@@ -1,0 +1,50 @@
+[workspace]
+members = [
+    "latticeshield-crypto",
+    "latticeshield-bridge",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["LatticeShield"]
+license     = "UNLICENSED"
+repository  = "https://github.com/nahuellamas/latticeshield"
+
+[workspace.dependencies]
+# Criptografia PQC — Rust puro, sin FFI
+ml-kem       = { version = "0.2", features = ["std"] }
+# ml-dsa: RUSTSEC-2025-0144 (timing side-channel, fixed en >=0.1.0-rc.3)
+# Usar solo para OTA signing (Mes 3+). Evaluar libcrux-ml-dsa como alternativa auditada.
+ml-dsa       = "0.0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf         = "0.12"
+sha2         = "0.10"
+aes-gcm      = "0.10"
+rand_core    = { version = "0.6", features = ["getrandom"] }
+
+# Red y transporte
+tokio  = { version = "1", features = ["full"] }
+quinn  = "0.11"
+rustls = { version = "0.23", features = ["prefer-post-quantum"] }
+
+# API Control Plane
+axum  = "0.7"
+sqlx  = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls"] }
+
+# Observabilidad
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilidades
+anyhow  = "1"
+thiserror = "1"
+serde   = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level       = 3
+lto             = true
+codegen-units   = 1
+strip           = true

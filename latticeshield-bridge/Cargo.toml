@@ -1,0 +1,21 @@
+[package]
+name        = "latticeshield-bridge"
+description = "Reverse proxy TLS con cifrado hibrido PQC"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "latticeshield-bridge"
+path = "src/main.rs"
+
+[dependencies]
+latticeshield-crypto = { path = "../latticeshield-crypto" }
+tokio              = { workspace = true }
+rustls             = { workspace = true }
+quinn              = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

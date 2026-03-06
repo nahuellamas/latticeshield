@@ -1,0 +1,22 @@
+[package]
+name        = "latticeshield-crypto"
+description = "Motor criptografico hibrido PQC: X25519 + ML-KEM-768 + HKDF-SHA256"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+ml-kem       = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf         = { workspace = true }
+sha2         = { workspace = true }
+aes-gcm      = { workspace = true }
+rand_core    = { workspace = true }
+thiserror    = { workspace = true }
+zeroize      = { version = "1", features = ["derive"] }
+hybrid-array = "0.2"
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
