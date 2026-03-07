@@ -13,7 +13,7 @@ use hkdf::Hkdf;
 use hybrid_array::Array;
 use ml_kem::{
     kem::{Decapsulate, Encapsulate},
-    KemCore, MlKem768,
+    EncodedSizeUser, KemCore, MlKem768,
 };
 use rand_core::CryptoRngCore;
 use sha2::Sha256;
@@ -23,6 +23,18 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const HKDF_INFO: &[u8] = b"latticeshield-v1-session-key";
 const SESSION_KEY_LEN: usize = 32;
+
+/// Tamaños del protocolo wire.
+pub const X25519_KEY_LEN: usize = 32;
+pub const MLKEM768_EK_LEN: usize = 1184;
+pub const MLKEM768_CT_LEN: usize = 1088;
+pub const NONCE_LEN: usize = 32;
+
+/// Tamaño total del ServerHello en el wire: X25519 pubkey + ML-KEM EK + nonce.
+pub const SERVER_HELLO_LEN: usize = X25519_KEY_LEN + MLKEM768_EK_LEN + NONCE_LEN; // 1248
+
+/// Tamaño total de la respuesta del cliente en el wire: X25519 pubkey + ML-KEM ciphertext.
+pub const CLIENT_RESPONSE_LEN: usize = X25519_KEY_LEN + MLKEM768_CT_LEN; // 1120
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -99,6 +111,42 @@ impl ServerHandshake {
         }
     }
 
+    /// Serializa el ServerHello para enviarlo por el wire.
+    ///
+    /// Formato: [32B X25519 pubkey] [1184B ML-KEM EK] [32B nonce]
+    pub fn server_hello_bytes(&self) -> [u8; SERVER_HELLO_LEN] {
+        let mut buf = [0u8; SERVER_HELLO_LEN];
+        let x25519_pub = X25519PublicKey::from(&self.x25519_secret);
+        buf[..X25519_KEY_LEN].copy_from_slice(x25519_pub.as_bytes());
+        let ek_encoded = self.kem_encap_key.as_bytes();
+        let ek_bytes: &[u8] = ek_encoded.as_ref();
+        buf[X25519_KEY_LEN..X25519_KEY_LEN + MLKEM768_EK_LEN].copy_from_slice(ek_bytes);
+        buf[X25519_KEY_LEN + MLKEM768_EK_LEN..].copy_from_slice(&self.nonce);
+        buf
+    }
+
+    /// Recibe la respuesta del cliente desde el wire y completa el handshake.
+    ///
+    /// Formato esperado: [32B X25519 pubkey] [1088B ML-KEM ciphertext]
+    pub fn complete_from_wire(
+        self,
+        bytes: &[u8; CLIENT_RESPONSE_LEN],
+    ) -> Result<SessionKey, HandshakeError> {
+        let x25519_pub = X25519PublicKey::from(
+            <[u8; X25519_KEY_LEN]>::try_from(&bytes[..X25519_KEY_LEN]).unwrap(),
+        );
+        let ct_bytes: &[u8] = &bytes[X25519_KEY_LEN..];
+        let ct_arr: [u8; MLKEM768_CT_LEN] = ct_bytes
+            .try_into()
+            .map_err(|_| HandshakeError::Decapsulate)?;
+        let kem_ciphertext = Array::from(ct_arr);
+        let response = ClientResponse {
+            x25519_public: x25519_pub,
+            kem_ciphertext,
+        };
+        self.complete(&response)
+    }
+
     /// El servidor recibe la respuesta del cliente y deriva la clave de sesion.
     pub fn complete(
         self,
@@ -117,6 +165,34 @@ impl ServerHandshake {
 
         derive_session_key(x25519_shared.as_bytes(), kem_shared.as_ref(), &self.nonce)
     }
+}
+
+/// Parsea un ServerHello recibido desde el wire y retorna el `ClientHello` estructurado.
+///
+/// Formato esperado: [32B X25519 pubkey] [1184B ML-KEM EK] [32B nonce]
+pub fn parse_server_hello(bytes: &[u8; SERVER_HELLO_LEN]) -> ClientHello {
+    let x25519_public = X25519PublicKey::from(
+        <[u8; X25519_KEY_LEN]>::try_from(&bytes[..X25519_KEY_LEN]).unwrap(),
+    );
+    let ek_slice = &bytes[X25519_KEY_LEN..X25519_KEY_LEN + MLKEM768_EK_LEN];
+    type EkSize = <<MlKem768 as KemCore>::EncapsulationKey as EncodedSizeUser>::EncodedSize;
+    let ek_ref: &Array<u8, EkSize> = ek_slice.try_into().expect("EK slice length invalido");
+    let kem_encap_key = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(ek_ref);
+    let nonce: [u8; NONCE_LEN] = bytes[X25519_KEY_LEN + MLKEM768_EK_LEN..]
+        .try_into()
+        .unwrap();
+    ClientHello { x25519_public, kem_encap_key, nonce }
+}
+
+/// Serializa un `ClientResponse` para enviarlo por el wire.
+///
+/// Formato: [32B X25519 pubkey] [1088B ML-KEM ciphertext]
+pub fn serialize_client_response(response: &ClientResponse) -> [u8; CLIENT_RESPONSE_LEN] {
+    let mut buf = [0u8; CLIENT_RESPONSE_LEN];
+    buf[..X25519_KEY_LEN].copy_from_slice(response.x25519_public.as_bytes());
+    let ct_bytes: &[u8] = response.kem_ciphertext.as_ref();
+    buf[X25519_KEY_LEN..].copy_from_slice(ct_bytes);
+    buf
 }
 
 /// Logica del cliente: recibe el ClientHello del servidor, encapsula, deriva la clave.
