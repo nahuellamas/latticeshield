@@ -6,6 +6,7 @@
 //!   3. Relay bidireccional entre cliente (cifrado) y backend (plaintext TCP).
 
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use anyhow::Context;
 use latticeshield_crypto::{ServerHandshake, CLIENT_RESPONSE_LEN};
@@ -17,6 +18,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::channel::EncryptedChannel;
+use crate::metrics::ActiveGuard;
 
 pub async fn handle(
     mut client: TcpStream,
@@ -25,9 +27,11 @@ pub async fn handle(
     max_frame_size: usize,
 ) -> anyhow::Result<()> {
     info!(%peer, "conexion entrante");
+    metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
 
     // ── 1. Handshake PQC ────────────────────────────────────────────────────
 
+    let t_handshake = Instant::now();
     let server = ServerHandshake::new(&mut OsRng);
     let hello_bytes = server.server_hello_bytes();
 
@@ -47,10 +51,12 @@ pub async fn handle(
     let session_key = server
         .complete_from_wire(&response_buf)
         .context("handshake PQC fallido")?;
+    metrics::histogram!(crate::metrics::HANDSHAKE_DURATION).record(t_handshake.elapsed().as_secs_f64());
     info!(%peer, "handshake PQC completado — canal cifrado activo");
 
     // ── 2. Canal cifrado ─────────────────────────────────────────────────────
 
+    let _guard = ActiveGuard::new();
     let channel = EncryptedChannel::new(session_key.as_bytes(), max_frame_size);
 
     // ── 3. Conexion al backend ───────────────────────────────────────────────

@@ -15,9 +15,10 @@ repository  = "https://github.com/nahuellamas/latticeshield"
 [workspace.dependencies]
 # Criptografia PQC — Rust puro, sin FFI
 ml-kem       = { version = "0.2", features = ["std"] }
-# ml-dsa: RUSTSEC-2025-0144 (timing side-channel, fixed en >=0.1.0-rc.3)
-# Usar solo para OTA signing (Mes 3+). Evaluar libcrux-ml-dsa como alternativa auditada.
-ml-dsa       = "0.0.4"
+# ml-dsa: pendiente 0.1.0 estable — ver memoria tracking/ml-dsa-stable-release
+# (0.0.4 tiene RUSTSEC-2025-0144 + CVE-2026-24850 sin parchear en stable)
+# Usando libcrux-ml-dsa como alternativa auditada hasta que RustCrypto publique 0.1.0 stable.
+libcrux-ml-dsa = { version = "=0.0.7", default-features = false, features = ["mldsa65"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf         = "0.12"
 sha2         = "0.10"
@@ -34,8 +35,10 @@ axum  = "0.7"
 sqlx  = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls"] }
 
 # Observabilidad
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing                     = "0.1"
+tracing-subscriber          = { version = "0.3", features = ["env-filter"] }
+metrics                     = "0.22"
+metrics-exporter-prometheus = "0.13"
 
 # Utilidades
 anyhow  = "1"

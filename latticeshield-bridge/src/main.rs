@@ -5,10 +5,12 @@
 //! Variables de entorno:
 //!   LISTEN_ADDR   — donde escucha el proxy (default: 0.0.0.0:8443)
 //!   BACKEND_ADDR  — backend de destino  (default: 127.0.0.1:8080)
+//!   METRICS_ADDR  — metricas Prometheus  (default: 0.0.0.0:8444)
 //!   RUST_LOG      — nivel de log        (default: info)
 
 mod channel;
 mod config;
+mod metrics;
 mod server;
 mod session;
 

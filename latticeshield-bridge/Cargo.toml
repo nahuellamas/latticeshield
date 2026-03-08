@@ -16,6 +16,9 @@ latticeshield-crypto = { path = "../latticeshield-crypto" }
 tokio              = { workspace = true }
 aes-gcm            = { workspace = true }
 rand_core          = { workspace = true }
-anyhow             = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
+anyhow                      = { workspace = true }
+tracing                     = { workspace = true }
+tracing-subscriber          = { workspace = true }
+axum                        = { workspace = true }
+metrics                     = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }

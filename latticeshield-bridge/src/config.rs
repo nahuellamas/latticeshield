@@ -10,6 +10,9 @@ pub struct Config {
     /// Direccion del backend al que el proxy reenvía el trafico.
     pub backend_addr: SocketAddr,
 
+    /// Direccion donde se expone el endpoint HTTP de metricas Prometheus.
+    pub metrics_addr: SocketAddr,
+
     /// Tamano maximo de un frame de datos (bytes de payload). Default: 64 KiB.
     pub max_frame_size: usize,
 }
@@ -18,8 +21,9 @@ impl Config {
     /// Carga la configuracion desde variables de entorno.
     ///
     /// Variables:
-    ///   LISTEN_ADDR  — default: 0.0.0.0:8443
-    ///   BACKEND_ADDR — default: 127.0.0.1:8080
+    ///   LISTEN_ADDR   — default: 0.0.0.0:8443
+    ///   BACKEND_ADDR  — default: 127.0.0.1:8080
+    ///   METRICS_ADDR  — default: 0.0.0.0:8444
     pub fn from_env() -> anyhow::Result<Self> {
         let listen_addr = std::env::var("LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
@@ -29,9 +33,14 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()?;
 
+        let metrics_addr = std::env::var("METRICS_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:8444".to_string())
+            .parse()?;
+
         Ok(Self {
             listen_addr,
             backend_addr,
+            metrics_addr,
             max_frame_size: 64 * 1024,
         })
     }

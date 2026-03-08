@@ -15,8 +15,9 @@ sha2         = { workspace = true }
 aes-gcm      = { workspace = true }
 rand_core    = { workspace = true }
 thiserror    = { workspace = true }
-zeroize      = { version = "1", features = ["derive"] }
-hybrid-array = "0.2"
+zeroize        = { version = "1", features = ["derive"] }
+hybrid-array   = "0.2"
+libcrux-ml-dsa = { workspace = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
