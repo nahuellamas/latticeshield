@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 
 mod channel;
 mod config;
+mod control_plane;
 pub(crate) mod identity;
 mod metrics;
 mod server;

@@ -9,10 +9,11 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, identity::ServerIdentity, metrics, session};
+use crate::{config::ValidConfig, control_plane, identity::ServerIdentity, metrics, metrics::MetricsState, session};
 
 pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     let metrics_handle = metrics::init()?;
+    let metrics_state = MetricsState::new();
 
     // ── Cargar identidad del servidor (falla rapido si no existe o permisos incorrectos)
     let identity = Arc::new(
@@ -32,14 +33,24 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     info!(addr = %config.listen_addr, "LatticeShield escuchando");
     info!(backend = %config.backend_addr, "backend configurado");
 
+    // ── Control plane heartbeat task (non-blocking, optional) ────────────────
+    if config.control_plane_enabled && !config.control_plane_endpoint.is_empty() {
+        let cfg = config.clone();
+        let ms = Arc::clone(&metrics_state);
+        tokio::spawn(async move {
+            control_plane::start(cfg, ms).await;
+        });
+    }
+
     loop {
         let (socket, peer) = listener.accept().await?;
         let backend_addr: SocketAddr = config.backend_addr;
         let max_frame_size = config.max_frame_size;
         let identity = Arc::clone(&identity);
+        let ms = Arc::clone(&metrics_state);
 
         tokio::spawn(async move {
-            if let Err(e) = session::handle(socket, peer, backend_addr, max_frame_size, identity).await {
+            if let Err(e) = session::handle(socket, peer, backend_addr, max_frame_size, identity, ms).await {
                 error!(%peer, "sesion error: {e:#}");
             }
         });

@@ -6,6 +6,7 @@
 //!   3. Relay bidireccional entre cliente (cifrado) y backend (plaintext TCP).
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::channel::EncryptedChannel;
 use crate::identity::ServerIdentity;
-use crate::metrics::ActiveGuard;
+use crate::metrics::{ActiveGuard, MetricsActiveGuard, MetricsState};
 
 pub async fn handle(
     mut client: TcpStream,
@@ -28,9 +29,11 @@ pub async fn handle(
     backend_addr: SocketAddr,
     max_frame_size: usize,
     identity: Arc<ServerIdentity>,
+    metrics_state: Arc<MetricsState>,
 ) -> anyhow::Result<()> {
     info!(%peer, "conexion entrante");
     metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
+    metrics_state.connections_total.fetch_add(1, Ordering::Relaxed);
 
     // ── 1. Handshake PQC autenticado ────────────────────────────────────────
 
@@ -64,6 +67,7 @@ pub async fn handle(
     // ── 2. Canal cifrado ─────────────────────────────────────────────────────
 
     let _guard = ActiveGuard::new();
+    let _ms_guard = MetricsActiveGuard::new(&metrics_state);
     let channel = EncryptedChannel::new(session_key.as_bytes(), max_frame_size);
 
     // ── 3. Conexion al backend ───────────────────────────────────────────────
@@ -94,6 +98,7 @@ pub async fn handle(
                     }
                     Err(e) => {
                         warn!(%peer, "error leyendo frame del cliente: {e}");
+                        metrics_state.channel_errors_total.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -110,6 +115,7 @@ pub async fn handle(
                         channel.write_frame(&mut client_w, &backend_buf[..n])
                             .await
                             .context("write frame al cliente")?;
+                        metrics_state.bytes_transmitted_total.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
                         warn!(%peer, "error leyendo del backend: {e}");
