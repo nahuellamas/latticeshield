@@ -131,3 +131,129 @@ impl ServerIdentity {
 fn vk_path_from(sk_path: &Path) -> PathBuf {
     sk_path.with_extension("vk")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // -------------------------------------------------------------------------
+    // generate_and_save
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn generate_creates_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        assert!(dir.path().join("server.sk").exists());
+        assert!(dir.path().join("server.vk").exists());
+    }
+
+    #[test]
+    fn generate_sk_has_correct_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join("server.sk"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "server.sk debe ser 0600, es {:o}", mode);
+    }
+
+    #[test]
+    fn generate_vk_has_correct_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join("server.vk"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "server.vk debe ser 0644, es {:o}", mode);
+    }
+
+    #[test]
+    fn generate_files_have_correct_size() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path().join("server.sk")).unwrap().len(),
+            SIGNING_KEY_LEN as u64
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("server.vk")).unwrap().len(),
+            VERIFYING_KEY_LEN as u64
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // load
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn load_roundtrip_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        ServerIdentity::load(&dir.path().join("server.sk")).unwrap();
+    }
+
+    #[test]
+    fn load_fails_on_wrong_sk_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        let sk_path = dir.path().join("server.sk");
+        std::fs::set_permissions(&sk_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = ServerIdentity::load(&sk_path)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permisos inseguros"), "{err}");
+    }
+
+    #[test]
+    fn load_fails_when_sk_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ServerIdentity::load(&dir.path().join("server.sk"))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no se puede acceder"), "{err}");
+    }
+
+    #[test]
+    fn load_fails_when_vk_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join("server.vk")).unwrap();
+        let err = ServerIdentity::load(&dir.path().join("server.sk"))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server.vk"), "{err}");
+    }
+
+    #[test]
+    fn load_fails_on_truncated_sk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk_path = dir.path().join("server.sk");
+        // Crear un .sk con datos basura de tamaño incorrecto (permisos 0o600)
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&sk_path)
+            .unwrap()
+            .write_all(&[0u8; 16])
+            .unwrap();
+        let err = ServerIdentity::load(&sk_path)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("truncado") || err.contains("failed to fill"),
+            "{err}"
+        );
+    }
+}
