@@ -8,6 +8,12 @@
 //!   3. El cliente encapsula contra la clave publica ML-KEM del servidor
 //!      y realiza X25519. Envia su clave publica X25519 + el ciphertext ML-KEM.
 //!   4. Ambos derivan la clave de sesion via HKDF-SHA256 sobre los dos secretos.
+//!
+//! Autenticacion del servidor (server-auth, pre-shared key):
+//!   El ServerHello firmado extiende el wire con una firma ML-DSA-65 sobre los
+//!   1248 bytes del ServerHello base. La VerifyingKey NO viaja en el wire — el
+//!   cliente la tiene pre-shared (distribuida out-of-band).
+//!   Formato: [1248B ServerHello] [3309B Signature] = 4557 bytes.
 
 use hkdf::Hkdf;
 use hybrid_array::Array;
@@ -21,6 +27,8 @@ use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::signing::{sign, verify, Signature, SigningKey, VerifyingKey, SIGNATURE_LEN};
+
 const HKDF_INFO: &[u8] = b"latticeshield-v1-session-key";
 const SESSION_KEY_LEN: usize = 32;
 
@@ -33,6 +41,11 @@ pub const NONCE_LEN: usize = 32;
 /// Tamaño total del ServerHello en el wire: X25519 pubkey + ML-KEM EK + nonce.
 pub const SERVER_HELLO_LEN: usize = X25519_KEY_LEN + MLKEM768_EK_LEN + NONCE_LEN; // 1248
 
+/// Tamaño total del ServerHello firmado: ServerHello + Signature ML-DSA-65.
+///
+/// La VerifyingKey NO viaja en el wire — el cliente la tiene pre-shared.
+pub const SERVER_HELLO_SIGNED_LEN: usize = SERVER_HELLO_LEN + SIGNATURE_LEN; // 4557
+
 /// Tamaño total de la respuesta del cliente en el wire: X25519 pubkey + ML-KEM ciphertext.
 pub const CLIENT_RESPONSE_LEN: usize = X25519_KEY_LEN + MLKEM768_CT_LEN; // 1120
 
@@ -44,6 +57,8 @@ pub enum HandshakeError {
     Decapsulate,
     #[error("HKDF key derivation failed")]
     Hkdf,
+    #[error("server authentication failed: invalid ML-DSA-65 signature")]
+    AuthenticationFailed,
 }
 
 /// Clave de sesion derivada del handshake hibrido.
@@ -125,6 +140,30 @@ impl ServerHandshake {
         buf
     }
 
+    /// Serializa el ServerHello firmado para enviarlo por el wire.
+    ///
+    /// Formato: [1248B ServerHello] [3309B Signature ML-DSA-65]
+    ///
+    /// La firma cubre los 1248 bytes del ServerHello — autentica las claves efimeras
+    /// y el nonce contra la clave de largo plazo del servidor.
+    /// La VerifyingKey NO se incluye en el wire: el cliente debe tenerla pre-shared.
+    pub fn server_hello_signed_bytes(
+        &self,
+        signing_key: &SigningKey,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<[u8; SERVER_HELLO_SIGNED_LEN], HandshakeError> {
+        let hello = self.server_hello_bytes();
+
+        let sig = sign(signing_key, &hello, rng)
+            .map_err(|_| HandshakeError::AuthenticationFailed)?;
+
+        let mut buf = [0u8; SERVER_HELLO_SIGNED_LEN];
+        buf[..SERVER_HELLO_LEN].copy_from_slice(&hello);
+        buf[SERVER_HELLO_LEN..].copy_from_slice(sig.to_bytes());
+
+        Ok(buf)
+    }
+
     /// Recibe la respuesta del cliente desde el wire y completa el handshake.
     ///
     /// Formato esperado: [32B X25519 pubkey] [1088B ML-KEM ciphertext]
@@ -182,6 +221,28 @@ pub fn parse_server_hello(bytes: &[u8; SERVER_HELLO_LEN]) -> ClientHello {
         .try_into()
         .unwrap();
     ClientHello { x25519_public, kem_encap_key, nonce }
+}
+
+/// Parsea y verifica un ServerHello firmado recibido desde el wire.
+///
+/// Formato esperado: [1248B ServerHello] [3309B Signature ML-DSA-65]
+///
+/// El caller provee la `VerifyingKey` pre-shared — no se extrae del wire.
+/// Verifica la firma antes de parsear. Retorna `Err(HandshakeError::AuthenticationFailed)`
+/// si la firma no es valida bajo la clave dada.
+pub fn parse_server_hello_signed(
+    bytes: &[u8; SERVER_HELLO_SIGNED_LEN],
+    vk: &VerifyingKey,
+) -> Result<ClientHello, HandshakeError> {
+    let hello_bytes: &[u8; SERVER_HELLO_LEN] =
+        bytes[..SERVER_HELLO_LEN].try_into().unwrap();
+
+    let sig = Signature::from_bytes(&bytes[SERVER_HELLO_LEN..])
+        .map_err(|_| HandshakeError::AuthenticationFailed)?;
+
+    verify(vk, hello_bytes, &sig).map_err(|_| HandshakeError::AuthenticationFailed)?;
+
+    Ok(parse_server_hello(hello_bytes))
 }
 
 /// Serializa un `ClientResponse` para enviarlo por el wire.
@@ -253,6 +314,7 @@ fn derive_session_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing::generate_keypair;
     use rand_core::OsRng;
 
     #[test]
@@ -295,6 +357,117 @@ mod tests {
             key1.as_bytes(),
             key2.as_bytes(),
             "Dos handshakes distintos no deben producir la misma clave"
+        );
+    }
+
+    // ── Server authentication (pre-shared VerifyingKey) ──────────────────────
+
+    #[test]
+    fn signed_server_hello_has_correct_length() {
+        let mut rng = OsRng;
+        let server = ServerHandshake::new(&mut rng);
+        let (sk, _vk) = generate_keypair(&mut rng);
+        let bytes = server.server_hello_signed_bytes(&sk, &mut rng).unwrap();
+        assert_eq!(bytes.len(), SERVER_HELLO_SIGNED_LEN);
+    }
+
+    #[test]
+    fn signed_server_hello_verifies_with_preshared_vk() {
+        let mut rng = OsRng;
+        let server = ServerHandshake::new(&mut rng);
+        let (sk, vk) = generate_keypair(&mut rng);
+        let bytes = server.server_hello_signed_bytes(&sk, &mut rng).unwrap();
+        let hello = parse_server_hello_signed(&bytes, &vk);
+        assert!(hello.is_ok(), "verificacion debe pasar con VK pre-shared correcta");
+    }
+
+    #[test]
+    fn signed_hello_server_and_client_derive_same_session_key() {
+        let mut rng = OsRng;
+        let server = ServerHandshake::new(&mut rng);
+        let (sk, vk) = generate_keypair(&mut rng);
+        let signed_bytes = server.server_hello_signed_bytes(&sk, &mut rng).unwrap();
+
+        let hello = parse_server_hello_signed(&signed_bytes, &vk).unwrap();
+        let (response, client_key) = client_respond(&hello, &mut rng).unwrap();
+        let server_key = server.complete(&response).unwrap();
+
+        assert_eq!(
+            client_key.as_bytes(),
+            server_key.as_bytes(),
+            "cliente y servidor deben derivar la misma session key"
+        );
+    }
+
+    #[test]
+    fn signed_hello_produces_unique_keys_per_session() {
+        let mut rng = OsRng;
+
+        let server1 = ServerHandshake::new(&mut rng);
+        let (sk1, vk1) = generate_keypair(&mut rng);
+        let bytes1 = server1.server_hello_signed_bytes(&sk1, &mut rng).unwrap();
+        let hello1 = parse_server_hello_signed(&bytes1, &vk1).unwrap();
+        let (response1, client_key1) = client_respond(&hello1, &mut rng).unwrap();
+        let _server_key1 = server1.complete(&response1).unwrap();
+
+        let server2 = ServerHandshake::new(&mut rng);
+        let (sk2, vk2) = generate_keypair(&mut rng);
+        let bytes2 = server2.server_hello_signed_bytes(&sk2, &mut rng).unwrap();
+        let hello2 = parse_server_hello_signed(&bytes2, &vk2).unwrap();
+        let (_, client_key2) = client_respond(&hello2, &mut rng).unwrap();
+
+        assert_ne!(
+            client_key1.as_bytes(),
+            client_key2.as_bytes(),
+            "dos sesiones distintas no deben producir la misma session key"
+        );
+    }
+
+    #[test]
+    fn tampered_signature_in_signed_hello_fails() {
+        let mut rng = OsRng;
+        let server = ServerHandshake::new(&mut rng);
+        let (sk, vk) = generate_keypair(&mut rng);
+        let mut bytes = server.server_hello_signed_bytes(&sk, &mut rng).unwrap();
+
+        bytes[SERVER_HELLO_LEN] ^= 0xFF;
+
+        let result = parse_server_hello_signed(&bytes, &vk);
+        assert!(
+            matches!(result, Err(HandshakeError::AuthenticationFailed)),
+            "firma corrompida debe fallar con AuthenticationFailed"
+        );
+    }
+
+    #[test]
+    fn tampered_server_hello_body_fails_authentication() {
+        let mut rng = OsRng;
+        let server = ServerHandshake::new(&mut rng);
+        let (sk, vk) = generate_keypair(&mut rng);
+        let mut bytes = server.server_hello_signed_bytes(&sk, &mut rng).unwrap();
+
+        bytes[X25519_KEY_LEN + MLKEM768_EK_LEN] ^= 0xFF;
+
+        let result = parse_server_hello_signed(&bytes, &vk);
+        assert!(
+            matches!(result, Err(HandshakeError::AuthenticationFailed)),
+            "ServerHello corrompido debe fallar con AuthenticationFailed"
+        );
+    }
+
+    #[test]
+    fn wrong_preshared_vk_fails_authentication() {
+        let mut rng = OsRng;
+        let server = ServerHandshake::new(&mut rng);
+        let (sk, _vk) = generate_keypair(&mut rng);
+        let (_sk2, vk2) = generate_keypair(&mut rng);
+
+        let bytes = server.server_hello_signed_bytes(&sk, &mut rng).unwrap();
+
+        let result = parse_server_hello_signed(&bytes, &vk2);
+        assert!(
+            matches!(result, Err(HandshakeError::AuthenticationFailed)),
+            "VK pre-shared erronea debe fallar con AuthenticationFailed"
         );
     }
 

@@ -3,9 +3,10 @@ pub mod handshake;
 pub mod signing;
 
 pub use handshake::{
-    client_respond, parse_server_hello, serialize_client_response,
+    client_respond, parse_server_hello, parse_server_hello_signed,
+    serialize_client_response,
     ClientHello, ClientResponse, HandshakeError, ServerHandshake, SessionKey,
-    CLIENT_RESPONSE_LEN, SERVER_HELLO_LEN,
+    CLIENT_RESPONSE_LEN, SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 pub use anti_replay::AntiReplayFilter;
 pub use signing::{
