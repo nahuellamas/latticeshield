@@ -57,12 +57,20 @@ A sliding-window filter (`AntiReplayFilter`) tracks consumed session tickets. Ea
 latticeshield/
 ├── Cargo.toml                   # Workspace root — all dependencies centralized
 ├── deny.toml                    # cargo-deny: blocks oqs-rs, openssl, unsafe advisories
-├── latticeshield-crypto/        # Cryptographic engine (Month 1 — complete)
+├── latticeshield-crypto/        # Cryptographic engine
 │   └── src/
 │       ├── lib.rs
-│       ├── handshake.rs         # Hybrid X25519 + ML-KEM-768 + HKDF-SHA256
+│       ├── handshake.rs         # Hybrid X25519 + ML-KEM-768 + HKDF-SHA256 + server auth
+│       ├── signing.rs           # ML-DSA-65 sign/verify (OTA + server authentication)
 │       └── anti_replay.rs       # 0-RTT anti-replay filter
-└── latticeshield-bridge/        # Proxy agent — HTTP/QUIC transport (Month 2+)
+└── latticeshield-bridge/        # Proxy agent
+    └── src/
+        ├── main.rs              # Entry point — --keygen subcommand
+        ├── server.rs            # Listener + session dispatch
+        ├── session.rs           # PQC handshake + AES-GCM relay
+        ├── identity.rs          # ServerIdentity: load/generate ML-DSA-65 keypair
+        ├── config.rs            # Env-based config (SIGNING_KEY_PATH, BACKEND_ADDR)
+        └── metrics.rs           # Prometheus /metrics endpoint
 ```
 
 ## Security Constraints
@@ -72,8 +80,9 @@ latticeshield/
 | Pure Rust — no FFI | Eliminates entire class of memory-safety bugs at the boundary |
 | No `oqs-rs` | C FFI wrapper; rejected in favor of native Rust implementations |
 | No `openssl` | Legacy C library; rejected via `cargo-deny` |
-| `ml-dsa` deferred to Month 3+ | Advisory RUSTSEC-2025-0144 (timing side-channel). Will evaluate `libcrux-ml-dsa` as audited alternative |
-| `rustls` with `prefer-post-quantum` | Enables native X25519MLKEM768 in TLS — no manual TLS hybrid implementation needed |
+| `libcrux-ml-dsa 0.0.7` instead of `ml-dsa` | `ml-dsa 0.0.4` has RUSTSEC-2025-0144 (timing side-channel) + CVE-2026-24850. Using audited libcrux alternative until RustCrypto publishes `ml-dsa 0.1.0` stable |
+| Pre-shared VerifyingKey | Server's ML-DSA-65 VK is distributed out-of-band — never transmitted on the wire, preventing MITM key substitution |
+| `mlock(2)` on SigningKey | Key material stored in heap-allocated `Box<[u8; 4032]>` and memory-locked via `libc::mlock` — never paged to swap |
 
 ## Dependencies (key)
 
@@ -111,25 +120,34 @@ cargo build --release
 
 ## Tests
 
-`latticeshield-crypto` ships 6 unit tests:
+43 unit tests across both crates — all passing.
 
-| Test | What it verifies |
+### latticeshield-crypto (26 tests)
+
+| Module | Tests |
 |---|---|
-| `handshake_produces_matching_session_keys` | Client and server derive identical session keys |
-| `session_keys_are_unique_per_handshake` | Two independent handshakes produce different keys |
-| `tampered_kem_ciphertext_fails_decapsulation` | ML-KEM ciphertext type is opaque — cannot be mutated accidentally |
-| `valid_ticket_accepted_once` | Anti-replay: first use accepted, second use rejected |
-| `different_tickets_all_accepted` | Independent tickets are all accepted |
-| `window_expiry_resets_filter` | Anti-replay window resets correctly |
+| `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection) |
+| `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
+| `anti_replay` | Accept once, reject duplicate, window expiry |
+
+### latticeshield-bridge (17 tests)
+
+| Module | Tests |
+|---|---|
+| `identity` | generate_and_save (files, permissions 0o600/0o644, sizes), load roundtrip, error paths |
+| `metrics` | Prometheus families, HTTP endpoint, session/byte counters, connection gauge |
+| `session` (integration) | Full PQC handshake + relay, tampered response rejection, key uniqueness |
 
 ## Roadmap
 
-| Month | Milestone |
-|---|---|
-| 1 | Cryptographic engine — hybrid handshake + anti-replay (complete) |
-| 2 | Proxy bridge — HTTP/HTTPS transparent forwarding via QUIC |
-| 3 | OTA signing with ML-DSA (pending audit of RUSTSEC-2025-0144) |
-| 4+ | Control plane API, observability, deployment packaging |
+| Month | Milestone | Status |
+|---|---|---|
+| 1 | Cryptographic engine — hybrid handshake + anti-replay | Complete |
+| 2 | TCP proxy bridge + AES-256-GCM relay | Complete |
+| 3 | ML-DSA-65 OTA signing + Prometheus observability | Complete |
+| 4–5 | Server authentication — signed ServerHello, pre-shared VK, mlock | Complete |
+| 6 | Config file (toml), control plane heartbeat, key rotation | Next |
+| 7+ | eBPF/XDP, TLS listener (rustls + quinn), OTA updater, Dashboard SaaS | Planned |
 
 ## License
 
