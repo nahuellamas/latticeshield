@@ -1,15 +1,16 @@
 //! Manejo de una conexion de cliente.
 //!
 //! Flujo por conexion:
-//!   1. Handshake PQC hibrido (X25519 + ML-KEM-768 + HKDF-SHA256).
+//!   1. Handshake PQC autenticado: ServerHello firmado con ML-DSA-65 (pre-shared VK).
 //!   2. Canal cifrado AES-256-GCM establecido.
 //!   3. Relay bidireccional entre cliente (cifrado) y backend (plaintext TCP).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use latticeshield_crypto::{ServerHandshake, CLIENT_RESPONSE_LEN};
+use latticeshield_crypto::{ServerHandshake, CLIENT_RESPONSE_LEN, SERVER_HELLO_SIGNED_LEN};
 use rand_core::OsRng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,6 +19,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::channel::EncryptedChannel;
+use crate::identity::ServerIdentity;
 use crate::metrics::ActiveGuard;
 
 pub async fn handle(
@@ -25,21 +27,26 @@ pub async fn handle(
     peer: SocketAddr,
     backend_addr: SocketAddr,
     max_frame_size: usize,
+    identity: Arc<ServerIdentity>,
 ) -> anyhow::Result<()> {
     info!(%peer, "conexion entrante");
     metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
 
-    // ── 1. Handshake PQC ────────────────────────────────────────────────────
+    // ── 1. Handshake PQC autenticado ────────────────────────────────────────
 
     let t_handshake = Instant::now();
     let server = ServerHandshake::new(&mut OsRng);
-    let hello_bytes = server.server_hello_bytes();
+
+    // Firma el ServerHello con la clave de largo plazo — VK pre-shared en el cliente
+    let hello_bytes = server
+        .server_hello_signed_bytes(&identity.signing_key, &mut OsRng)
+        .context("firma del ServerHello")?;
 
     client
         .write_all(&hello_bytes)
         .await
-        .context("envio ServerHello")?;
-    debug!(%peer, "ServerHello enviado ({} bytes)", hello_bytes.len());
+        .context("envio ServerHello firmado")?;
+    debug!(%peer, "ServerHello firmado enviado ({} bytes)", SERVER_HELLO_SIGNED_LEN);
 
     let mut response_buf = [0u8; CLIENT_RESPONSE_LEN];
     client

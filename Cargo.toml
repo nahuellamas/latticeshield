@@ -42,6 +42,7 @@ metrics-exporter-prometheus = "0.13"
 
 # Utilidades
 anyhow  = "1"
+zeroize = { version = "1", features = ["derive"] }
 thiserror = "1"
 serde   = { version = "1", features = ["derive"] }
 serde_json = "1"

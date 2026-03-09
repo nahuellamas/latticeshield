@@ -1,29 +1,43 @@
 //! Integration tests: flujo completo PQC end-to-end.
 //!
 //! Valida que cliente y servidor puedan:
-//!   1. Completar el handshake hibrido X25519 + ML-KEM-768
+//!   1. Completar el handshake autenticado: ServerHello firmado ML-DSA-65 + pre-shared VK
 //!   2. Derivar la misma SessionKey
 //!   3. Intercambiar datos cifrados a traves del proxy
 //!   4. El backend recibe y responde el payload correcto
 
+use std::sync::Arc;
+
 use latticeshield_crypto::{
-    client_respond, parse_server_hello, serialize_client_response, SERVER_HELLO_LEN,
-    CLIENT_RESPONSE_LEN,
+    client_respond, generate_keypair, parse_server_hello_signed, serialize_client_response,
+    SigningKey, VerifyingKey, SERVER_HELLO_SIGNED_LEN, CLIENT_RESPONSE_LEN,
 };
 use rand_core::OsRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::channel::EncryptedChannel;
+use crate::identity::ServerIdentity;
 
 const MAX_FRAME: usize = 64 * 1024;
 
-/// Flujo completo: handshake PQC + cifrado AES-GCM + relay al backend.
+/// Crea un `Arc<ServerIdentity>` de prueba con un keypair efimero.
+fn test_identity() -> Arc<ServerIdentity> {
+    let (sk, vk) = generate_keypair(&mut OsRng);
+    let sk = SigningKey::from_bytes(sk.to_bytes()).unwrap();
+    let vk = VerifyingKey::from_bytes(vk.to_bytes()).unwrap();
+    Arc::new(ServerIdentity { signing_key: sk, verifying_key: vk })
+}
+
+/// Flujo completo: handshake PQC autenticado + cifrado AES-GCM + relay al backend.
 ///
 /// Topologia del test:
 ///   cliente (test) ←→ bridge (session::handle) ←→ backend mock (echo)
 #[tokio::test]
 async fn full_pqc_handshake_and_relay() {
+    let identity = test_identity();
+    let vk = VerifyingKey::from_bytes(identity.verifying_key.to_bytes()).unwrap();
+
     // ── Backend mock: echo server ────────────────────────────────────────────
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
@@ -33,7 +47,6 @@ async fn full_pqc_handshake_and_relay() {
         let mut buf = vec![0u8; MAX_FRAME];
         let n = conn.read(&mut buf).await.unwrap();
         conn.write_all(&buf[..n]).await.unwrap();
-        // conn cae al salir del scope — cierra la conexion con el bridge
     });
 
     // ── Bridge: una sesion ───────────────────────────────────────────────────
@@ -42,24 +55,22 @@ async fn full_pqc_handshake_and_relay() {
 
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        // Ignoramos el error al terminar — el cliente cierra primero
-        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME).await;
+        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await;
     });
 
-    // ── Cliente: realiza el handshake y prueba el canal ───────────────────────
+    // ── Cliente: realiza el handshake autenticado ────────────────────────────
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
 
-    // 1. Leer ServerHello
-    let mut hello_buf = [0u8; SERVER_HELLO_LEN];
+    // 1. Leer ServerHello firmado
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
     client.read_exact(&mut hello_buf).await.unwrap();
 
-    // 2. Parsear y responder
-    let hello = parse_server_hello(&hello_buf);
+    // 2. Verificar firma con VK pre-shared y parsear
+    let hello = parse_server_hello_signed(&hello_buf, &vk).unwrap();
     let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
 
     // 3. Enviar ClientResponse
-    let response_wire = serialize_client_response(&response);
-    client.write_all(&response_wire).await.unwrap();
+    client.write_all(&serialize_client_response(&response)).await.unwrap();
 
     // 4. Canal cifrado activo — enviar request
     let channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
@@ -75,7 +86,7 @@ async fn full_pqc_handshake_and_relay() {
 /// Verifica que dos handshakes independientes producen SessionKeys distintas.
 #[tokio::test]
 async fn two_sessions_produce_different_keys() {
-    async fn do_handshake() -> Vec<u8> {
+    async fn do_handshake(identity: Arc<ServerIdentity>, vk: Arc<VerifyingKey>) -> Vec<u8> {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -89,20 +100,23 @@ async fn two_sessions_produce_different_keys() {
         let bridge_addr = bridge_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, peer) = bridge_listener.accept().await.unwrap();
-            let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME).await;
+            let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await;
         });
 
         let mut client = TcpStream::connect(bridge_addr).await.unwrap();
-        let mut hello_buf = [0u8; SERVER_HELLO_LEN];
+        let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
         client.read_exact(&mut hello_buf).await.unwrap();
-        let hello = parse_server_hello(&hello_buf);
+        let hello = parse_server_hello_signed(&hello_buf, &vk).unwrap();
         let (response, key) = client_respond(&hello, &mut OsRng).unwrap();
         client.write_all(&serialize_client_response(&response)).await.unwrap();
         key.as_bytes().to_vec()
     }
 
-    let key1 = do_handshake().await;
-    let key2 = do_handshake().await;
+    let identity = test_identity();
+    let vk = Arc::new(VerifyingKey::from_bytes(identity.verifying_key.to_bytes()).unwrap());
+
+    let key1 = do_handshake(Arc::clone(&identity), Arc::clone(&vk)).await;
+    let key2 = do_handshake(Arc::clone(&identity), Arc::clone(&vk)).await;
 
     assert_ne!(key1, key2, "cada sesion debe producir una SessionKey unica");
 }
@@ -110,10 +124,11 @@ async fn two_sessions_produce_different_keys() {
 /// Verifica que un ClientResponse corrupto es rechazado por el bridge.
 #[tokio::test]
 async fn tampered_client_response_is_rejected() {
+    let identity = test_identity();
+
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        // El backend no deberia recibir nada en este test
         let _ = backend_listener.accept().await;
     });
 
@@ -122,19 +137,18 @@ async fn tampered_client_response_is_rejected() {
 
     let bridge_result = tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        crate::session::handle(socket, peer, backend_addr, MAX_FRAME).await
+        crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await
     });
 
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
-    let mut hello_buf = [0u8; SERVER_HELLO_LEN];
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
     client.read_exact(&mut hello_buf).await.unwrap();
 
     // Enviar ClientResponse completamente invalido (ceros)
     client.write_all(&[0u8; CLIENT_RESPONSE_LEN]).await.unwrap();
     drop(client);
 
-    // El bridge debe completar sin panic (puede fallar con error, no con panic)
-    let _ = bridge_result.await.unwrap(); // no debe hacer unwrap del Result
+    let _ = bridge_result.await.unwrap();
 }
 
 // ── Tests de métricas Prometheus ─────────────────────────────────────────────
@@ -313,8 +327,7 @@ async fn http_endpoint_returns_200_ok_with_prometheus_content_type() {
 #[tokio::test]
 async fn full_session_records_connections_and_bytes() {
     use latticeshield_crypto::{
-        client_respond, parse_server_hello, serialize_client_response,
-        SERVER_HELLO_LEN,
+        client_respond, serialize_client_response,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -333,18 +346,21 @@ async fn full_session_records_connections_and_bytes() {
         conn.write_all(&buf[..n]).await.unwrap();
     });
 
+    let identity = test_identity();
+    let vk = VerifyingKey::from_bytes(identity.verifying_key.to_bytes()).unwrap();
+
     let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bridge_addr = bridge_listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME).await;
+        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await;
     });
 
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
 
-    let mut hello_buf = [0u8; SERVER_HELLO_LEN];
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
     client.read_exact(&mut hello_buf).await.unwrap();
-    let hello = parse_server_hello(&hello_buf);
+    let hello = parse_server_hello_signed(&hello_buf, &vk).unwrap();
     let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
     client.write_all(&serialize_client_response(&response)).await.unwrap();
 

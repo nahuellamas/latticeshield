@@ -2,16 +2,27 @@
 //! Tambien inicia el servidor HTTP de metricas Prometheus en un puerto dedicado.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::{extract::State, http::header::CONTENT_TYPE, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{config::Config, metrics, session};
+use crate::{config::Config, identity::ServerIdentity, metrics, session};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let metrics_handle = metrics::init()?;
+
+    // ── Cargar identidad del servidor (falla rapido si no existe o permisos incorrectos)
+    let identity = Arc::new(
+        ServerIdentity::load(&config.signing_key_path)
+            .map_err(|e| anyhow::anyhow!(
+                "no se pudo cargar el keypair del servidor: {e}\n\
+                 Hint: ejecuta `latticeshield-bridge --keygen ./keys` para generar las claves."
+            ))?,
+    );
+    info!(path = %config.signing_key_path.display(), "identidad del servidor cargada");
 
     // ── Metrics HTTP server (puerto dedicado, plain HTTP) ───────────────────
     spawn_metrics_server(config.metrics_addr, metrics_handle);
@@ -25,9 +36,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let (socket, peer) = listener.accept().await?;
         let backend_addr: SocketAddr = config.backend_addr;
         let max_frame_size = config.max_frame_size;
+        let identity = Arc::clone(&identity);
 
         tokio::spawn(async move {
-            if let Err(e) = session::handle(socket, peer, backend_addr, max_frame_size).await {
+            if let Err(e) = session::handle(socket, peer, backend_addr, max_frame_size, identity).await {
                 error!(%peer, "sesion error: {e:#}");
             }
         });

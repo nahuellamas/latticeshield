@@ -17,6 +17,7 @@ tokio              = { workspace = true }
 aes-gcm            = { workspace = true }
 rand_core          = { workspace = true }
 anyhow                      = { workspace = true }
+zeroize                     = { workspace = true }
 tracing                     = { workspace = true }
 tracing-subscriber          = { workspace = true }
 axum                        = { workspace = true }
