@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::channel::EncryptedChannel;
 use crate::identity::ServerIdentity;
+use crate::metrics::MetricsState;
 
 const MAX_FRAME: usize = 64 * 1024;
 
@@ -55,7 +56,7 @@ async fn full_pqc_handshake_and_relay() {
 
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await;
+        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity, MetricsState::new()).await;
     });
 
     // ── Cliente: realiza el handshake autenticado ────────────────────────────
@@ -100,7 +101,7 @@ async fn two_sessions_produce_different_keys() {
         let bridge_addr = bridge_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, peer) = bridge_listener.accept().await.unwrap();
-            let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await;
+            let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity, MetricsState::new()).await;
         });
 
         let mut client = TcpStream::connect(bridge_addr).await.unwrap();
@@ -137,7 +138,7 @@ async fn tampered_client_response_is_rejected() {
 
     let bridge_result = tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await
+        crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity, MetricsState::new()).await
     });
 
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
@@ -353,7 +354,7 @@ async fn full_session_records_connections_and_bytes() {
     let bridge_addr = bridge_listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity).await;
+        let _ = crate::session::handle(socket, peer, backend_addr, MAX_FRAME, identity, MetricsState::new()).await;
     });
 
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
