@@ -9,9 +9,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{config::Config, identity::ServerIdentity, metrics, session};
+use crate::{config::ValidConfig, identity::ServerIdentity, metrics, session};
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     let metrics_handle = metrics::init()?;
 
     // ── Cargar identidad del servidor (falla rapido si no existe o permisos incorrectos)

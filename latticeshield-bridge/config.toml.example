@@ -1,0 +1,27 @@
+# LatticeShield Bridge — configuration reference
+# Copy to config.toml and adjust to your environment.
+# Run: latticeshield-bridge --config /etc/latticeshield/config.toml
+
+[server]
+# TCP address where the Bridge listens for client connections
+listen_addr = "0.0.0.0:8443"
+
+# Upstream backend to relay decrypted traffic to
+backend_addr = "127.0.0.1:8080"
+
+# Maximum encrypted frame payload in bytes (1 KiB – 16 MiB)
+max_frame_size = 65536
+
+[crypto]
+# Path to the ML-DSA-65 signing key (must have permissions 0600)
+# Generate with: latticeshield-bridge keygen ./keys
+signing_key_path = "./keys/server.sk"
+
+[metrics]
+# HTTP address for the Prometheus /metrics endpoint
+listen_addr = "0.0.0.0:8444"
+
+[logging]
+# Log level: error | warn | info | debug | trace
+# Override with RUST_LOG environment variable
+level = "info"

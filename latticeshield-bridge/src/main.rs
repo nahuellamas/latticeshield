@@ -1,14 +1,13 @@
-//! LatticeShield Bridge — reverse proxy quantum-safe.
+//! LatticeShield Bridge — quantum-safe reverse proxy.
 //!
-//! Variables de entorno:
-//!   LISTEN_ADDR        — donde escucha el proxy   (default: 0.0.0.0:8443)
-//!   BACKEND_ADDR       — backend de destino        (default: 127.0.0.1:8080)
-//!   METRICS_ADDR       — metricas Prometheus       (default: 0.0.0.0:8444)
-//!   SIGNING_KEY_PATH   — clave de firma ML-DSA-65  (default: ./keys/server.sk)
-//!   RUST_LOG           — nivel de log              (default: info)
-//!
-//! Subcomandos:
-//!   --keygen <dir>   Genera server.sk (0600) y server.vk (0644) en <dir>
+//! Usage:
+//!   latticeshield-bridge [--config <path>]
+//!   latticeshield-bridge keygen <dir>
+//!   latticeshield-bridge --version
+
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
 
 mod channel;
 mod config;
@@ -20,32 +19,55 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-use std::path::Path;
-use tracing::info;
+#[derive(Parser)]
+#[command(
+    name = "latticeshield-bridge",
+    version,
+    about = "Quantum-safe reverse proxy — X25519 + ML-KEM-768 + ML-DSA-65"
+)]
+struct Cli {
+    /// Path to config.toml (default: ./config.toml)
+    #[arg(long, default_value = "./config.toml")]
+    config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Generate a new ML-DSA-65 server keypair (server.sk + server.vk)
+    Keygen {
+        /// Directory to write server.sk (0600) and server.vk (0644)
+        #[arg(default_value = "./keys")]
+        dir: PathBuf,
+    },
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // ── Subcomando --keygen (no requiere runtime async) ──────────────────────
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("--keygen") {
-        let dir = args.get(2).map(Path::new).unwrap_or(Path::new("./keys"));
-        return identity::ServerIdentity::generate_and_save(dir);
+    let cli = Cli::parse();
+
+    if let Some(Commands::Keygen { dir }) = cli.command {
+        return identity::ServerIdentity::generate_and_save(&dir);
     }
 
-    // ── Arranque normal ──────────────────────────────────────────────────────
+    // Load config FIRST so log_level is available for tracing init
+    let config = config::Config::load(&cli.config)?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| config.log_level.clone()),
         )
         .init();
 
-    info!(
+    tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        crypto = "X25519 + ML-KEM-768 + ML-DSA-65 + HKDF-SHA256",
-        transport = "AES-256-GCM frames over TCP",
-        "LatticeShield Bridge arrancando"
+        listen = %config.listen_addr,
+        backend = %config.backend_addr,
+        metrics = %config.metrics_addr,
+        "LatticeShield Bridge starting"
     );
 
-    let config = config::Config::from_env()?;
     server::run(config).await
 }
