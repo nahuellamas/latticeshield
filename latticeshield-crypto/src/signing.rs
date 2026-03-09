@@ -12,7 +12,7 @@
 use libcrux_ml_dsa::ml_dsa_65;
 use rand_core::CryptoRngCore;
 use thiserror::Error;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 /// Tamanio de la clave de firma serializada.
 pub const SIGNING_KEY_LEN: usize = 4032;
@@ -38,12 +38,18 @@ pub enum SigningError {
 
 // ── Newtypes opacos ───────────────────────────────────────────────────────────
 
-/// Clave de firma ML-DSA-65. Material secreto — se zeroiza al salir del scope.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct SigningKey([u8; SIGNING_KEY_LEN]);
+/// Clave de firma ML-DSA-65. Material secreto — se zeroiza y se hace munlock al salir del scope.
+///
+/// El material de clave se almacena en el heap (`Box`) para que la direccion sea estable
+/// ante moves. Esto permite que `mlock(2)` funcione correctamente: el SO no paginara
+/// estos bytes al swap durante toda la vida del objeto.
+///
+/// En plataformas no-Unix el tipo funciona igual pero sin mlock.
+#[derive(Zeroize)]
+pub struct SigningKey(Box<[u8; SIGNING_KEY_LEN]>);
 
 impl SigningKey {
-    /// Construye una `SigningKey` desde un slice de bytes.
+    /// Construye una `SigningKey` desde un slice de bytes y bloquea la pagina en memoria.
     ///
     /// Retorna `SigningError::InvalidLength` si `bytes` no tiene exactamente
     /// `SIGNING_KEY_LEN` bytes.
@@ -51,12 +57,37 @@ impl SigningKey {
         let arr: [u8; SIGNING_KEY_LEN] = bytes
             .try_into()
             .map_err(|_| SigningError::InvalidLength)?;
-        Ok(Self(arr))
+        Ok(Self::new(arr))
     }
 
     /// Retorna los bytes de la clave de firma.
     pub fn to_bytes(&self) -> &[u8; SIGNING_KEY_LEN] {
         &self.0
+    }
+
+    /// Constructor interno: boxea los bytes y llama mlock sobre el heap.
+    fn new(bytes: [u8; SIGNING_KEY_LEN]) -> Self {
+        let boxed = Box::new(bytes);
+        #[cfg(unix)]
+        unsafe {
+            // Non-fatal: si mlock falla (p.ej. RLIMIT_MEMLOCK bajo) la clave sigue
+            // funcionando — solo pierde la garantia anti-swap.
+            libc::mlock(boxed.as_ptr() as *const libc::c_void, SIGNING_KEY_LEN);
+        }
+        Self(boxed)
+    }
+}
+
+impl Drop for SigningKey {
+    fn drop(&mut self) {
+        // Zeroizar primero: limpia los bytes mientras la pagina sigue bloqueada.
+        self.0.zeroize();
+        // Desbloquear despues: la pagina puede volver a ser candidata a swap,
+        // pero ya no contiene material sensible.
+        #[cfg(unix)]
+        unsafe {
+            libc::munlock(self.0.as_ptr() as *const libc::c_void, SIGNING_KEY_LEN);
+        }
     }
 }
 
@@ -145,7 +176,7 @@ pub fn generate_keypair(
     let sk_bytes: &[u8; SIGNING_KEY_LEN] = kp.signing_key.as_ref();
     let vk_bytes: &[u8; VERIFYING_KEY_LEN] = kp.verification_key.as_ref();
 
-    (SigningKey(*sk_bytes), VerifyingKey(*vk_bytes))
+    (SigningKey::new(*sk_bytes), VerifyingKey(*vk_bytes))
 }
 
 /// Firma `msg` con la `SigningKey` dada.
@@ -160,7 +191,7 @@ pub fn sign(
     let mut randomness = [0u8; libcrux_ml_dsa::SIGNING_RANDOMNESS_SIZE];
     rng.fill_bytes(&mut randomness);
 
-    let sk = ml_dsa_65::MLDSA65SigningKey::new(key.0);
+    let sk = ml_dsa_65::MLDSA65SigningKey::new(*key.0);
     let sig = ml_dsa_65::portable::sign(&sk, msg, EMPTY_CONTEXT, randomness)
         .map_err(|_| SigningError::Signing)?;
 
