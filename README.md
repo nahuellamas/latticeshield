@@ -150,8 +150,9 @@ cargo build --release
 | 3 | ML-DSA-65 OTA signing + Prometheus observability | Complete |
 | 4–5 | Server authentication — signed ServerHello, pre-shared VK, mlock | Complete |
 | 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
-| 7 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Planned |
-| 8+ | eBPF/XDP, TLS listener (rustls + quinn), OTA updater, Dashboard SaaS | Planned |
+| 7 | TLS listener — rustls + QUIC (quinn), standard HTTPS clients without agent | Planned |
+| 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Planned |
+| 9+ | eBPF/XDP, OTA updater, Dashboard SaaS | Planned |
 
 ## License
 
