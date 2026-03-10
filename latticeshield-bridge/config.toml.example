@@ -25,3 +25,20 @@ listen_addr = "0.0.0.0:8444"
 # Log level: error | warn | info | debug | trace
 # Override with RUST_LOG environment variable
 level = "info"
+
+[key_rotation]
+# Automatic AES-256-GCM session key rotation via HKDF-SHA256 ratchet.
+# The server initiates rotation; the client receives a KEY_ROTATE frame and
+# derives the same new key via HKDF(current_key, nonce, "latticeshield-v1-key-rotation").
+# The old key is zeroized from memory immediately after rotation.
+
+# Enable automatic key rotation (default: false)
+# enabled = false
+
+# Rotate after this many bytes have been transmitted (default: 10 GiB)
+# Minimum: 1048576 (1 MiB)
+# max_bytes_per_key = 10737418240
+
+# Rotate after this many seconds (default: 86400 = 24 hours)
+# Minimum: 60
+# max_seconds_per_key = 86400

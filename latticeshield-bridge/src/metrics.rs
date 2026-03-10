@@ -23,6 +23,7 @@ pub const CONNECTIONS_ACTIVE: &str = "latticeshield_connections_active";
 pub const HANDSHAKE_DURATION: &str = "latticeshield_handshake_duration_seconds";
 pub const BYTES_TRANSMITTED: &str = "latticeshield_bytes_transmitted_total";
 pub const CHANNEL_ERRORS: &str = "latticeshield_channel_errors_total";
+pub const KEY_ROTATIONS_TOTAL: &str = "latticeshield_key_rotations_total";
 
 /// Inicializa el recorder Prometheus y registra los descriptores de las cinco metricas.
 ///
@@ -40,6 +41,7 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
     );
     describe_counter!(BYTES_TRANSMITTED, "Bytes de payload transmitidos desde el backend al cliente");
     describe_counter!(CHANNEL_ERRORS, "Errores en el canal cifrado AES-256-GCM");
+    describe_counter!(KEY_ROTATIONS_TOTAL, "Total number of session key rotations performed");
 
     Ok(handle)
 }
@@ -65,13 +67,14 @@ impl Drop for ActiveGuard {
 
 // ── MetricsState — parallel AtomicU64 counters for heartbeat read-back ─────────
 
-/// Snapshot of all four metric counters, serializable to JSON.
+/// Snapshot of all metric counters, serializable to JSON.
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
     pub connections_active: u64,
     pub connections_total: u64,
     pub bytes_transmitted_total: u64,
     pub channel_errors_total: u64,
+    pub key_rotations_total: u64,
 }
 
 /// Parallel atomic counters for heartbeat reporting.
@@ -82,6 +85,7 @@ pub struct MetricsState {
     pub connections_active: AtomicU64,
     pub bytes_transmitted_total: AtomicU64,
     pub channel_errors_total: AtomicU64,
+    pub key_rotations_total: AtomicU64,
 }
 
 impl MetricsState {
@@ -91,6 +95,7 @@ impl MetricsState {
             connections_active: AtomicU64::new(0),
             bytes_transmitted_total: AtomicU64::new(0),
             channel_errors_total: AtomicU64::new(0),
+            key_rotations_total: AtomicU64::new(0),
         })
     }
 
@@ -100,6 +105,7 @@ impl MetricsState {
             connections_total: self.connections_total.load(Ordering::Relaxed),
             bytes_transmitted_total: self.bytes_transmitted_total.load(Ordering::Relaxed),
             channel_errors_total: self.channel_errors_total.load(Ordering::Relaxed),
+            key_rotations_total: self.key_rotations_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -171,6 +177,20 @@ mod metrics_state_tests {
         assert_eq!(snap.connections_active, 2);
         assert_eq!(snap.bytes_transmitted_total, 4096);
         assert_eq!(snap.channel_errors_total, 3);
+    }
+
+    #[test]
+    fn metrics_state_new_key_rotations_zero() {
+        let state = MetricsState::new();
+        assert_eq!(state.key_rotations_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_includes_key_rotations() {
+        let state = MetricsState::new();
+        state.key_rotations_total.fetch_add(3, Ordering::Relaxed);
+        let snap = state.snapshot();
+        assert_eq!(snap.key_rotations_total, 3);
     }
 
     #[tokio::test]

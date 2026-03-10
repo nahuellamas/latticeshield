@@ -105,6 +105,10 @@ fn default_cp_endpoint() -> String { String::new() }
 fn default_cp_agent_name() -> String { String::new() }
 fn default_cp_interval() -> u64 { 30 }
 
+fn default_kr_enabled() -> bool { false }
+fn default_kr_max_bytes() -> u64 { 10_737_418_240 } // 10 GB
+fn default_kr_max_seconds() -> u64 { 86_400 }       // 24 hours
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneConfig {
@@ -129,6 +133,27 @@ impl Default for ControlPlaneConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct KeyRotationConfig {
+    #[serde(default = "default_kr_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_kr_max_bytes")]
+    pub max_bytes_per_key: u64,
+    #[serde(default = "default_kr_max_seconds")]
+    pub max_seconds_per_key: u64,
+}
+
+impl Default for KeyRotationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_kr_enabled(),
+            max_bytes_per_key: default_kr_max_bytes(),
+            max_seconds_per_key: default_kr_max_seconds(),
+        }
+    }
+}
+
 // ── Root Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +164,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
     pub control_plane: ControlPlaneConfig,
+    pub key_rotation: KeyRotationConfig,
 }
 
 impl Default for Config {
@@ -149,6 +175,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),
             control_plane: ControlPlaneConfig::default(),
+            key_rotation: KeyRotationConfig::default(),
         }
     }
 }
@@ -167,6 +194,9 @@ pub struct ValidConfig {
     pub control_plane_endpoint: String,
     pub control_plane_agent_name: String,
     pub heartbeat_interval: std::time::Duration,
+    pub key_rotation_enabled: bool,
+    pub max_bytes_per_key: u64,
+    pub key_rotation_interval: std::time::Duration,
 }
 
 // ── Config::load + validate ────────────────────────────────────────────────────
@@ -239,6 +269,21 @@ impl Config {
             self.control_plane.heartbeat_interval_secs.max(5),
         );
 
+        // ── Key rotation validation ─────────────────────────────────────────
+        if self.key_rotation.max_bytes_per_key < 1_048_576 {
+            anyhow::bail!(
+                "key_rotation.max_bytes_per_key must be at least 1048576 (1 MiB), got {}",
+                self.key_rotation.max_bytes_per_key
+            );
+        }
+
+        if self.key_rotation.max_seconds_per_key < 60 {
+            anyhow::bail!(
+                "key_rotation.max_seconds_per_key must be at least 60, got {}",
+                self.key_rotation.max_seconds_per_key
+            );
+        }
+
         Ok(ValidConfig {
             listen_addr,
             backend_addr,
@@ -250,6 +295,9 @@ impl Config {
             control_plane_endpoint,
             control_plane_agent_name,
             heartbeat_interval,
+            key_rotation_enabled: self.key_rotation.enabled,
+            max_bytes_per_key: self.key_rotation.max_bytes_per_key,
+            key_rotation_interval: std::time::Duration::from_secs(self.key_rotation.max_seconds_per_key),
         })
     }
 }
@@ -475,5 +523,47 @@ listen_addr = "not_an_addr"
         );
         let cfg = Config::load(f.path()).unwrap();
         assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_secs(5));
+    }
+
+    // ── KeyRotation config tests ──────────────────────────────────────────────
+
+    #[test]
+    fn key_rotation_defaults_when_section_absent() {
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.key_rotation_enabled);
+        assert_eq!(cfg.max_bytes_per_key, 10_737_418_240);
+        assert_eq!(cfg.key_rotation_interval, std::time::Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn key_rotation_custom_values_accepted() {
+        let f = write_toml(
+            "[key_rotation]\nenabled = true\nmax_bytes_per_key = 1048576\nmax_seconds_per_key = 60\n",
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.key_rotation_enabled);
+        assert_eq!(cfg.max_bytes_per_key, 1_048_576);
+        assert_eq!(cfg.key_rotation_interval, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn key_rotation_max_bytes_below_minimum_rejected() {
+        let f = write_toml("[key_rotation]\nmax_bytes_per_key = 1000\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("max_bytes_per_key"),
+            "error should reference max_bytes_per_key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn key_rotation_max_seconds_below_minimum_rejected() {
+        let f = write_toml("[key_rotation]\nmax_seconds_per_key = 30\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("max_seconds_per_key"),
+            "error should reference max_seconds_per_key, got: {err}"
+        );
     }
 }

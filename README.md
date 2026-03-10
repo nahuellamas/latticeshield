@@ -120,7 +120,7 @@ cargo build --release
 
 ## Tests
 
-43 unit tests across both crates — all passing.
+86 unit + integration tests across both crates — all passing.
 
 ### latticeshield-crypto (26 tests)
 
@@ -130,13 +130,16 @@ cargo build --release
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (17 tests)
+### latticeshield-bridge (60 tests)
 
 | Module | Tests |
 |---|---|
+| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
+| `config` | TOML load/defaults/validation, control plane config, key rotation config |
 | `identity` | generate_and_save (files, permissions 0o600/0o644, sizes), load roundtrip, error paths |
-| `metrics` | Prometheus families, HTTP endpoint, session/byte counters, connection gauge |
-| `session` (integration) | Full PQC handshake + relay, tampered response rejection, key uniqueness |
+| `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
+| `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
+| `session` (integration) | Full PQC handshake + relay, tampered response rejection, key uniqueness, POST `/rotate` endpoint, time-based and byte-threshold key rotation, full relay after rotation |
 
 ## Roadmap
 
@@ -146,7 +149,7 @@ cargo build --release
 | 2 | TCP proxy bridge + AES-256-GCM relay | Complete |
 | 3 | ML-DSA-65 OTA signing + Prometheus observability | Complete |
 | 4–5 | Server authentication — signed ServerHello, pre-shared VK, mlock | Complete |
-| 6 | Config file (toml), control plane heartbeat, key rotation | Next |
+| 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
 | 7+ | eBPF/XDP, TLS listener (rustls + quinn), OTA updater, Dashboard SaaS | Planned |
 
 ## License

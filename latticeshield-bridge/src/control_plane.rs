@@ -186,6 +186,9 @@ mod tests {
             control_plane_endpoint: endpoint,
             control_plane_agent_name: "test-agent".to_string(),
             heartbeat_interval: Duration::from_secs(30),
+            key_rotation_enabled: false,
+            max_bytes_per_key: 10_737_418_240,
+            key_rotation_interval: Duration::from_secs(86_400),
         }
     }
 
