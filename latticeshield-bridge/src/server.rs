@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::ServerIdentity, metrics, metrics::MetricsState, session, tls};
+use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::ServerIdentity, metrics, metrics::MetricsState, quic, session, tls};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
@@ -57,6 +57,11 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
         metrics_state: Arc::clone(&metrics_state),
     };
     spawn_metrics_server(config.metrics_addr, app_state);
+
+    // ── QUIC listener (optional — only when quic.enabled = true) ────────────
+    if config.quic_enabled {
+        spawn_quic_listener(config.clone());
+    }
 
     // ── TLS listener (optional — only when tls.enabled = true) ──────────────
     if config.tls_enabled {
@@ -136,6 +141,45 @@ fn spawn_tls_listener(config: ValidConfig, acceptor: Arc<tokio_rustls::TlsAccept
                     }
                     Err(e) => {
                         tracing::warn!(%peer, "TLS handshake failed: {e}");
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn spawn_quic_listener(config: ValidConfig) {
+    tokio::spawn(async move {
+        let endpoint = match quic::build_endpoint(
+            &config.quic_cert_path,
+            &config.quic_key_path,
+            config.quic_listen_addr,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                error!(addr = %config.quic_listen_addr, "QUIC endpoint build failed: {e}");
+                return;
+            }
+        };
+        info!(addr = %config.quic_listen_addr, "QUIC listener active");
+
+        let relay = quic::QuicRelay::new(config.backend_addr);
+
+        loop {
+            let connecting = match endpoint.accept().await {
+                Some(c) => c,
+                None => break, // endpoint closed cleanly
+            };
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                match connecting.await {
+                    Ok(conn) => {
+                        if let Err(e) = relay.relay_connection(conn).await {
+                            tracing::warn!("QUIC connection error: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("QUIC handshake failed: {e}");
                     }
                 }
             });

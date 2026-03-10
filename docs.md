@@ -5,11 +5,14 @@ Es el primer archivo que ejecuta Rust cuando arrancás el programa. Hace exactam
 1. Parsear los argumentos de línea de comandos (con la librería clap):
    latticeshield-bridge → arranca el proxy (modo normal)
    latticeshield-bridge --config mi.toml → usa un config custom
-   latticeshield-bridge keygen ./keys → genera las claves del servidor
+   latticeshield-bridge keygen ./keys → genera las claves ML-DSA-65 del servidor
+   latticeshield-bridge tls-keygen ./keys → genera cert.pem + key.pem para el listener TLS/QUIC
 
-clap genera automáticamente el --help, el --version, y valida que los argumentos sean correctos. Antes de agregar clap, esto estaba hecho a mano con std::env::args().
+clap genera automáticamente el --help, el --version, y valida que los argumentos sean correctos.
 
-2. Si el comando es keygen: llama a identity::ServerIdentity::generate_and_save() y termina. No arranca el proxy.
+2. Si el comando es keygen: llama a identity::ServerIdentity::generate_and_save() y termina.
+   Si el comando es tls-keygen: llama a tls::generate_self_signed() (requiere --features tls-keygen) y termina.
+   Estos subcomandos no arrancan el proxy.
 
 3. Si no hay subcomando: carga el config.toml, inicializa los logs, y llama a server::run(config) — que es el loop infinito del proxy.
 
@@ -20,21 +23,27 @@ bloquear.
 
 server.rs — El oído del sistema
 
-Su única responsabilidad es escuchar conexiones TCP y despacharlas a tareas individuales. También expone el servidor HTTP de métricas.
+Su responsabilidad es arrancar todos los listeners y despachar conexiones a tareas individuales.
 
-Puerto 8443 (configurable)
-|
-| → nueva conexión TCP de cliente
-|
 server::run()
 |
 ├── crea el canal de rotación: watch::channel(0u64)
 ├── carga identity (claves ML-DSA) desde disco
-├── inicia servidor HTTP en puerto 8444 (GET /metrics + POST /rotate)
+├── inicia servidor HTTP de métricas en :8444 (GET /metrics + POST /rotate)
+├── si quic.enabled → spawn_quic_listener() en :8441 (UDP)
+├── si tls.enabled  → spawn_tls_listener() en :8440 (TCP)
 ├── inicia heartbeat al control plane (si está configurado)
 |
-└── loop infinito:
-acepta conexión → spawn(session::handle(conexión, rotate_tx.clone(), config.clone()))
+└── loop infinito en :8443:
+    acepta conexión TCP → spawn(session::handle())
+
+Hay tres listeners independientes corriendo en paralelo vía tokio::spawn():
+
+1. spawn_quic_listener(): crea un quinn::Endpoint en UDP, acepta conexiones QUIC, y por cada conexión llama a QuicRelay::relay_connection(). Es opt-in: solo se inicia si [quic] enabled = true en config.toml.
+
+2. spawn_tls_listener(): crea un TcpListener en :8440, hace el handshake TLS con rustls, y pasa el stream a HttpRelay::handle(). También opt-in: [tls] enabled = true.
+
+3. Loop principal (PQC): el listener original en :8443. Siempre activo.
 
 El tokio::spawn() es clave: crea una tarea async nueva para cada conexión. Esas tareas corren concurrentemente sin bloquear entre sí. Si hay 500 clientes conectados al mismo tiempo, hay 500 tareas corriendo en paralelo — pero sin crear 500 threads del sistema operativo (Tokio los multiplexa eficientemente).
 
@@ -82,6 +91,82 @@ El select! tiene cuatro brazos. Los tres triggers de rotación (bytes, tiempo, P
 ¿Por qué el if después y no dentro? AES-GCM necesita &mut self para rotar la clave (rotate_key modifica los internos del canal). Pero dentro del select!, el canal ya tiene un borrow &self por el read_frame() que está siendo polleado. Si intentás hacer &mut mientras &self está activo, el compilador de Rust te para. La solución: el select! devuelve un bool, y el &mut borrow solo se toma después de que el select! termina y libera todos sus borrows.
 
 do_rotate() genera un nonce aleatorio, lo envía al cliente como KEY_ROTATE, y llama a channel.rotate_key(nonce). El cliente — que recibe el frame KEY_ROTATE — aplica el mismo HKDF con el mismo nonce y deriva la misma clave nueva. TCP garantiza el orden: el cliente siempre procesa el KEY_ROTATE antes que cualquier DATA frame cifrado con la clave nueva.
+
+---
+
+tls.rs — El constructor del listener HTTPS
+
+Encapsula todo lo relacionado con rustls: cargar certificados, construir configuraciones, y generar certs de prueba.
+
+Las tres funciones públicas principales:
+
+load_certs(path) → carga un archivo PEM y retorna Vec<CertificateDer>. Usa rustls-pemfile.
+load_private_key(path) → carga la clave privada PEM. Retorna error si el archivo no tiene ninguna clave.
+build_server_config(cert_path, key_path) → construye un Arc<rustls::ServerConfig> con no_client_auth. Es la función base: tanto el listener TLS como el QUIC la usan para obtener su configuración criptográfica.
+build_acceptor(cert_path, key_path) → envuelve build_server_config() en un TlsAcceptor (para tokio-rustls). Lo usa el listener TCP/TLS.
+generate_self_signed(dir) → genera cert.pem + key.pem usando rcgen. Solo disponible con --features tls-keygen. Útil para desarrollo y tests.
+
+¿Por qué build_server_config está separado de build_acceptor?
+
+El listener TLS necesita un TlsAcceptor (tipo de tokio-rustls).
+El listener QUIC necesita un rustls::ServerConfig crudo (quinn lo convierte internamente).
+Ambos comparten la misma lógica de carga. Separar las funciones evita duplicar el código de cert/key loading.
+
+---
+
+http_relay.rs — El relay HTTP/1.1 para clientes estándar
+
+Cuando un cliente se conecta al listener TLS (:8440), no habla el protocolo PQC custom — habla HTTP/1.1 normal. http_relay.rs se encarga de parsear ese request y forwardearlo al backend.
+
+Flujo de handle(tls_stream, peer):
+
+1. Lee bytes del stream TLS hasta encontrar \r\n\r\n (fin de los headers HTTP).
+   Usa httparse para detectar cuándo los headers están completos.
+   Si los headers superan 8 KiB → responde 400 Bad Request y cierra.
+
+2. Conecta al backend por TCP.
+   Si falla → responde 502 Bad Gateway y cierra.
+
+3. Forwarda el buffer completo (headers + body inicial ya leído) al backend.
+
+4. Relay bidireccional con tokio::select!:
+   cliente → backend: tokio::io::copy(&mut client_read, &mut backend_write)
+   backend → cliente: tokio::io::copy(&mut backend_read, &mut client_write)
+
+¿Por qué select! acá y try_join! en el relay QUIC?
+
+HTTP/1.1 sobre TCP tiene semántica de "una sola respuesta por conexión" en el caso básico. Cuando el backend termina de responder y cierra, el select! lo detecta y cierra también el lado del cliente. Es comportamiento correcto para HTTP/1.1.
+
+QUIC tiene half-close por stream: cada stream se cierra independientemente en cada dirección. Usar select! en QUIC causaría data loss silencioso. Por eso quic.rs usa try_join! — espera que AMBAS direcciones terminen.
+
+---
+
+quic.rs — El relay QUIC (raw streams)
+
+Implementa un relay de streams QUIC → TCP sin HTTP/3 framing. Cada stream QUIC bidi es independiente y se mapea a una conexión TCP fresca al backend.
+
+Las dos funciones/tipos principales:
+
+build_endpoint(cert_path, key_path, listen_addr) → construye un quinn::Endpoint. Internamente llama a tls::build_server_config() y lo convierte al formato que quinn espera (QuicServerConfig). Bindea un socket UDP.
+
+QuicRelay { backend_addr } — struct con Clone (necesario para moverse dentro de tokio::spawn).
+
+relay_connection(conn): loop que acepta streams bidi del cliente QUIC. Por cada stream, spawnea una tarea que llama a relay_stream(). Si la conexión se cierra normalmente (ApplicationClosed / LocallyClosed), el loop termina limpiamente.
+
+relay_stream(send, recv): el corazón del relay.
+1. Conecta al backend por TCP.
+2. Usa tokio::try_join! para correr ambas direcciones concurrentemente:
+   recv (QUIC) → backend_write (TCP)
+   backend_read (TCP) → send (QUIC)
+3. OBLIGATORIO: llama send.finish() después del try_join!.
+
+¿Por qué send.finish() es obligatorio?
+
+En quinn 0.11, el SendStream NO llama finish() al ser dropeado. Si no lo llamás explícitamente, el peer QUIC remoto queda esperando EOF para siempre — la conexión se cuelga. Este es el gotcha más importante de quinn 0.11.
+
+¿Por qué try_join! y no select!?
+
+QUIC soporta half-close: el cliente puede cerrar su lado del stream (dejar de enviar) sin cerrar el lado del servidor. select! cancela la dirección "perdedora" y dropea los bytes pendientes. try_join! espera que ambas terminen. quinn::RecvStream devuelve Ok(0) cuando recibe el FIN del peer, por lo que la copia termina naturalmente.
 
 ---
 
@@ -167,7 +252,7 @@ El resto del programa solo recibe ValidConfig — nunca toca los strings. Si lle
 
 La estructura del config.toml:
 [server]
-listen_addr = "0.0.0.0:8443"
+listen_addr = "0.0.0.0:8443"    # listener PQC custom (siempre activo)
 backend_addr = "127.0.0.1:8080"
 
 [crypto]
@@ -179,6 +264,18 @@ listen_addr = "0.0.0.0:8444"
 [logging]
 level = "info"
 
+[tls]
+enabled = false                   # listener HTTPS estándar (:8440)
+listen_addr = "0.0.0.0:8440"
+cert_path = "./keys/cert.pem"    # requerido si enabled = true
+key_path = "./keys/key.pem"      # requerido si enabled = true
+
+[quic]
+enabled = false                   # listener QUIC/UDP (:8441)
+listen_addr = "0.0.0.0:8441"
+cert_path = "./keys/cert.pem"    # puede compartir cert con [tls]
+key_path = "./keys/key.pem"
+
 [control_plane]
 enabled = false
 endpoint = "http://tu-control-plane:9000"
@@ -188,7 +285,7 @@ enabled = false           # activar rotación automática de clave de sesión
 max_bytes_per_key = 10737418240   # rotar después de 10 GB transmitidos
 max_seconds_per_key = 86400       # rotar después de 24 horas
 
-La sección [key_rotation] es completamente opcional — si no la ponés, los defaults se aplican solos y la rotación está desactivada. La validación rechaza valores por debajo del mínimo (1 MiB de bytes, 60 segundos) para evitar rotaciones tan frecuentes que degraden el rendimiento.
+Las secciones [tls], [quic] y [key_rotation] son completamente opcionales — si no las ponés, los defaults se aplican (disabled) y esos listeners no se inician. La validación rechaza configuraciones inconsistentes: enabled = true sin cert_path/key_path falla al arrancar con un error claro. También detecta colisiones de puertos entre listeners.
 
 ---
 

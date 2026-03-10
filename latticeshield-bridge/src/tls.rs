@@ -34,9 +34,9 @@ fn load_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow::anyhow!("no private key found in: {}", path.display()))
 }
 
-/// Load cert + key from PEM files and build a TlsAcceptor.
-/// Returns Err with an actionable message if files are missing or malformed.
-pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
+/// Build a rustls ServerConfig from PEM cert+key files.
+/// Returns Arc<ServerConfig> — consumed by both TlsAcceptor (TLS) and quinn Endpoint (QUIC).
+pub fn build_server_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<Arc<ServerConfig>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let config = ServerConfig::builder()
@@ -48,7 +48,14 @@ pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAc
             cert_path.display(),
             key_path.display()
         ))?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(Arc::new(config))
+}
+
+/// Load cert + key from PEM files and build a TlsAcceptor.
+/// Returns Err with an actionable message if files are missing or malformed.
+pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
+    let config = build_server_config(cert_path, key_path)?;
+    Ok(TlsAcceptor::from(config))
 }
 
 /// Generate a self-signed TLS cert+key for development use.
@@ -161,6 +168,35 @@ mod tests {
             .expect("should be Err")
             .to_string();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn build_server_config_valid_cert_ok() {
+        let (cert_f, key_f) = make_self_signed_files();
+        let result = build_server_config(cert_f.path(), key_f.path());
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn build_server_config_missing_cert_err() {
+        let key_f = NamedTempFile::new().unwrap();
+        let err = build_server_config(Path::new("/nonexistent/tls.crt"), key_f.path())
+            .err()
+            .expect("should be Err")
+            .to_string();
+        assert!(err.contains("cert"), "expected 'cert' in error, got: {err}");
+    }
+
+    #[test]
+    fn build_server_config_missing_key_err() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let mut cert_f = NamedTempFile::new().unwrap();
+        cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
+        let err = build_server_config(cert_f.path(), Path::new("/nonexistent/tls.key"))
+            .err()
+            .expect("should be Err")
+            .to_string();
+        assert!(err.contains("key"), "expected 'key' in error, got: {err}");
     }
 
     #[cfg(feature = "tls-keygen")]

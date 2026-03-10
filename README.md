@@ -9,18 +9,29 @@ Classical key exchange (ECDH, RSA) is vulnerable to future quantum computers via
 ## Architecture
 
 ```
-Client
-  |
-  | (hybrid handshake: X25519 + ML-KEM-768)
-  |
-LatticeShield Proxy
-  |
-  | (plain TLS or internal transport)
-  |
-Backend Service
+Standard HTTPS client (curl, browser)       PQC-aware client (custom agent)
+  |                                            |
+  | HTTPS / TLS (:8440)                        | PQC handshake (:8443)
+  |                                            |
+  +-------------------+------------------------+
+                      |
+             LatticeShield Proxy
+                      |
+                      | plain TCP
+                      |
+               Backend Service
 ```
 
-The proxy is transparent — backends require no changes.
+LatticeShield runs three independent listeners:
+
+| Port | Protocol | Client |
+|------|----------|--------|
+| `:8443` | Custom PQC (X25519 + ML-KEM-768 + AES-256-GCM) | Agents with custom handshake |
+| `:8440` | Standard TLS / HTTPS (rustls 0.23) | curl, browsers, any HTTPS client |
+| `:8441` | QUIC / UDP (quinn 0.11) | QUIC-capable clients |
+| `:8444` | Plain HTTP (Prometheus metrics) | Monitoring systems |
+
+Backends require no changes — the proxy is transparent.
 
 ## Cryptographic Design
 
@@ -65,12 +76,17 @@ latticeshield/
 │       └── anti_replay.rs       # 0-RTT anti-replay filter
 └── latticeshield-bridge/        # Proxy agent
     └── src/
-        ├── main.rs              # Entry point — --keygen subcommand
-        ├── server.rs            # Listener + session dispatch
-        ├── session.rs           # PQC handshake + AES-GCM relay
+        ├── main.rs              # Entry point — keygen / tls-keygen / quic-keygen subcommands
+        ├── server.rs            # Three listeners: PQC + TLS + QUIC
+        ├── session.rs           # PQC handshake + AES-GCM relay + key rotation
+        ├── channel.rs           # AES-256-GCM frame format + HKDF ratchet
+        ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
+        ├── http_relay.rs        # HTTP/1.1 relay for TLS listener (httparse + tokio::io::copy)
+        ├── quic.rs              # QUIC relay (quinn 0.11) — raw bidi stream → TCP
         ├── identity.rs          # ServerIdentity: load/generate ML-DSA-65 keypair
-        ├── config.rs            # Env-based config (SIGNING_KEY_PATH, BACKEND_ADDR)
-        └── metrics.rs           # Prometheus /metrics endpoint
+        ├── config.rs            # TOML config — BridgeConfig + ValidConfig
+        ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
+        └── control_plane.rs     # Heartbeat to remote control plane
 ```
 
 ## Security Constraints
@@ -120,7 +136,7 @@ cargo build --release
 
 ## Tests
 
-86 unit + integration tests across both crates — all passing.
+123 unit + integration tests across both crates — all passing.
 
 ### latticeshield-crypto (26 tests)
 
@@ -130,12 +146,15 @@ cargo build --release
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (60 tests)
+### latticeshield-bridge (97 tests)
 
 | Module | Tests |
 |---|---|
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
-| `config` | TOML load/defaults/validation, control plane config, key rotation config |
+| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, port collision detection |
+| `tls` | `build_server_config`, `build_acceptor`, cert/key loading, self-signed generation (feature-gated) |
+| `http_relay` | HTTP head parsing (complete/partial/oversized), GET forwarding, POST with body, backend down → 502 |
+| `quic` | `build_endpoint`, `relay_stream` end-to-end, backend down → error, normal connection close |
 | `identity` | generate_and_save (files, permissions 0o600/0o644, sizes), load roundtrip, error paths |
 | `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
@@ -150,7 +169,7 @@ cargo build --release
 | 3 | ML-DSA-65 OTA signing + Prometheus observability | Complete |
 | 4–5 | Server authentication — signed ServerHello, pre-shared VK, mlock | Complete |
 | 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
-| 7 | TLS listener — rustls + QUIC (quinn), standard HTTPS clients without agent | Planned |
+| 7 | TLS listener (rustls 0.23) + QUIC listener (quinn 0.11), standard HTTPS/QUIC clients without agent | Complete |
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Planned |
 | 9+ | eBPF/XDP, OTA updater, Dashboard SaaS | Planned |
 

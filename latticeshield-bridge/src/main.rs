@@ -15,6 +15,7 @@ mod control_plane;
 mod http_relay;
 pub(crate) mod identity;
 mod metrics;
+mod quic;
 mod server;
 mod session;
 mod tls;
@@ -52,19 +53,40 @@ enum Commands {
         #[arg(default_value = "./keys")]
         dir: PathBuf,
     },
+    /// Generate a self-signed TLS cert+key for QUIC (same PEM format as tls-keygen).
+    /// Writes tls.crt (0644) and tls.key (0600) to the specified directory.
+    QuicKeygen {
+        /// Directory to write tls.crt and tls.key into (created if absent)
+        #[arg(default_value = "./keys")]
+        dir: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if let Some(Commands::Keygen { dir }) = cli.command {
-        return identity::ServerIdentity::generate_and_save(&dir);
+    if let Some(Commands::Keygen { dir }) = &cli.command {
+        return identity::ServerIdentity::generate_and_save(dir);
     }
 
-    if let Some(Commands::TlsKeygen { dir }) = cli.command {
+    if let Some(Commands::TlsKeygen { dir }) = &cli.command {
         #[cfg(feature = "tls-keygen")]
-        return tls::generate_self_signed(&dir);
+        return tls::generate_self_signed(dir);
+        #[cfg(not(feature = "tls-keygen"))]
+        {
+            let _ = dir;
+            eprintln!(
+                "Error: tls-keygen feature not enabled.\n\
+                 Rebuild with: cargo build --features tls-keygen"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(Commands::QuicKeygen { dir }) = &cli.command {
+        #[cfg(feature = "tls-keygen")]
+        return tls::generate_self_signed(dir);
         #[cfg(not(feature = "tls-keygen"))]
         {
             let _ = dir;

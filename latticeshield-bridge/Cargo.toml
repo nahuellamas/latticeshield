@@ -34,6 +34,8 @@ url                         = "2"
 tokio-rustls                = "0.26"
 rustls-pemfile              = "2"
 httparse                    = "1"
+quinn  = { workspace = true }
+rustls = { workspace = true }
 
 [dependencies.rcgen]
 version  = "0.13"
@@ -44,6 +46,7 @@ default    = []
 tls-keygen = ["dep:rcgen"]
 
 [dev-dependencies]
-tempfile = "3"
-wiremock = "0.6"
-rcgen    = "0.13"
+tempfile   = "3"
+wiremock   = "0.6"
+rcgen      = "0.13"
+tokio-test = "0.4"
