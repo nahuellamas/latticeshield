@@ -114,6 +114,9 @@ fn default_tls_listen_addr() -> String { "0.0.0.0:8440".to_string() }
 fn default_tls_cert_path() -> PathBuf { PathBuf::from("./keys/tls.crt") }
 fn default_tls_key_path() -> PathBuf { PathBuf::from("./keys/tls.key") }
 
+fn default_quic_enabled() -> bool { false }
+fn default_quic_listen_addr() -> String { "0.0.0.0:8441".to_string() }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneConfig {
@@ -183,6 +186,28 @@ impl Default for TlsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct QuicConfig {
+    #[serde(default = "default_quic_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_quic_listen_addr")]
+    pub listen_addr: String,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_quic_enabled(),
+            listen_addr: default_quic_listen_addr(),
+            cert_path: None,
+            key_path: None,
+        }
+    }
+}
+
 // ── Root Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,6 +220,7 @@ pub struct Config {
     pub control_plane: ControlPlaneConfig,
     pub key_rotation: KeyRotationConfig,
     pub tls: TlsConfig,
+    pub quic: QuicConfig,
 }
 
 impl Default for Config {
@@ -207,6 +233,7 @@ impl Default for Config {
             control_plane: ControlPlaneConfig::default(),
             key_rotation: KeyRotationConfig::default(),
             tls: TlsConfig::default(),
+            quic: QuicConfig::default(),
         }
     }
 }
@@ -232,6 +259,10 @@ pub struct ValidConfig {
     pub tls_listen_addr: SocketAddr,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
+    pub quic_enabled: bool,
+    pub quic_listen_addr: SocketAddr,
+    pub quic_cert_path: PathBuf,   // only meaningful when quic_enabled = true
+    pub quic_key_path: PathBuf,    // only meaningful when quic_enabled = true
 }
 
 // ── Config::load + validate ────────────────────────────────────────────────────
@@ -347,6 +378,37 @@ impl Config {
             }
         }
 
+        // ── QUIC listener validation ─────────────────────────────────────────
+        let quic_listen_addr: SocketAddr = self.quic.listen_addr.parse()
+            .context("invalid quic.listen_addr")?;
+
+        if self.quic.enabled {
+            if self.quic.cert_path.is_none() {
+                anyhow::bail!("quic.cert_path must be set when quic.enabled = true");
+            }
+            if self.quic.key_path.is_none() {
+                anyhow::bail!("quic.key_path must be set when quic.enabled = true");
+            }
+            if quic_listen_addr == listen_addr {
+                anyhow::bail!(
+                    "quic.listen_addr ({}) conflicts with server.listen_addr — they must be different ports",
+                    quic_listen_addr
+                );
+            }
+            if self.tls.enabled && quic_listen_addr == tls_listen_addr {
+                anyhow::bail!(
+                    "quic.listen_addr ({}) conflicts with tls.listen_addr — same addr/port on UDP vs TCP is confusing, use different ports",
+                    quic_listen_addr
+                );
+            }
+            if quic_listen_addr == metrics_addr {
+                anyhow::bail!(
+                    "quic.listen_addr ({}) conflicts with metrics.listen_addr — they must be different ports",
+                    quic_listen_addr
+                );
+            }
+        }
+
         Ok(ValidConfig {
             listen_addr,
             backend_addr,
@@ -365,6 +427,10 @@ impl Config {
             tls_listen_addr,
             tls_cert_path: self.tls.cert_path,
             tls_key_path: self.tls.key_path,
+            quic_enabled: self.quic.enabled,
+            quic_listen_addr,
+            quic_cert_path: self.quic.cert_path.unwrap_or_default(),
+            quic_key_path: self.quic.key_path.unwrap_or_default(),
         })
     }
 }
@@ -688,6 +754,86 @@ listen_addr = "not_an_addr"
     fn tls_disabled_skips_path_and_cert_validation() {
         // cert/key paths are empty and files don't exist, but enabled = false → no error
         let f = write_toml("[tls]\nenabled = false\n");
+        Config::load(f.path()).unwrap();
+    }
+
+    // ── QuicConfig tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn quic_disabled_by_default() {
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.quic_enabled);
+        assert_eq!(cfg.quic_listen_addr.to_string(), "0.0.0.0:8441");
+    }
+
+    #[test]
+    fn quic_section_parsed_from_toml() {
+        let f = write_toml(
+            "[quic]\nenabled = true\nlisten_addr = \"127.0.0.1:8441\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.quic_enabled);
+        assert_eq!(cfg.quic_listen_addr.to_string(), "127.0.0.1:8441");
+        assert_eq!(cfg.quic_cert_path, PathBuf::from("./keys/tls.crt"));
+        assert_eq!(cfg.quic_key_path, PathBuf::from("./keys/tls.key"));
+    }
+
+    #[test]
+    fn quic_enabled_missing_cert_path_rejected() {
+        let f = write_toml(
+            "[quic]\nenabled = true\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("cert_path"), "expected cert_path in error, got: {err}");
+    }
+
+    #[test]
+    fn quic_enabled_missing_key_path_rejected() {
+        let f = write_toml(
+            "[quic]\nenabled = true\ncert_path = \"./keys/tls.crt\"\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("key_path"), "expected key_path in error, got: {err}");
+    }
+
+    #[test]
+    fn quic_listen_addr_collides_with_pqc_rejected() {
+        // default server.listen_addr is 0.0.0.0:8443
+        let f = write_toml(
+            "[quic]\nenabled = true\nlisten_addr = \"0.0.0.0:8443\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts in error, got: {err}");
+    }
+
+    #[test]
+    fn quic_listen_addr_collides_with_tls_rejected() {
+        // tls.listen_addr = 0.0.0.0:8440, quic.listen_addr = 0.0.0.0:8440
+        let f = write_toml(
+            "[tls]\nenabled = true\nlisten_addr = \"0.0.0.0:8440\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n\
+             [quic]\nenabled = true\nlisten_addr = \"0.0.0.0:8440\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts in error, got: {err}");
+    }
+
+    #[test]
+    fn quic_listen_addr_collides_with_metrics_rejected() {
+        // default metrics is 0.0.0.0:8444
+        let f = write_toml(
+            "[quic]\nenabled = true\nlisten_addr = \"0.0.0.0:8444\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts in error, got: {err}");
+    }
+
+    #[test]
+    fn quic_disabled_skips_cert_and_collision_validation() {
+        // enabled=false, no cert_path, colliding addr → no error
+        let f = write_toml(
+            "[quic]\nenabled = false\nlisten_addr = \"0.0.0.0:8443\"\n"
+        );
         Config::load(f.path()).unwrap();
     }
 }
