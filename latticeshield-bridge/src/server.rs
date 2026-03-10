@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, control_plane, identity::ServerIdentity, metrics, metrics::MetricsState, session};
+use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::ServerIdentity, metrics, metrics::MetricsState, session, tls};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
@@ -58,6 +58,16 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     };
     spawn_metrics_server(config.metrics_addr, app_state);
 
+    // ── TLS listener (optional — only when tls.enabled = true) ──────────────
+    if config.tls_enabled {
+        let acceptor = tls::build_acceptor(&config.tls_cert_path, &config.tls_key_path)
+            .map_err(|e| anyhow::anyhow!(
+                "TLS setup failed: {e}\n\
+                 Hint: use `latticeshield-bridge tls-keygen ./keys` to generate a self-signed cert."
+            ))?;
+        spawn_tls_listener(config.clone(), Arc::new(acceptor));
+    }
+
     // ── TCP proxy listener ───────────────────────────────────────────────────
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "LatticeShield escuchando");
@@ -92,6 +102,45 @@ pub(crate) fn metrics_app(state: MetricsAppState) -> axum::Router {
         .route("/metrics", get(metrics_handler))
         .route("/rotate", post(rotate_handler))
         .with_state(state)
+}
+
+fn spawn_tls_listener(config: ValidConfig, acceptor: Arc<tokio_rustls::TlsAcceptor>) {
+    tokio::spawn(async move {
+        let listener = match TcpListener::bind(config.tls_listen_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(addr = %config.tls_listen_addr, "TLS listener bind failed: {e}");
+                return;
+            }
+        };
+        info!(addr = %config.tls_listen_addr, "TLS (HTTPS) listener active");
+
+        loop {
+            let (socket, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("TLS accept error: {e}");
+                    continue;
+                }
+            };
+
+            let acceptor = Arc::clone(&acceptor);
+            let relay = HttpRelay::new(config.backend_addr);
+
+            tokio::spawn(async move {
+                match acceptor.accept(socket).await {
+                    Ok(tls_stream) => {
+                        if let Err(e) = relay.handle(tls_stream, peer).await {
+                            tracing::warn!(%peer, "TLS relay error: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer, "TLS handshake failed: {e}");
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn spawn_metrics_server(addr: SocketAddr, state: MetricsAppState) {
