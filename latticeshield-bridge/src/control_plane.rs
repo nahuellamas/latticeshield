@@ -193,6 +193,10 @@ mod tests {
             tls_listen_addr: "127.0.0.1:8440".parse().unwrap(),
             tls_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
             tls_key_path: std::path::PathBuf::from("./keys/tls.key"),
+            quic_enabled: false,
+            quic_listen_addr: "127.0.0.1:8441".parse().unwrap(),
+            quic_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
+            quic_key_path: std::path::PathBuf::from("./keys/tls.key"),
         }
     }
 

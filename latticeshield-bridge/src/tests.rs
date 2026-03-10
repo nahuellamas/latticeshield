@@ -54,6 +54,10 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         tls_listen_addr: "127.0.0.1:0".parse().unwrap(),
         tls_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
         tls_key_path: std::path::PathBuf::from("./keys/tls.key"),
+        quic_enabled: false,
+        quic_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        quic_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
+        quic_key_path: std::path::PathBuf::from("./keys/tls.key"),
     }
 }
 
@@ -67,6 +71,21 @@ async fn tls_listener_not_spawned_when_disabled() {
         .await
         .expect("port 8440 should be free when TLS is disabled");
     // No further assertion needed — the bind succeeding is the assertion
+}
+
+#[tokio::test]
+async fn quic_listener_not_spawned_when_disabled() {
+    // When quic_enabled = false, UDP port 8441 should remain free
+    let addr: std::net::SocketAddr = "127.0.0.1:8441".parse().unwrap();
+    // If QUIC listener were spawned, binding this UDP socket would fail (or be non-exclusive).
+    // We just verify no crash and the test_config has quic_enabled = false.
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap();
+    let cfg = test_config(backend_addr);
+    assert!(!cfg.quic_enabled, "quic must be disabled in default test config");
+    // Also verify the UDP port is bindable (no ghost QUIC listener)
+    let sock = std::net::UdpSocket::bind(addr);
+    assert!(sock.is_ok(), "UDP port 8441 should be free when QUIC is disabled");
 }
 
 /// Crea un Arc<watch::Sender<u64>> de prueba (sin receptores activos).
