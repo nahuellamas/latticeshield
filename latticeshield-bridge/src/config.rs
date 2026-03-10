@@ -109,6 +109,11 @@ fn default_kr_enabled() -> bool { false }
 fn default_kr_max_bytes() -> u64 { 10_737_418_240 } // 10 GB
 fn default_kr_max_seconds() -> u64 { 86_400 }       // 24 hours
 
+fn default_tls_enabled() -> bool { false }
+fn default_tls_listen_addr() -> String { "0.0.0.0:8440".to_string() }
+fn default_tls_cert_path() -> PathBuf { PathBuf::from("./keys/tls.crt") }
+fn default_tls_key_path() -> PathBuf { PathBuf::from("./keys/tls.key") }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneConfig {
@@ -154,6 +159,30 @@ impl Default for KeyRotationConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    #[serde(default = "default_tls_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_tls_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_tls_cert_path")]
+    pub cert_path: PathBuf,
+    #[serde(default = "default_tls_key_path")]
+    pub key_path: PathBuf,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tls_enabled(),
+            listen_addr: default_tls_listen_addr(),
+            cert_path: default_tls_cert_path(),
+            key_path: default_tls_key_path(),
+        }
+    }
+}
+
 // ── Root Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +194,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub control_plane: ControlPlaneConfig,
     pub key_rotation: KeyRotationConfig,
+    pub tls: TlsConfig,
 }
 
 impl Default for Config {
@@ -176,6 +206,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             control_plane: ControlPlaneConfig::default(),
             key_rotation: KeyRotationConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -197,6 +228,10 @@ pub struct ValidConfig {
     pub key_rotation_enabled: bool,
     pub max_bytes_per_key: u64,
     pub key_rotation_interval: std::time::Duration,
+    pub tls_enabled: bool,
+    pub tls_listen_addr: SocketAddr,
+    pub tls_cert_path: PathBuf,
+    pub tls_key_path: PathBuf,
 }
 
 // ── Config::load + validate ────────────────────────────────────────────────────
@@ -284,6 +319,34 @@ impl Config {
             );
         }
 
+        // ── TLS listener validation ──────────────────────────────────────────
+        let tls_listen_addr: SocketAddr = self
+            .tls
+            .listen_addr
+            .parse()
+            .context("invalid tls.listen_addr")?;
+
+        if self.tls.enabled {
+            if self.tls.cert_path.as_os_str().is_empty() {
+                anyhow::bail!("tls.cert_path must be set when tls.enabled = true");
+            }
+            if self.tls.key_path.as_os_str().is_empty() {
+                anyhow::bail!("tls.key_path must be set when tls.enabled = true");
+            }
+            if tls_listen_addr == listen_addr {
+                anyhow::bail!(
+                    "tls.listen_addr ({}) conflicts with server.listen_addr — they must be different ports",
+                    tls_listen_addr
+                );
+            }
+            if tls_listen_addr == metrics_addr {
+                anyhow::bail!(
+                    "tls.listen_addr ({}) conflicts with metrics.listen_addr — they must be different ports",
+                    tls_listen_addr
+                );
+            }
+        }
+
         Ok(ValidConfig {
             listen_addr,
             backend_addr,
@@ -298,6 +361,10 @@ impl Config {
             key_rotation_enabled: self.key_rotation.enabled,
             max_bytes_per_key: self.key_rotation.max_bytes_per_key,
             key_rotation_interval: std::time::Duration::from_secs(self.key_rotation.max_seconds_per_key),
+            tls_enabled: self.tls.enabled,
+            tls_listen_addr,
+            tls_cert_path: self.tls.cert_path,
+            tls_key_path: self.tls.key_path,
         })
     }
 }
@@ -565,5 +632,62 @@ listen_addr = "not_an_addr"
             err.contains("max_seconds_per_key"),
             "error should reference max_seconds_per_key, got: {err}"
         );
+    }
+
+    // ── TlsConfig tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn tls_disabled_by_default() {
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.tls_enabled);
+    }
+
+    #[test]
+    fn tls_enabled_empty_cert_path_rejected() {
+        let f = write_toml("[tls]\nenabled = true\ncert_path = \"\"\nkey_path = \"./keys/tls.key\"\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("cert_path"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_enabled_empty_key_path_rejected() {
+        let f = write_toml("[tls]\nenabled = true\ncert_path = \"./keys/tls.crt\"\nkey_path = \"\"\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_enabled_bad_listen_addr_rejected() {
+        let f = write_toml("[tls]\nenabled = true\nlisten_addr = \"not_an_addr\"\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("tls.listen_addr"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_listen_addr_collides_with_pqc_rejected() {
+        // default PQC is 0.0.0.0:8443; set TLS to the same
+        let f = write_toml(
+            "[tls]\nenabled = true\nlisten_addr = \"0.0.0.0:8443\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_listen_addr_collides_with_metrics_rejected() {
+        // default metrics is 0.0.0.0:8444; set TLS to the same
+        let f = write_toml(
+            "[tls]\nenabled = true\nlisten_addr = \"0.0.0.0:8444\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_disabled_skips_path_and_cert_validation() {
+        // cert/key paths are empty and files don't exist, but enabled = false → no error
+        let f = write_toml("[tls]\nenabled = false\n");
+        Config::load(f.path()).unwrap();
     }
 }

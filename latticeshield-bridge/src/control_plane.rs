@@ -189,6 +189,10 @@ mod tests {
             key_rotation_enabled: false,
             max_bytes_per_key: 10_737_418_240,
             key_rotation_interval: Duration::from_secs(86_400),
+            tls_enabled: false,
+            tls_listen_addr: "127.0.0.1:8440".parse().unwrap(),
+            tls_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
+            tls_key_path: std::path::PathBuf::from("./keys/tls.key"),
         }
     }
 

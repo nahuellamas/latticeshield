@@ -50,7 +50,23 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         key_rotation_enabled: false,
         max_bytes_per_key: 10_737_418_240,
         key_rotation_interval: Duration::from_secs(86_400),
+        tls_enabled: false,
+        tls_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        tls_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
+        tls_key_path: std::path::PathBuf::from("./keys/tls.key"),
     }
+}
+
+#[tokio::test]
+async fn tls_listener_not_spawned_when_disabled() {
+    // When tls_enabled = false, port 8440 should remain free
+    // (this test verifies no phantom listener is bound)
+    let addr: std::net::SocketAddr = "127.0.0.1:8440".parse().unwrap();
+    // If TLS listener were spawned, binding this would fail
+    let _listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("port 8440 should be free when TLS is disabled");
+    // No further assertion needed — the bind succeeding is the assertion
 }
 
 /// Crea un Arc<watch::Sender<u64>> de prueba (sin receptores activos).

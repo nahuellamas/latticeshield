@@ -12,10 +12,12 @@ use clap::{Parser, Subcommand};
 mod channel;
 mod config;
 mod control_plane;
+mod http_relay;
 pub(crate) mod identity;
 mod metrics;
 mod server;
 mod session;
+mod tls;
 
 #[cfg(test)]
 mod tests;
@@ -43,6 +45,13 @@ enum Commands {
         #[arg(default_value = "./keys")]
         dir: PathBuf,
     },
+    /// Generate a self-signed TLS certificate and private key for dev/test use.
+    /// Writes tls.crt (0644) and tls.key (0600) to the specified directory.
+    TlsKeygen {
+        /// Directory to write tls.crt and tls.key (created if absent)
+        #[arg(default_value = "./keys")]
+        dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -51,6 +60,20 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Commands::Keygen { dir }) = cli.command {
         return identity::ServerIdentity::generate_and_save(&dir);
+    }
+
+    if let Some(Commands::TlsKeygen { dir }) = cli.command {
+        #[cfg(feature = "tls-keygen")]
+        return tls::generate_self_signed(&dir);
+        #[cfg(not(feature = "tls-keygen"))]
+        {
+            let _ = dir;
+            eprintln!(
+                "Error: tls-keygen feature not enabled.\n\
+                 Rebuild with: cargo build --features tls-keygen"
+            );
+            std::process::exit(1);
+        }
     }
 
     // Load config FIRST so log_level is available for tracing init
