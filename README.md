@@ -194,7 +194,9 @@ cargo build --release
 | 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
 | 7 | TLS listener (rustls 0.23) + QUIC listener (quinn 0.11), standard HTTPS/QUIC clients without agent | Complete |
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
-| 9+ | eBPF/XDP, OTA updater, Dashboard SaaS | Planned |
+| 9 | Mutual auth (client identity + ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Planned |
+| 10 | Workspace CLI tool (unified keygen/setup) + identity.rs disk tests (bridge debt) | Planned |
+| 11+ | eBPF/XDP (scope TBD after explore), OTA updater, Dashboard SaaS | Planned |
 
 ## License
 
