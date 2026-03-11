@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use crate::channel::{EncryptedChannel, FrameResult};
+use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 use crate::config::ValidConfig;
 use crate::identity::ServerIdentity;
 use crate::metrics::MetricsState;
@@ -416,7 +416,7 @@ async fn full_session_records_connections_and_bytes() {
     let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
     client.write_all(&serialize_client_response(&response)).await.unwrap();
 
-    let channel = crate::channel::EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let channel = latticeshield_crypto::channel::EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
     let payload = b"GET / HTTP/1.0\r\n\r\n";
     channel.write_frame(&mut client, payload).await.unwrap();
     let _ = channel.read_frame(&mut client).await.unwrap();

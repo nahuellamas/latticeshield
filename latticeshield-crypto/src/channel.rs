@@ -84,8 +84,6 @@ impl EncryptedChannel {
         writer.write_all(&nonce_bytes).await.context("write frame nonce")?;
         writer.write_all(&ciphertext).await.context("write frame ciphertext")?;
 
-        metrics::counter!(crate::metrics::BYTES_TRANSMITTED).increment(data.len() as u64);
-
         Ok(())
     }
 
@@ -118,10 +116,7 @@ impl EncryptedChannel {
                 let plaintext = self
                     .cipher
                     .decrypt(nonce, ciphertext.as_ref())
-                    .map_err(|_| {
-                        metrics::counter!(crate::metrics::CHANNEL_ERRORS).increment(1);
-                        anyhow!("AES-GCM decrypt failed — posible replay o tampering")
-                    })?;
+                    .map_err(|_| anyhow!("AES-GCM decrypt failed — posible replay o tampering"))?;
 
                 Ok(FrameResult::Data(plaintext))
             }

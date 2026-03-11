@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-mod channel;
 mod config;
 mod control_plane;
 mod http_relay;

@@ -2,6 +2,7 @@
 members = [
     "latticeshield-crypto",
     "latticeshield-bridge",
+    "latticeshield-client",
 ]
 resolver = "2"
 

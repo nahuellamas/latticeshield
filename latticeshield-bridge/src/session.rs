@@ -29,7 +29,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::channel::{EncryptedChannel, FrameResult};
+use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 use crate::config::ValidConfig;
 use crate::identity::ServerIdentity;
 use crate::metrics::{ActiveGuard, MetricsActiveGuard, MetricsState};
@@ -130,6 +130,7 @@ pub async fn handle(
                     Err(e) => {
                         warn!(%peer, "error leyendo frame del cliente: {e}");
                         metrics_state.channel_errors_total.fetch_add(1, Ordering::Relaxed);
+                        metrics::counter!(crate::metrics::CHANNEL_ERRORS).increment(1);
                         break;
                     }
                 }
@@ -147,6 +148,7 @@ pub async fn handle(
                             .await
                             .context("write frame al cliente")?;
                         metrics_state.bytes_transmitted_total.fetch_add(n as u64, Ordering::Relaxed);
+                        metrics::counter!(crate::metrics::BYTES_TRANSMITTED).increment(n as u64);
                         bytes_this_epoch += n as u64;
                         // Trigger por umbral de bytes
                         config.key_rotation_enabled && bytes_this_epoch >= config.max_bytes_per_key

@@ -1,0 +1,32 @@
+[package]
+name        = "latticeshield-client"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+name = "latticeshield_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "latticeshield-client"
+path = "src/main.rs"
+
+[dependencies]
+latticeshield-crypto = { path = "../latticeshield-crypto" }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+zeroize    = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap       = { version = "4", features = ["derive"] }
+serde      = { workspace = true }
+toml       = "0.8"
+sha2       = { workspace = true }
+rand_core  = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+rand     = "0.8"

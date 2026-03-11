@@ -14,9 +14,6 @@ path = "src/main.rs"
 [dependencies]
 latticeshield-crypto = { path = "../latticeshield-crypto" }
 tokio              = { workspace = true }
-aes-gcm            = { workspace = true }
-hkdf               = { workspace = true }
-sha2               = { workspace = true }
 rand_core          = { workspace = true }
 anyhow                      = { workspace = true }
 zeroize                     = { workspace = true }
