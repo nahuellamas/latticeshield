@@ -9,24 +9,30 @@ Classical key exchange (ECDH, RSA) is vulnerable to future quantum computers via
 ## Architecture
 
 ```
-Standard HTTPS client (curl, browser)       PQC-aware client (custom agent)
-  |                                            |
-  | HTTPS / TLS (:8440)                        | PQC handshake (:8443)
-  |                                            |
-  +-------------------+------------------------+
-                      |
-             LatticeShield Proxy
-                      |
-                      | plain TCP
-                      |
-               Backend Service
+User Application (plain TCP)
+  |
+  | plain TCP (:9090)
+  |
+latticeshield-client          Standard HTTPS client (curl, browser)
+  |                              |
+  | PQC handshake (:8443)        | HTTPS / TLS (:8440)
+  |                              |
+  +------------------------------+
+                 |
+        latticeshield-bridge
+                 |
+                 | plain TCP
+                 |
+          Backend Service
 ```
 
-LatticeShield runs three independent listeners:
+`latticeshield-client` is the local proxy agent: it accepts plain TCP from the user application, performs the PQC handshake with the bridge, and relays data through an AES-256-GCM encrypted channel. User applications need zero changes.
+
+`latticeshield-bridge` runs three independent listeners:
 
 | Port | Protocol | Client |
 |------|----------|--------|
-| `:8443` | Custom PQC (X25519 + ML-KEM-768 + AES-256-GCM) | Agents with custom handshake |
+| `:8443` | Custom PQC (X25519 + ML-KEM-768 + AES-256-GCM) | `latticeshield-client` agent |
 | `:8440` | Standard TLS / HTTPS (rustls 0.23) | curl, browsers, any HTTPS client |
 | `:8441` | QUIC / UDP (quinn 0.11) | QUIC-capable clients |
 | `:8444` | Plain HTTP (Prometheus metrics) | Monitoring systems |
@@ -68,25 +74,32 @@ A sliding-window filter (`AntiReplayFilter`) tracks consumed session tickets. Ea
 latticeshield/
 ├── Cargo.toml                   # Workspace root — all dependencies centralized
 ├── deny.toml                    # cargo-deny: blocks oqs-rs, openssl, unsafe advisories
-├── latticeshield-crypto/        # Cryptographic engine
+├── latticeshield-crypto/        # Cryptographic engine (shared by bridge + client)
 │   └── src/
 │       ├── lib.rs
 │       ├── handshake.rs         # Hybrid X25519 + ML-KEM-768 + HKDF-SHA256 + server auth
 │       ├── signing.rs           # ML-DSA-65 sign/verify (OTA + server authentication)
+│       ├── channel.rs           # AES-256-GCM frame format + HKDF ratchet (shared transport)
 │       └── anti_replay.rs       # 0-RTT anti-replay filter
-└── latticeshield-bridge/        # Proxy agent
+├── latticeshield-bridge/        # Server-side proxy agent
+│   └── src/
+│       ├── main.rs              # Entry point — keygen / tls-keygen / quic-keygen subcommands
+│       ├── server.rs            # Three listeners: PQC + TLS + QUIC
+│       ├── session.rs           # PQC handshake (server) + AES-GCM relay + key rotation
+│       ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
+│       ├── http_relay.rs        # HTTP/1.1 relay for TLS listener (httparse + tokio::io::copy)
+│       ├── quic.rs              # QUIC relay (quinn 0.11) — raw bidi stream → TCP
+│       ├── identity.rs          # ServerIdentity: load/generate ML-DSA-65 keypair
+│       ├── config.rs            # TOML config — BridgeConfig + ValidConfig
+│       ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
+│       └── control_plane.rs     # Heartbeat to remote control plane
+└── latticeshield-client/        # Client-side proxy agent
     └── src/
-        ├── main.rs              # Entry point — keygen / tls-keygen / quic-keygen subcommands
-        ├── server.rs            # Three listeners: PQC + TLS + QUIC
-        ├── session.rs           # PQC handshake + AES-GCM relay + key rotation
-        ├── channel.rs           # AES-256-GCM frame format + HKDF ratchet
-        ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
-        ├── http_relay.rs        # HTTP/1.1 relay for TLS listener (httparse + tokio::io::copy)
-        ├── quic.rs              # QUIC relay (quinn 0.11) — raw bidi stream → TCP
-        ├── identity.rs          # ServerIdentity: load/generate ML-DSA-65 keypair
-        ├── config.rs            # TOML config — BridgeConfig + ValidConfig
-        ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
-        └── control_plane.rs     # Heartbeat to remote control plane
+        ├── main.rs              # Entry point — vk-info subcommand, tracing init
+        ├── server.rs            # TCP listener on listen_addr, tokio::spawn per connection
+        ├── client_session.rs    # PQC handshake (client) + AES-GCM relay
+        ├── identity.rs          # load_verifying_key() + SHA-256 fingerprint
+        └── config.rs            # TOML config — ClientConfig + ValidClientConfig
 ```
 
 ## Security Constraints
@@ -136,21 +149,21 @@ cargo build --release
 
 ## Tests
 
-123 unit + integration tests across both crates — all passing.
+143 unit + integration tests across all three crates — all passing.
 
-### latticeshield-crypto (26 tests)
+### latticeshield-crypto (35 tests)
 
 | Module | Tests |
 |---|---|
 | `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection) |
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
+| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (97 tests)
+### latticeshield-bridge (88 tests)
 
 | Module | Tests |
 |---|---|
-| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, port collision detection |
 | `tls` | `build_server_config`, `build_acceptor`, cert/key loading, self-signed generation (feature-gated) |
 | `http_relay` | HTTP head parsing (complete/partial/oversized), GET forwarding, POST with body, backend down → 502 |
@@ -159,6 +172,16 @@ cargo build --release
 | `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
 | `session` (integration) | Full PQC handshake + relay, tampered response rejection, key uniqueness, POST `/rotate` endpoint, time-based and byte-threshold key rotation, full relay after rotation |
+
+### latticeshield-client (20 tests)
+
+| Module | Tests |
+|---|---|
+| `config` | TOML defaults, custom values, missing file, bad TOML, invalid addrs, out-of-range max_frame_size, empty vk_path |
+| `identity` | load roundtrip, wrong size, nonexistent file, fingerprint length, fingerprint determinism |
+| `client_session` | Bridge connect refused → user gets EOF, tampered signature → Ok(()) |
+| `server` | Listener binds and accepts connections |
+| integration | Full PQC relay round-trip (client ↔ mock bridge ↔ echo backend), KEY_ROTATE survives relay, `vk-info` binary output |
 
 ## Roadmap
 
@@ -170,7 +193,7 @@ cargo build --release
 | 4–5 | Server authentication — signed ServerHello, pre-shared VK, mlock | Complete |
 | 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
 | 7 | TLS listener (rustls 0.23) + QUIC listener (quinn 0.11), standard HTTPS/QUIC clients without agent | Complete |
-| 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Planned |
+| 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
 | 9+ | eBPF/XDP, OTA updater, Dashboard SaaS | Planned |
 
 ## License
