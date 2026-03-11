@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Write;
 
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -94,6 +95,51 @@ async fn server_handshake(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// vk-info subcommand: spawn the real binary, load a generated VK, verify output.
+#[test]
+fn vk_info_prints_fingerprint() {
+    let mut rng = OsRng;
+    let (_sk, vk) = generate_keypair(&mut rng);
+
+    // Write VK bytes to a tempfile.
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.write_all(vk.to_bytes()).unwrap();
+    tmp.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_latticeshield-client");
+    let output = std::process::Command::new(bin)
+        .args(["vk-info", tmp.path().to_str().unwrap()])
+        .output()
+        .expect("failed to spawn latticeshield-client");
+
+    assert!(
+        output.status.success(),
+        "vk-info exited with non-zero status: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Must contain a 64-char hex fingerprint on the "fingerprint:" line.
+    let fp_line = stdout
+        .lines()
+        .find(|l| l.starts_with("fingerprint:"))
+        .expect("output should contain a 'fingerprint:' line");
+    let hex = fp_line.trim_start_matches("fingerprint:").trim();
+    assert_eq!(hex.len(), 64, "fingerprint should be 64 hex chars, got: {hex}");
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "fingerprint should be hex, got: {hex}"
+    );
+
+    // Must contain the key size.
+    assert!(
+        stdout.contains("1952"),
+        "output should reference VERIFYING_KEY_LEN=1952, got: {stdout}"
+    );
+}
 
 /// Full round-trip: client connects to mock bridge, handshakes, sends data,
 /// bridge relays to echo backend, data echoes back through the encrypted channel.

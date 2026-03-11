@@ -143,6 +143,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_connect_refused_closes_session() {
+        let mut rng = OsRng;
+        let (_sk, vk) = generate_keypair(&mut rng);
+
+        // Bind a listener to get a valid addr, then drop it so the port is closed.
+        let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_addr = bridge_listener.local_addr().unwrap();
+        drop(bridge_listener);
+
+        // User side: listener + stream to simulate a connected user app.
+        let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let user_addr = user_listener.local_addr().unwrap();
+
+        let connect_task = tokio::spawn(async move {
+            TcpStream::connect(user_addr).await.unwrap()
+        });
+        let (user_server_side, _) = user_listener.accept().await.unwrap();
+        let mut user_client_side = connect_task.await.unwrap();
+
+        let peer: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let config = make_config(bridge_addr);
+
+        // handle debe retornar Ok(()) — error de sesion, no fatal.
+        let result = handle(user_server_side, peer, config, Arc::new(vk)).await;
+        assert!(result.is_ok(), "handle should return Ok(()) on bridge refused, got: {result:?}");
+
+        // El usuario debe recibir EOF (handle hace shutdown del user write side).
+        let mut buf = [0u8; 1];
+        let n = user_client_side.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "user side should receive EOF after bridge connect failure");
+    }
+
+    #[tokio::test]
     async fn tampered_signature_closes_session() {
         let mut rng = OsRng;
         let (_sk, vk) = generate_keypair(&mut rng);
