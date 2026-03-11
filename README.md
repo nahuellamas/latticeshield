@@ -196,9 +196,110 @@ cargo build --release
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
 | 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Planned |
 | 10 | Unified CLI `latticeshield` (keygen/setup for full stack) + identity.rs disk tests (bridge debt) | Planned |
-| 11 | GitHub Actions releases (pre-compiled binaries) + systemd service files + setup script | Planned |
-| 12 | Web dashboard (real-time metrics, session status) | Planned |
-| 13 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
+| 11 | Distribution: pre-compiled binaries (GitHub Actions) + systemd service files + `curl \| sh` installer | Planned |
+| 12 | Control Plane SaaS: tenant registry, VK distribution API, bridge management backend | Planned |
+| 13 | Web dashboard: real-time metrics, session status, tenant overview | Planned |
+| 14 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
+
+---
+
+## Product Vision — Installation & Distribution
+
+> ⚠️ **NOTA IMPORTANTE**: Todo este circuito requiere una revisión completa de UI/UX antes de implementarse — flujo del operador del bridge, flujo del usuario final, flujo de distribución del server.vk, onboarding en el control plane, y cada pantalla/comando que el usuario toca. No implementar Mes 11-12 sin ese ejercicio previo.
+
+### Roles
+
+**LatticeShield (nosotros)** — proveemos el software (bridge + client) y el control plane SaaS central.
+
+**Empresa cliente** — instala el bridge en su propio servidor. Su backend no se modifica.
+
+**Usuario final** — instala el client localmente. Su app no se modifica — solo apunta a `localhost:9090`.
+
+---
+
+### Flujo del operador del bridge (Empresa cliente)
+
+```
+1. Se registra en latticeshield.io → recibe api_token
+
+2. En su servidor Linux:
+   curl -sSL https://install.latticeshield.io | sh --token <api_token>
+
+3. El script automáticamente:
+   ├── Detecta arquitectura (x86_64 / ARM64)
+   ├── Descarga el binario correcto de GitHub Releases
+   ├── Genera server.sk + server.vk + cert.pem (via latticeshield keygen)
+   ├── Registra el bridge en el control plane (guarda server.vk)
+   ├── Crea /etc/latticeshield/config.toml (pregunta: backend_addr)
+   ├── Instala latticeshield-bridge.service en systemd
+   └── Arranca el bridge → bridge activo en :8443
+
+4. El cliente no necesita distribuir server.vk manualmente —
+   el control plane lo almacena y lo sirve a los clients que lo pidan.
+```
+
+El bridge es **su infraestructura** — en su servidor, bajo su control. El backend existente (Node.js, Python, etc.) no se toca. El bridge se pone delante apuntando al backend.
+
+```
+Servidor del cliente (ejemplo — convive con lo que ya tiene):
+├── nginx         :80/:443   → no se toca
+├── su app        :3000      → no se toca
+├── PostgreSQL    :5432      → no se toca
+└── ls-bridge     :8443/:8440/:8441  → nuevo, apunta a :3000
+```
+
+---
+
+### Flujo del usuario final
+
+```
+1. Recibe de Empresa X: "usá latticeshield para conectarte a nuestro servicio"
+
+2. Instala el client:
+   curl -sSL https://install.latticeshield.io/client | sh
+
+3. Setup interactivo:
+   latticeshield client setup --tenant empresa-x
+   → el control plane entrega el server.vk de Empresa X automáticamente
+   → no necesita archivos, no necesita entender criptografía
+
+4. Arranca el client:
+   latticeshield client start
+   → escuchando en 127.0.0.1:9090
+
+5. Apunta su app a localhost:9090 en vez de al backend directo
+   → tráfico cifrado PQC de extremo a extremo, transparente para la app
+```
+
+---
+
+### Control Plane SaaS (Mes 12)
+
+API HTTPS central que:
+- **Registro de bridges**: recibe el `POST /register` que `control_plane.rs` ya envía
+- **VK Registry**: almacena el `server.vk` de cada bridge por tenant
+- **Heartbeat receiver**: recibe el estado y métricas de cada bridge activo
+- **Client VK delivery**: cuando un client hace `setup --tenant X`, le entrega el `server.vk` correcto
+- **Tenant management**: vos ves todos tus clientes, sus bridges, versiones, estado
+
+El bridge ya tiene `control_plane.rs` implementado — solo falta el servidor que recibe esos requests.
+
+---
+
+### Lo que ya está construido
+
+| Pieza | Estado |
+|-------|--------|
+| Bridge (PQC + TLS + QUIC) | ✅ Mes 1–7 |
+| Client (PQC handshake + relay) | ✅ Mes 8 |
+| Server auth (bridge firma con ML-DSA-65) | ✅ Mes 4–5 |
+| Mutual auth (client también se autentica) | ⏳ Mes 9 |
+| Prometheus metrics | ✅ Mes 3 |
+| `control_plane.rs` (heartbeat sender) | ✅ Mes 6 |
+| CLI keygen unificado | ⏳ Mes 10 |
+| Binarios + installer (`curl \| sh`) | ⏳ Mes 11 |
+| **Control Plane SaaS** (receptor de heartbeats + VK registry) | ⏳ Mes 12 |
+| **Web dashboard** | ⏳ Mes 13 |
 
 ## License
 
