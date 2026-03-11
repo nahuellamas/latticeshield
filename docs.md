@@ -170,7 +170,9 @@ QUIC soporta half-close: el cliente puede cerrar su lado del stream (dejar de en
 
 ---
 
-channel.rs — La caja fuerte del cable
+channel.rs — La caja fuerte del cable (latticeshield-crypto)
+
+> Este módulo vivía en `latticeshield-bridge/src/channel.rs` hasta Mes 8. Se movió a `latticeshield-crypto/src/channel.rs` para que tanto el bridge como el client compartan la misma implementación sin duplicación.
 
 EncryptedChannel encapsula el cifrado AES-256-GCM. Define cómo se ve un "frame" (paquete) en el wire. Hay dos tipos de frames:
 
@@ -312,6 +314,119 @@ metrics_state.connections_total.fetch_add(1, Ordering::Relaxed); // → legible
 AtomicU64 es un entero de 64 bits que puede ser leído y escrito desde múltiples tareas simultáneamente sin race conditions — sin locks, sin mutexes.
 
 MetricsActiveGuard es un RAII guard: cuando se crea, incrementa connections_active. Cuando se destruye (al terminar la sesión), lo decrementa. Así no podés olvidarte de decrementar — Rust lo hace automáticamente.
+
+---
+
+---
+
+# latticeshield-client
+
+---
+
+main.rs (client) — El punto de entrada del agente cliente
+
+Hace tres cosas:
+
+1. Parsear los argumentos de línea de comandos (con clap):
+   latticeshield-client → arranca el proxy cliente (modo normal)
+   latticeshield-client --config mi.toml → usa un config custom
+   latticeshield-client vk-info ./keys/server.vk → imprime el fingerprint SHA-256 de la VerifyingKey
+
+2. Si el comando es vk-info: carga la VK, imprime el fingerprint (hex de 64 chars) y el tamaño (1952 bytes). Termina sin arrancar ningún listener.
+
+3. Si no hay subcomando: carga el config.toml del cliente, inicializa tracing, carga la VerifyingKey del servidor, y llama a server::run(config, vk).
+
+---
+
+config.rs (client) — El lector del config del cliente
+
+Mismo patrón de dos pasos que el bridge:
+
+Paso 1 — ClientConfig (raw): lee el TOML. Cada campo tiene defaults.
+Paso 2 — ValidClientConfig (validado): convierte strings en tipos reales.
+
+La estructura del latticeshield-client.toml:
+[client]
+listen_addr  = "127.0.0.1:9090"   # donde escucha el cliente (plain TCP local)
+bridge_addr  = "127.0.0.1:8443"   # dirección del bridge (protocolo PQC)
+max_frame_size = 65536             # tamaño máximo de frame AES-GCM (bytes)
+
+[crypto]
+server_vk_path = "./keys/server.vk"   # VerifyingKey ML-DSA-65 del servidor (pre-shared)
+
+[logging]
+level = "info"
+
+Validaciones:
+- listen_addr y bridge_addr deben ser SocketAddr válidos
+- max_frame_size en [1024, 16 MiB]
+- server_vk_path no puede estar vacío
+
+---
+
+identity.rs (client) — El lector de la VerifyingKey del servidor
+
+load_verifying_key(path) carga el archivo server.vk:
+1. Lee los bytes del archivo.
+2. Valida que tenga exactamente VERIFYING_KEY_LEN = 1952 bytes. Si no, falla al startup.
+3. Parsea a VerifyingKey. Si el archivo está corrupto, falla al startup.
+4. No verifica permisos (la VK es pública — 0o644 es correcto).
+
+fingerprint(vk) → SHA-256 de los bytes raw de la VK → string hex de 64 chars.
+Útil para verificar que todos los clientes tienen la misma VK que el servidor.
+
+A diferencia de identity.rs del bridge (que carga la clave PRIVADA con mlock y permisos 0o600),
+el cliente solo carga la clave pública. No hay secreto que proteger, pero sí hay que validar la integridad del archivo.
+
+---
+
+server.rs (client) — El dispatcher
+
+Responsabilidad: escuchar en listen_addr y despachar conexiones.
+
+run(config, Arc<VerifyingKey>):
+1. TcpListener::bind(config.listen_addr) → fatal si falla (proceso termina).
+2. Log "LatticeShield Client listening" + "targeting bridge".
+3. loop { listener.accept() → tokio::spawn(client_session::handle()) }
+
+Un error en una sesión no detiene al listener — las otras sesiones siguen funcionando.
+
+---
+
+client_session.rs — El cerebro de cada conexión cliente
+
+Es el simétrico de session.rs en el bridge. Cada vez que un usuario se conecta:
+
+Paso 1 — Conectar al bridge:
+TcpStream::connect(config.bridge_addr)
+Si falla → shutdown del lado usuario → return Ok(()) (error de sesión, no fatal)
+
+Paso 2 — Handshake PQC (lado cliente):
+1. read_exact([u8; SERVER_HELLO_SIGNED_LEN=4557]) — lee el ServerHello firmado del bridge
+2. parse_server_hello_signed(&bytes, &vk) — verifica la firma ML-DSA-65 con la VK pre-shared
+   Si falla → log WARN "authentication failed" → shutdown usuario → return Ok(())
+3. client_respond(&hello, &mut OsRng) → (ClientResponse, SessionKey)
+4. write_all(&serialize_client_response(&response)) — envía los 1120 bytes al bridge
+5. EncryptedChannel::new(session_key.as_bytes(), config.max_frame_size)
+
+Paso 3 — Relay bidireccional con tokio::select!:
+loop {
+  select! {
+    usuario → bridge: read plain bytes → channel.write_frame(bridge)
+    bridge → usuario: channel.read_frame(bridge)
+                     → Data(d): write plain to user
+                     → KeyRotate(nonce): channel.rotate_key(nonce) [transparente al usuario]
+                     → Err: log WARN + break
+  }
+}
+
+La diferencia clave con session.rs del bridge:
+- El bridge GENERA KEY_ROTATE (lo inicia).
+- El cliente RECIBE KEY_ROTATE (lo aplica transparentemente, nunca lo genera).
+
+¿Por qué la verificación de firma falla silenciosamente (Ok()) en vez de propagar el error?
+Porque es un error de seguridad a nivel de sesión — posible ataque MITM o misconfiguration.
+No es un bug del proceso. Cerramos esa conexión, loguemos, y seguimos aceptando otras.
 
 ---
 
