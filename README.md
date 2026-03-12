@@ -2,6 +2,12 @@
 
 A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cryptography (PQC) layer — **X25519 + ML-KEM-768** — as a transparent encryption layer between clients and backend services, with no FFI, no OpenSSL, no `oqs-rs`.
 
+## What's New
+
+### Unified `latticeshield` Command (2026-03-12)
+
+We added a single `latticeshield` command so that you can generate all your security keys — for the server, the client, and TLS certificates — without needing to know which internal program to call. Previously, key generation was split across two different programs; now everything lives under one roof with a guided welcome screen.
+
 ## Why
 
 Classical key exchange (ECDH, RSA) is vulnerable to future quantum computers via Shor's algorithm. LatticeShield implements the hybrid model recommended by NIST and IETF: combine a classical algorithm (X25519) with a post-quantum one (ML-KEM-768, formerly Kyber). If either is broken, the session remains secure.
