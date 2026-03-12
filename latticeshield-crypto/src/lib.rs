@@ -5,9 +5,10 @@ pub mod signing;
 
 pub use handshake::{
     client_respond, parse_server_hello, parse_server_hello_signed,
-    serialize_client_response,
+    serialize_client_response, serialize_client_response_signed,
     ClientHello, ClientResponse, HandshakeError, ServerHandshake, SessionKey,
-    CLIENT_RESPONSE_LEN, SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
+    CLIENT_RESPONSE_LEN, CLIENT_RESPONSE_SIGNED_LEN,
+    SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 pub use anti_replay::AntiReplayFilter;
 pub use channel::{EncryptedChannel, FrameResult};

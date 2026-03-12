@@ -197,6 +197,8 @@ mod tests {
             quic_listen_addr: "127.0.0.1:8441".parse().unwrap(),
             quic_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
             quic_key_path: std::path::PathBuf::from("./keys/tls.key"),
+            client_auth_enabled: false,
+            client_vk_path: None,
         }
     }
 

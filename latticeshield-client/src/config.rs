@@ -28,6 +28,9 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_max_retries() -> u32 { 3 }
+fn default_base_delay_ms() -> u64 { 500 }
+
 // ── Sub-structs ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +44,7 @@ pub struct ClientSection {
     pub server_vk_path: PathBuf,
     #[serde(default = "default_max_frame_size")]
     pub max_frame_size: usize,
+    pub client_sk_path: Option<PathBuf>,
 }
 
 impl Default for ClientSection {
@@ -50,6 +54,25 @@ impl Default for ClientSection {
             bridge_addr: default_bridge_addr(),
             server_vk_path: default_server_vk_path(),
             max_frame_size: default_max_frame_size(),
+            client_sk_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReconnectConfig {
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_base_delay_ms")]
+    pub base_delay_ms: u64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            base_delay_ms: default_base_delay_ms(),
         }
     }
 }
@@ -76,6 +99,8 @@ impl Default for LoggingSection {
 pub struct ClientConfig {
     pub client: ClientSection,
     pub logging: LoggingSection,
+    #[serde(default)]
+    pub reconnect: ReconnectConfig,
 }
 
 impl Default for ClientConfig {
@@ -83,6 +108,7 @@ impl Default for ClientConfig {
         Self {
             client: ClientSection::default(),
             logging: LoggingSection::default(),
+            reconnect: ReconnectConfig::default(),
         }
     }
 }
@@ -94,8 +120,10 @@ pub struct ValidClientConfig {
     pub listen_addr: SocketAddr,
     pub bridge_addr: SocketAddr,
     pub server_vk_path: PathBuf,
+    pub client_sk_path: Option<PathBuf>,
     pub max_frame_size: usize,
     pub log_level: String,
+    pub reconnect: ReconnectConfig,
 }
 
 // ── ClientConfig::load + validate ─────────────────────────────────────────────
@@ -138,8 +166,10 @@ impl ClientConfig {
             listen_addr,
             bridge_addr,
             server_vk_path: self.client.server_vk_path,
+            client_sk_path: self.client.client_sk_path,
             max_frame_size: self.client.max_frame_size,
             log_level: self.logging.level,
+            reconnect: self.reconnect,
         })
     }
 }
@@ -251,5 +281,46 @@ bridge_addr = "10.0.0.1:8443"
             err.contains("crypto.server_vk_path"),
             "error should reference crypto.server_vk_path, got: {err}"
         );
+    }
+
+    #[test]
+    fn client_sk_path_parsed() {
+        let f = write_toml(
+            r#"
+[client]
+client_sk_path = "./keys/client.sk"
+"#,
+        );
+        let cfg = ClientConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.client_sk_path, Some(PathBuf::from("./keys/client.sk")));
+    }
+
+    #[test]
+    fn client_sk_path_absent_is_none() {
+        let f = write_toml("");
+        let cfg = ClientConfig::load(f.path()).unwrap();
+        assert!(cfg.client_sk_path.is_none());
+    }
+
+    #[test]
+    fn reconnect_defaults_when_section_absent() {
+        let f = write_toml("");
+        let cfg = ClientConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.reconnect.max_retries, 3);
+        assert_eq!(cfg.reconnect.base_delay_ms, 500);
+    }
+
+    #[test]
+    fn reconnect_custom_values_parsed() {
+        let f = write_toml(
+            r#"
+[reconnect]
+max_retries = 5
+base_delay_ms = 1000
+"#,
+        );
+        let cfg = ClientConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.reconnect.max_retries, 5);
+        assert_eq!(cfg.reconnect.base_delay_ms, 1000);
     }
 }

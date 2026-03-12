@@ -10,11 +10,16 @@ use latticeshield_crypto::VerifyingKey;
 
 use crate::client_session;
 use crate::config::ValidClientConfig;
+use crate::identity::ClientIdentity;
 
 /// Arranca el listener TCP y acepta conexiones indefinidamente.
 ///
 /// Cada conexion se maneja en una task tokio separada via `client_session::handle`.
-pub async fn run(config: ValidClientConfig, vk: Arc<VerifyingKey>) -> anyhow::Result<()> {
+pub async fn run(
+    config: ValidClientConfig,
+    vk: Arc<VerifyingKey>,
+    client_identity: Option<Arc<ClientIdentity>>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "LatticeShield Client listening");
     info!(bridge = %config.bridge_addr, "targeting bridge");
@@ -23,8 +28,10 @@ pub async fn run(config: ValidClientConfig, vk: Arc<VerifyingKey>) -> anyhow::Re
         let (stream, peer) = listener.accept().await?;
         let config = config.clone();
         let vk = Arc::clone(&vk);
+        let client_identity = client_identity.clone();
+        let reconnect = config.reconnect.clone();
         tokio::spawn(async move {
-            if let Err(e) = client_session::handle(stream, peer, config, vk).await {
+            if let Err(e) = client_session::handle(stream, peer, config, vk, client_identity, reconnect).await {
                 tracing::warn!(peer = %peer, "session error: {e}");
             }
         });
@@ -57,11 +64,13 @@ mod tests {
             listen_addr,
             bridge_addr: "127.0.0.1:8443".parse().unwrap(),
             server_vk_path: PathBuf::from("./keys/server.vk"),
+            client_sk_path: None,
             max_frame_size: 65536,
             log_level: "info".to_string(),
+            reconnect: crate::config::ReconnectConfig::default(),
         };
 
-        let task = tokio::spawn(run(config, Arc::clone(&vk)));
+        let task = tokio::spawn(run(config, Arc::clone(&vk), None));
 
         // Give server a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

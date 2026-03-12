@@ -132,6 +132,77 @@ fn vk_path_from(sk_path: &Path) -> PathBuf {
     sk_path.with_extension("vk")
 }
 
+/// Error al cargar una identidad de cliente.
+#[derive(Debug)]
+pub enum IdentityError {
+    Io(std::io::Error),
+    InvalidSize { expected: usize, found: usize },
+    InvalidKey(String),
+}
+
+impl std::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdentityError::Io(e) => write!(f, "archivo no encontrado o no legible: {e}"),
+            IdentityError::InvalidSize { expected, found } => {
+                write!(f, "tamano de archivo invalido: esperado {expected} bytes, encontrado {found}")
+            }
+            IdentityError::InvalidKey(msg) => write!(f, "clave de verificacion invalida: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for IdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            IdentityError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for IdentityError {
+    fn from(e: std::io::Error) -> Self {
+        IdentityError::Io(e)
+    }
+}
+
+/// Clave de verificacion publica de un cliente para autenticacion mutua.
+///
+/// Se carga una vez al arrancar via `ClientVerifyingIdentity::load()` y se
+/// comparte entre tareas de sesion como `Arc<ClientVerifyingIdentity>`.
+///
+/// No requiere chequeo de permisos — la VK es material publico.
+#[derive(Debug)]
+pub struct ClientVerifyingIdentity {
+    pub verifying_key: VerifyingKey,
+}
+
+impl ClientVerifyingIdentity {
+    /// Carga la clave de verificacion del cliente desde disco.
+    ///
+    /// Falla si:
+    ///   - El archivo no existe o no es legible
+    ///   - El archivo no tiene exactamente `VERIFYING_KEY_LEN` bytes
+    ///   - Los bytes no representan una VK valida
+    pub fn load(vk_path: &Path) -> Result<Self, IdentityError> {
+        let data = std::fs::read(vk_path)?;
+
+        if data.len() != VERIFYING_KEY_LEN {
+            return Err(IdentityError::InvalidSize {
+                expected: VERIFYING_KEY_LEN,
+                found: data.len(),
+            });
+        }
+
+        let buf: &[u8; VERIFYING_KEY_LEN] = data.as_slice().try_into().expect("len ya validado");
+        let verifying_key = VerifyingKey::from_bytes(buf)
+            .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+
+        Ok(Self { verifying_key })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +326,40 @@ mod tests {
             err.contains("truncado") || err.contains("failed to fill"),
             "{err}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // ClientVerifyingIdentity
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn client_vk_load_roundtrip_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        // Generar un keypair de servidor y reusar la VK como VK de cliente
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        let vk_path = dir.path().join("server.vk");
+        // Cargar como ClientVerifyingIdentity
+        ClientVerifyingIdentity::load(&vk_path).unwrap();
+    }
+
+    #[test]
+    fn client_vk_load_wrong_size_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("client.vk");
+        // Escribir un archivo con tamano incorrecto
+        std::fs::write(&vk_path, &[0u8; 16]).unwrap();
+        let err = ClientVerifyingIdentity::load(&vk_path).unwrap_err();
+        assert!(
+            matches!(err, IdentityError::InvalidSize { expected: VERIFYING_KEY_LEN, .. }),
+            "error inesperado: {err}"
+        );
+    }
+
+    #[test]
+    fn client_vk_load_missing_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("nonexistent.vk");
+        let err = ClientVerifyingIdentity::load(&vk_path).unwrap_err();
+        assert!(matches!(err, IdentityError::Io(_)), "error inesperado: {err}");
     }
 }

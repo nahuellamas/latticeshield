@@ -5,6 +5,7 @@
 
 use latticeshield_client::config;
 use latticeshield_client::identity;
+use latticeshield_client::identity::ClientIdentity;
 use latticeshield_client::server;
 
 use std::path::PathBuf;
@@ -28,6 +29,11 @@ enum Commands {
         /// Ruta al archivo de la VerifyingKey (.vk)
         path: PathBuf,
     },
+    /// Genera un par de claves de largo plazo para el cliente.
+    ClientKeygen {
+        /// Directorio donde guardar client.sk y client.vk
+        dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -41,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
             println!("fingerprint: {fp}");
             println!("size: {} bytes", vk.to_bytes().len());
         }
+        Some(Commands::ClientKeygen { dir }) => {
+            ClientIdentity::generate_and_save(&dir)?;
+        }
         None => {
             // Cargar configuracion
             let config = config::ClientConfig::load(&cli.config)?;
@@ -52,12 +61,21 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .init();
 
-            // Cargar VerifyingKey
+            // Cargar VerifyingKey del servidor
             let vk = identity::load_verifying_key(&config.server_vk_path)?;
             let vk = Arc::new(vk);
 
+            // Cargar ClientIdentity si se configuro client_sk_path
+            let client_identity: Option<Arc<ClientIdentity>> =
+                if let Some(sk_path) = &config.client_sk_path {
+                    let identity = ClientIdentity::load(sk_path)?;
+                    Some(Arc::new(identity))
+                } else {
+                    None
+                };
+
             // Arrancar servidor
-            server::run(config, vk).await?;
+            server::run(config, vk, client_identity).await?;
         }
     }
 
