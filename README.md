@@ -81,9 +81,9 @@ latticeshield/
 │       ├── signing.rs           # ML-DSA-65 sign/verify (OTA + server authentication)
 │       ├── channel.rs           # AES-256-GCM frame format + HKDF ratchet (shared transport)
 │       └── anti_replay.rs       # 0-RTT anti-replay filter
-├── latticeshield-bridge/        # Server-side proxy agent
+├── latticeshield-bridge/        # Server-side proxy agent (also exposes [lib] for identity + tls)
 │   └── src/
-│       ├── main.rs              # Entry point — keygen / tls-keygen / quic-keygen subcommands
+│       ├── main.rs              # Entry point — keygen / tls-keygen / quic-keygen (deprecated since Mes 10)
 │       ├── server.rs            # Three listeners: PQC + TLS + QUIC
 │       ├── session.rs           # PQC handshake (server) + AES-GCM relay + key rotation
 │       ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
@@ -93,13 +93,16 @@ latticeshield/
 │       ├── config.rs            # TOML config — BridgeConfig + ValidConfig + AuthConfig
 │       ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
 │       └── control_plane.rs     # Heartbeat to remote control plane
-└── latticeshield-client/        # Client-side proxy agent
+├── latticeshield-client/        # Client-side proxy agent
+│   └── src/
+│       ├── main.rs              # Entry point — vk-info / --client-keygen (deprecated since Mes 10), tracing init
+│       ├── server.rs            # TCP listener on listen_addr, tokio::spawn per connection
+│       ├── client_session.rs    # PQC handshake (client) + mutual auth signing + reconnect/backoff + AES-GCM relay
+│       ├── identity.rs          # load_verifying_key() + ClientIdentity (load/generate/zeroize) + SHA-256 fingerprint
+│       └── config.rs            # TOML config — ClientConfig + ValidClientConfig + ReconnectConfig
+└── latticeshield-cli/           # Unified CLI — single entry point for all setup and key operations
     └── src/
-        ├── main.rs              # Entry point — vk-info / --client-keygen subcommands, tracing init
-        ├── server.rs            # TCP listener on listen_addr, tokio::spawn per connection
-        ├── client_session.rs    # PQC handshake (client) + mutual auth signing + reconnect/backoff + AES-GCM relay
-        ├── identity.rs          # load_verifying_key() + ClientIdentity (load/generate/zeroize) + SHA-256 fingerprint
-        └── config.rs            # TOML config — ClientConfig + ValidClientConfig + ReconnectConfig
+        └── main.rs              # Binary `latticeshield` — keygen server/client/tls + vk-info + ASCII banner
 ```
 
 ## Security Constraints
@@ -151,7 +154,7 @@ cargo build --release
 
 ## Tests
 
-169 unit + integration tests across all three crates — all passing.
+176 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -185,6 +188,18 @@ cargo build --release
 | `server` | Listener binds and accepts connections |
 | integration | Full PQC relay round-trip (client ↔ mock bridge ↔ echo backend), KEY_ROTATE survives relay, `vk-info` binary output |
 
+### latticeshield-cli (7 tests)
+
+| Test | What it verifies |
+|---|---|
+| `keygen_server_creates_files` | `keygen server` produces `server.sk` (4032B, 0o600) and `server.vk` (1952B, 0o644) |
+| `keygen_client_creates_files` | `keygen client` produces `client.sk` (4032B, 0o600) and `client.vk` (1952B, 0o644) |
+| `keygen_tls_creates_files` | `keygen tls` produces `tls.crt` and `tls.key` |
+| `vk_info_server_vk` | `vk-info server.vk` prints File, Size (1952), SHA-256 (64 hex chars) |
+| `vk_info_client_vk` | `vk-info client.vk` prints File, Size (1952), SHA-256 |
+| `vk_info_nonexistent` | `vk-info` with missing file exits non-zero |
+| `help_shows_banner` | `--help` output includes "LatticeShield" |
+
 ## Roadmap
 
 | Month | Milestone | Status |
@@ -197,7 +212,7 @@ cargo build --release
 | 7 | TLS listener (rustls 0.23) + QUIC listener (quinn 0.11), standard HTTPS/QUIC clients without agent | Complete |
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
 | 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Complete |
-| 10 | Unified CLI `latticeshield` (keygen/setup for full stack) + identity.rs disk tests (bridge debt) | Planned |
+| 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner, deprecation warnings in old subcommands | Complete |
 | 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Planned |
 | 12 | Distribution: pre-compiled binaries (GitHub Actions) + systemd service files + `curl \| sh` installer | Planned |
 | 13 | Control Plane SaaS: tenant registry, VK distribution API, bridge management backend | Planned |
@@ -299,7 +314,7 @@ El bridge ya tiene `control_plane.rs` implementado — solo falta el servidor qu
 | Mutual auth (client también se autentica) | ✅ Mes 9 |
 | Prometheus metrics | ✅ Mes 3 |
 | `control_plane.rs` (heartbeat sender) | ✅ Mes 6 |
-| CLI keygen unificado | ⏳ Mes 10 |
+| CLI keygen unificado (`latticeshield keygen` + `vk-info`) | ✅ Mes 10 |
 | Connection pool (lazy close + proactive warming) | ⏳ Mes 11 |
 | Binarios + installer (`curl \| sh`) | ⏳ Mes 12 |
 | **Control Plane SaaS** (receptor de heartbeats + VK registry) | ⏳ Mes 13 |

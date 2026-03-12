@@ -5,8 +5,10 @@ Es el primer archivo que ejecuta Rust cuando arrancás el programa. Hace exactam
 1. Parsear los argumentos de línea de comandos (con la librería clap):
    latticeshield-bridge → arranca el proxy (modo normal)
    latticeshield-bridge --config mi.toml → usa un config custom
-   latticeshield-bridge keygen ./keys → genera las claves ML-DSA-65 del servidor
-   latticeshield-bridge tls-keygen ./keys → genera cert.pem + key.pem para el listener TLS/QUIC
+   latticeshield-bridge keygen ./keys → genera las claves ML-DSA-65 del servidor (DEPRECATED desde Mes 10)
+   latticeshield-bridge tls-keygen ./keys → genera cert.pem + key.pem para el listener TLS/QUIC (DEPRECATED desde Mes 10)
+
+   NOTA: los subcomandos keygen y tls-keygen del bridge imprimen un aviso de deprecación desde Mes 10. Usar el nuevo binario `latticeshield` en su lugar. Serán removidos en Mes 11.
 
 clap genera automáticamente el --help, el --version, y valida que los argumentos sean correctos.
 
@@ -881,15 +883,17 @@ Así como el bridge tiene `--keygen` para generar su par de claves, el cliente a
 latticeshield-client --client-keygen ./keys
 ```
 
+NOTA: este subcomando está DEPRECATED desde Mes 10. Imprime un aviso de deprecación y será removido en Mes 11. Usar `latticeshield keygen client ./keys` en su lugar.
+
 Esto llama a `ClientIdentity::generate_and_save("./keys")` y genera:
 - `./keys/client.sk` — clave privada (guardala, no la compartas)
 - `./keys/client.vk` — clave pública (copiala al bridge)
 
-Workflow completo para habilitar mutual auth:
+Workflow completo para habilitar mutual auth (usando el nuevo CLI unificado, ver Mes 10):
 
 ```sh
 # En la máquina del cliente: generar las claves
-latticeshield-client --client-keygen ./keys
+latticeshield keygen client ./keys
 
 # Copiar la clave pública al bridge (scp, rsync, lo que uses)
 scp ./keys/client.vk usuario@servidor-bridge:/etc/latticeshield/keys/
@@ -922,3 +926,231 @@ Entonces si el atacante captura los 4429 bytes de una sesión A e intenta usarlo
 - La verificación falla: `Err(ClientAuthFailed)`
 
 La firma no solo dice "yo soy el cliente autorizado", sino "yo soy el cliente autorizado **y estoy respondiendo a esta sesión específica**".
+
+---
+
+---
+
+# Mes 10 — CLI Unificado (`latticeshield`)
+
+---
+
+## El problema que existía
+
+Hasta Mes 9, generar claves requería conocer tres binarios diferentes y sus flags específicos:
+
+```sh
+latticeshield-bridge keygen ./keys          # claves del servidor
+latticeshield-client --client-keygen ./keys # claves del cliente
+latticeshield-bridge tls-keygen ./keys      # cert TLS/QUIC
+```
+
+No hay UI consistente, no hay help centralizado, y el nuevo usuario no tiene forma de saber qué binario hace qué. Además, el subcomando `vk-info` solo existía en el cliente, escondido entre opciones que no tienen nada que ver con inspección de claves.
+
+La solución: un nuevo crate `latticeshield-cli` que expone un único binario `latticeshield` con todos los subcomandos de setup y utilidades. Los binarios específicos del bridge y del client quedan para su rol operacional (arrancar el proxy), no para el setup inicial.
+
+---
+
+## latticeshield-cli — El crate nuevo
+
+`latticeshield-cli` es un crate independiente en el workspace:
+
+```
+latticeshield/
+├── latticeshield-cli/
+│   └── src/
+│       └── main.rs   # binario latticeshield — subcomandos keygen + vk-info
+```
+
+Características:
+- Es **sync** (sin tokio) — todas las operaciones de keygen son operaciones de disco y criptografía síncrona. No hay ninguna razón para tener un runtime async.
+- Depende de `latticeshield-bridge` como librería (via el nuevo target `[lib]`) y de `latticeshield-crypto` para el fingerprint SHA-256.
+- Muestra un **banner ASCII** al arrancar: logo cyan con forma de lattice+shield, borde doble, título en blanco negrita, y subtítulo.
+- 7 integration tests via `assert_cmd`.
+
+---
+
+## El banner de bienvenida
+
+Al ejecutar `latticeshield` (sin subcomandos) o `latticeshield --help`, se muestra:
+
+```
+╔══════════════════════════════════╗
+║   ▓▓▓  ▓  ▓▓▓  ▓▓▓▓  ▓▓▓▓      ║
+║   ▓  ▓ ▓ ▓      ▓   ▓           ║
+║   ▓▓▓  ▓ ▓      ▓   ▓  ▓▓▓      ║
+║   ▓    ▓ ▓      ▓   ▓    ▓      ║
+║   ▓    ▓  ▓▓▓  ▓▓▓▓  ▓▓▓▓       ║
+║                                  ║
+║   ▓▓▓  ▓  ▓  ▓▓▓  ▓▓▓  ▓  ▓▓▓  ║
+║  ▓     ▓  ▓ ▓     ▓    ▓  ▓  ▓  ║
+║   ▓▓   ▓▓▓▓ ▓ ▓▓▓ ▓▓▓  ▓  ▓  ▓  ║
+║     ▓  ▓  ▓ ▓   ▓ ▓    ▓  ▓  ▓  ║
+║  ▓▓▓   ▓  ▓  ▓▓▓  ▓▓▓  ▓  ▓▓▓   ║
+╚══════════════════════════════════╝
+         LatticeShield
+  Quantum-Safe Reverse Proxy
+```
+
+El logo es cyan, el título es blanco negrita. Se renderiza con `colored`.
+
+---
+
+## Subcomandos
+
+### `latticeshield keygen server <dir>`
+
+Genera el par de claves ML-DSA-65 del servidor.
+
+```sh
+latticeshield keygen server ./keys
+```
+
+Genera en `<dir>`:
+- `server.sk` — Signing Key, 4032 bytes, permisos `0o600` (solo el dueño puede leer)
+- `server.vk` — Verifying Key, 1952 bytes, permisos `0o644` (pública, todos pueden leer)
+
+Internamente llama a `ServerIdentity::generate_and_save(dir)` del crate `latticeshield-bridge`.
+
+Equivalente deprecated: `latticeshield-bridge keygen <dir>`
+
+---
+
+### `latticeshield keygen client <dir>`
+
+Genera el par de claves ML-DSA-65 del cliente.
+
+```sh
+latticeshield keygen client ./keys
+```
+
+Genera en `<dir>`:
+- `client.sk` — Signing Key, 4032 bytes, permisos `0o600`
+- `client.vk` — Verifying Key, 1952 bytes, permisos `0o644`
+
+Internamente llama a `ClientIdentity::generate_and_save(dir)` del crate `latticeshield-bridge` (expuesto via el `[lib]` target).
+
+Equivalente deprecated: `latticeshield-client --client-keygen <dir>`
+
+---
+
+### `latticeshield keygen tls <dir>`
+
+Genera el certificado TLS auto-firmado para los listeners TLS y QUIC.
+
+```sh
+latticeshield keygen tls ./keys
+```
+
+Genera en `<dir>`:
+- `tls.crt` — certificado PEM (rcgen)
+- `tls.key` — clave privada PEM
+
+El mismo par de archivos sirve para el listener TLS (`:8440`) y para el listener QUIC (`:8441`) — ambos usan `tls::build_server_config(cert_path, key_path)`.
+
+Internamente llama a `tls::generate_self_signed(dir)` del crate `latticeshield-bridge`.
+
+Equivalente deprecated: `latticeshield-bridge tls-keygen <dir>` / `latticeshield-bridge quic-keygen <dir>`
+
+---
+
+### `latticeshield vk-info <path>`
+
+Imprime información de diagnóstico sobre cualquier archivo `.vk` (server.vk o client.vk).
+
+```sh
+latticeshield vk-info ./keys/server.vk
+```
+
+Salida:
+
+```
+File:    ./keys/server.vk
+Size:    1952 bytes
+SHA-256: a3f1c2d4e5b6...  (64 hex chars)
+```
+
+El fingerprint SHA-256 es útil para verificar que el bridge y todos los clientes tienen **exactamente la misma VK** — un mismatch en la VK causa fallas de autenticación silenciosas.
+
+El subcomando acepta cualquier `.vk` — detecta si es server.vk o client.vk solo por el tamaño (ambos son 1952 bytes en ML-DSA-65).
+
+Anteriormente este subcomando solo existía en `latticeshield-client` como `latticeshield-client vk-info <path>`. Ahora vive en el CLI unificado y el de cliente está deprecated.
+
+---
+
+## El `[lib]` target en latticeshield-bridge
+
+Para que `latticeshield-cli` pueda llamar a `ServerIdentity::generate_and_save()` y `ClientIdentity::generate_and_save()` sin duplicar código, `latticeshield-bridge` expone un target `[lib]` en su `Cargo.toml`:
+
+```toml
+[lib]
+name = "latticeshield_bridge"
+path = "src/lib.rs"
+```
+
+El `lib.rs` re-exporta solo dos módulos públicos:
+
+```rust
+pub mod identity;
+pub mod tls;
+```
+
+El resto (server, session, config, metrics, etc.) no es público — son internos al binario del bridge. Esto evita que `latticeshield-cli` dependa de tokio o de la lógica de red del bridge.
+
+---
+
+## Workflow completo de setup con el nuevo CLI
+
+```sh
+# 1. Generar claves del servidor (en la máquina del bridge)
+latticeshield keygen server ./keys
+# → ./keys/server.sk (0600) + ./keys/server.vk (0644)
+
+# 2. Generar certificado TLS/QUIC (en la máquina del bridge)
+latticeshield keygen tls ./keys
+# → ./keys/tls.crt + ./keys/tls.key
+
+# 3. Verificar el fingerprint del server.vk
+latticeshield vk-info ./keys/server.vk
+# → File: ./keys/server.vk | Size: 1952 bytes | SHA-256: ...
+
+# 4. Distribuir server.vk a los clientes (out-of-band)
+scp ./keys/server.vk usuario@maquina-cliente:/etc/latticeshield/keys/
+
+# 5. (Opcional) Generar claves del cliente para mutual auth
+latticeshield keygen client ./keys
+# → ./keys/client.sk (0600) + ./keys/client.vk (0644)
+
+# 6. Distribuir client.vk al bridge
+scp ./keys/client.vk usuario@servidor-bridge:/etc/latticeshield/keys/
+```
+
+---
+
+## Deprecaciones en Mes 10
+
+Los siguientes subcomandos imprimen un aviso de deprecación al ejecutarse:
+
+| Binario | Subcomando deprecated | Reemplazo |
+|---------|----------------------|-----------|
+| `latticeshield-bridge` | `keygen <dir>` | `latticeshield keygen server <dir>` |
+| `latticeshield-bridge` | `tls-keygen <dir>` | `latticeshield keygen tls <dir>` |
+| `latticeshield-bridge` | `quic-keygen <dir>` | `latticeshield keygen tls <dir>` |
+| `latticeshield-client` | `--client-keygen <dir>` | `latticeshield keygen client <dir>` |
+| `latticeshield-client` | `vk-info <path>` | `latticeshield vk-info <path>` |
+
+Serán removidos en Mes 11.
+
+---
+
+## Tests del CLI (7 integration tests via assert_cmd)
+
+| Test | Qué verifica |
+|------|-------------|
+| `keygen_server_creates_files` | `keygen server` genera `server.sk` (4032B, 0o600) y `server.vk` (1952B, 0o644) |
+| `keygen_client_creates_files` | `keygen client` genera `client.sk` (4032B, 0o600) y `client.vk` (1952B, 0o644) |
+| `keygen_tls_creates_files` | `keygen tls` genera `tls.crt` y `tls.key` |
+| `vk_info_server_vk` | `vk-info server.vk` imprime File, Size (1952), SHA-256 (64 hex chars) |
+| `vk_info_client_vk` | `vk-info client.vk` imprime File, Size (1952), SHA-256 |
+| `vk_info_nonexistent` | `vk-info` con archivo inexistente retorna código de salida no-cero |
+| `help_shows_banner` | `--help` incluye "LatticeShield" en la salida |
