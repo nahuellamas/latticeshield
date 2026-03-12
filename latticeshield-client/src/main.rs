@@ -42,12 +42,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::VkInfo { path }) => {
+            eprintln!("[DEPRECATED] Use 'latticeshield vk-info <path>' instead. Removed in Mes 11.");
             let vk = identity::load_verifying_key(&path)?;
             let fp = identity::fingerprint(&vk);
             println!("fingerprint: {fp}");
             println!("size: {} bytes", vk.to_bytes().len());
         }
         Some(Commands::ClientKeygen { dir }) => {
+            eprintln!("[DEPRECATED] Use 'latticeshield keygen client <dir>' instead. Removed in Mes 11.");
             ClientIdentity::generate_and_save(&dir)?;
         }
         None => {

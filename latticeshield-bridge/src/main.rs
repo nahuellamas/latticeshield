@@ -66,10 +66,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(Commands::Keygen { dir }) = &cli.command {
+        eprintln!("[DEPRECATED] Use 'latticeshield keygen server <dir>' instead. This subcommand will be removed in Mes 11.");
         return identity::ServerIdentity::generate_and_save(dir);
     }
 
     if let Some(Commands::TlsKeygen { dir }) = &cli.command {
+        eprintln!("[DEPRECATED] Use 'latticeshield keygen tls <dir>' instead. This subcommand will be removed in Mes 11.");
         #[cfg(feature = "tls-keygen")]
         return tls::generate_self_signed(dir);
         #[cfg(not(feature = "tls-keygen"))]
@@ -84,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(Commands::QuicKeygen { dir }) = &cli.command {
+        eprintln!("[DEPRECATED] Use 'latticeshield keygen tls <dir>' instead (covers both TLS and QUIC). Removed in Mes 11.");
         #[cfg(feature = "tls-keygen")]
         return tls::generate_self_signed(dir);
         #[cfg(not(feature = "tls-keygen"))]
