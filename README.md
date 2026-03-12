@@ -89,17 +89,17 @@ latticeshield/
 │       ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
 │       ├── http_relay.rs        # HTTP/1.1 relay for TLS listener (httparse + tokio::io::copy)
 │       ├── quic.rs              # QUIC relay (quinn 0.11) — raw bidi stream → TCP
-│       ├── identity.rs          # ServerIdentity: load/generate ML-DSA-65 keypair
-│       ├── config.rs            # TOML config — BridgeConfig + ValidConfig
+│       ├── identity.rs          # ServerIdentity + ClientVerifyingIdentity: load/generate ML-DSA-65 keypairs
+│       ├── config.rs            # TOML config — BridgeConfig + ValidConfig + AuthConfig
 │       ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
 │       └── control_plane.rs     # Heartbeat to remote control plane
 └── latticeshield-client/        # Client-side proxy agent
     └── src/
-        ├── main.rs              # Entry point — vk-info subcommand, tracing init
+        ├── main.rs              # Entry point — vk-info / --client-keygen subcommands, tracing init
         ├── server.rs            # TCP listener on listen_addr, tokio::spawn per connection
-        ├── client_session.rs    # PQC handshake (client) + AES-GCM relay
-        ├── identity.rs          # load_verifying_key() + SHA-256 fingerprint
-        └── config.rs            # TOML config — ClientConfig + ValidClientConfig
+        ├── client_session.rs    # PQC handshake (client) + mutual auth signing + reconnect/backoff + AES-GCM relay
+        ├── identity.rs          # load_verifying_key() + ClientIdentity (load/generate/zeroize) + SHA-256 fingerprint
+        └── config.rs            # TOML config — ClientConfig + ValidClientConfig + ReconnectConfig
 ```
 
 ## Security Constraints
@@ -110,7 +110,9 @@ latticeshield/
 | No `oqs-rs` | C FFI wrapper; rejected in favor of native Rust implementations |
 | No `openssl` | Legacy C library; rejected via `cargo-deny` |
 | `libcrux-ml-dsa 0.0.7` instead of `ml-dsa` | `ml-dsa 0.0.4` has RUSTSEC-2025-0144 (timing side-channel) + CVE-2026-24850. Using audited libcrux alternative until RustCrypto publishes `ml-dsa 0.1.0` stable |
-| Pre-shared VerifyingKey | Server's ML-DSA-65 VK is distributed out-of-band — never transmitted on the wire, preventing MITM key substitution |
+| Pre-shared server VerifyingKey | Server's ML-DSA-65 VK is distributed out-of-band — never transmitted on the wire, preventing MITM key substitution |
+| Pre-shared client VerifyingKey | Client's ML-DSA-65 VK is pre-shared to the bridge (one authorized keypair per bridge). Bridge rejects any unsigned or wrongly-signed ClientResponse |
+| Session-bound client signature | Client signs `ClientResponse bytes \|\| ServerHello bytes` — the signature covers the server's per-session nonce, making replay attacks across sessions impossible |
 | `mlock(2)` on SigningKey | Key material stored in heap-allocated `Box<[u8; 4032]>` and memory-locked via `libc::mlock` — never paged to swap |
 
 ## Dependencies (key)
@@ -149,37 +151,37 @@ cargo build --release
 
 ## Tests
 
-143 unit + integration tests across all three crates — all passing.
+169 unit + integration tests across all three crates — all passing.
 
-### latticeshield-crypto (35 tests)
+### latticeshield-crypto (39 tests)
 
 | Module | Tests |
 |---|---|
-| `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection) |
+| `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection), mutual auth (signed ClientResponse roundtrip, wrong VK, tampered CR, wrong ServerHello) |
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (88 tests)
+### latticeshield-bridge (97 tests)
 
 | Module | Tests |
 |---|---|
-| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, port collision detection |
+| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, auth config, port collision detection |
 | `tls` | `build_server_config`, `build_acceptor`, cert/key loading, self-signed generation (feature-gated) |
 | `http_relay` | HTTP head parsing (complete/partial/oversized), GET forwarding, POST with body, backend down → 502 |
 | `quic` | `build_endpoint`, `relay_stream` end-to-end, backend down → error, normal connection close |
-| `identity` | generate_and_save (files, permissions 0o600/0o644, sizes), load roundtrip, error paths |
+| `identity` | ServerIdentity: generate_and_save (files, permissions, sizes), load roundtrip, error paths. ClientVerifyingIdentity: load roundtrip, wrong size rejected |
 | `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
-| `session` (integration) | Full PQC handshake + relay, tampered response rejection, key uniqueness, POST `/rotate` endpoint, time-based and byte-threshold key rotation, full relay after rotation |
+| `session` (integration) | Full PQC handshake + relay, mutual auth (with/without client auth, wrong VK rejection), tampered response rejection, key uniqueness, POST `/rotate`, time-based and byte-threshold key rotation |
 
-### latticeshield-client (20 tests)
+### latticeshield-client (33 tests)
 
 | Module | Tests |
 |---|---|
-| `config` | TOML defaults, custom values, missing file, bad TOML, invalid addrs, out-of-range max_frame_size, empty vk_path |
-| `identity` | load roundtrip, wrong size, nonexistent file, fingerprint length, fingerprint determinism |
-| `client_session` | Bridge connect refused → user gets EOF, tampered signature → Ok(()) |
+| `config` | TOML defaults, custom values, missing file, bad TOML, invalid addrs, out-of-range max_frame_size, empty vk_path, client_sk_path, reconnect section |
+| `identity` | ServerVK: load roundtrip, wrong size, nonexistent file, fingerprint. ClientIdentity: load roundtrip, wrong permissions rejected, wrong size, generate_and_save (files, permissions 0o600/0o644) |
+| `client_session` | Bridge connect refused → EOF, tampered signature → Ok(()), reconnect succeeds on 2nd attempt, reconnect exhausts max_retries, auth failure does not trigger reconnect |
 | `server` | Listener binds and accepts connections |
 | integration | Full PQC relay round-trip (client ↔ mock bridge ↔ echo backend), KEY_ROTATE survives relay, `vk-info` binary output |
 
@@ -194,7 +196,7 @@ cargo build --release
 | 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
 | 7 | TLS listener (rustls 0.23) + QUIC listener (quinn 0.11), standard HTTPS/QUIC clients without agent | Complete |
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
-| 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Planned |
+| 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Complete |
 | 10 | Unified CLI `latticeshield` (keygen/setup for full stack) + identity.rs disk tests (bridge debt) | Planned |
 | 11 | Distribution: pre-compiled binaries (GitHub Actions) + systemd service files + `curl \| sh` installer | Planned |
 | 12 | Control Plane SaaS: tenant registry, VK distribution API, bridge management backend | Planned |
@@ -293,7 +295,7 @@ El bridge ya tiene `control_plane.rs` implementado — solo falta el servidor qu
 | Bridge (PQC + TLS + QUIC) | ✅ Mes 1–7 |
 | Client (PQC handshake + relay) | ✅ Mes 8 |
 | Server auth (bridge firma con ML-DSA-65) | ✅ Mes 4–5 |
-| Mutual auth (client también se autentica) | ⏳ Mes 9 |
+| Mutual auth (client también se autentica) | ✅ Mes 9 |
 | Prometheus metrics | ✅ Mes 3 |
 | `control_plane.rs` (heartbeat sender) | ✅ Mes 6 |
 | CLI keygen unificado | ⏳ Mes 10 |
