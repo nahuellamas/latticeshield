@@ -49,6 +49,12 @@ pub const SERVER_HELLO_SIGNED_LEN: usize = SERVER_HELLO_LEN + SIGNATURE_LEN; // 
 /// Tamaño total de la respuesta del cliente en el wire: X25519 pubkey + ML-KEM ciphertext.
 pub const CLIENT_RESPONSE_LEN: usize = X25519_KEY_LEN + MLKEM768_CT_LEN; // 1120
 
+/// Tamaño total de la respuesta del cliente firmada: ClientResponse + Signature ML-DSA-65.
+///
+/// La firma cubre [CR_bytes(1120) || server_hello(1248)] para autenticar al cliente
+/// y vincular la respuesta al handshake especifico.
+pub const CLIENT_RESPONSE_SIGNED_LEN: usize = CLIENT_RESPONSE_LEN + SIGNATURE_LEN; // 4429
+
 #[derive(Debug, Error)]
 pub enum HandshakeError {
     #[error("ML-KEM encapsulation failed")]
@@ -59,6 +65,8 @@ pub enum HandshakeError {
     Hkdf,
     #[error("server authentication failed: invalid ML-DSA-65 signature")]
     AuthenticationFailed,
+    #[error("client authentication failed: invalid ML-DSA-65 signature")]
+    ClientAuthFailed,
 }
 
 /// Clave de sesion derivada del handshake hibrido.
@@ -99,6 +107,10 @@ pub struct ServerHandshake {
     kem_decap_key: <MlKem768 as KemCore>::DecapsulationKey,
     kem_encap_key: <MlKem768 as KemCore>::EncapsulationKey,
     nonce: [u8; 32],
+    /// Los 1248 bytes del ServerHello serializados eagerly al construir la struct.
+    /// Se usan en `complete_from_wire_signed` para verificar la firma del cliente,
+    /// que cubre [CR_bytes || server_hello_raw] para vincular la respuesta al handshake.
+    pub server_hello_raw: [u8; SERVER_HELLO_LEN],
 }
 
 impl ServerHandshake {
@@ -109,11 +121,21 @@ impl ServerHandshake {
         let mut nonce = [0u8; 32];
         rng.fill_bytes(&mut nonce);
 
+        // Serializar el ServerHello eagerly para tenerlo disponible en complete_from_wire_signed.
+        let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+        let x25519_pub = X25519PublicKey::from(&x25519_secret);
+        server_hello_raw[..X25519_KEY_LEN].copy_from_slice(x25519_pub.as_bytes());
+        let ek_encoded = kem_encap_key.as_bytes();
+        let ek_bytes: &[u8] = ek_encoded.as_ref();
+        server_hello_raw[X25519_KEY_LEN..X25519_KEY_LEN + MLKEM768_EK_LEN].copy_from_slice(ek_bytes);
+        server_hello_raw[X25519_KEY_LEN + MLKEM768_EK_LEN..].copy_from_slice(&nonce);
+
         Self {
             x25519_secret,
             kem_decap_key,
             kem_encap_key,
             nonce,
+            server_hello_raw,
         }
     }
 
@@ -130,14 +152,7 @@ impl ServerHandshake {
     ///
     /// Formato: [32B X25519 pubkey] [1184B ML-KEM EK] [32B nonce]
     pub fn server_hello_bytes(&self) -> [u8; SERVER_HELLO_LEN] {
-        let mut buf = [0u8; SERVER_HELLO_LEN];
-        let x25519_pub = X25519PublicKey::from(&self.x25519_secret);
-        buf[..X25519_KEY_LEN].copy_from_slice(x25519_pub.as_bytes());
-        let ek_encoded = self.kem_encap_key.as_bytes();
-        let ek_bytes: &[u8] = ek_encoded.as_ref();
-        buf[X25519_KEY_LEN..X25519_KEY_LEN + MLKEM768_EK_LEN].copy_from_slice(ek_bytes);
-        buf[X25519_KEY_LEN + MLKEM768_EK_LEN..].copy_from_slice(&self.nonce);
-        buf
+        self.server_hello_raw
     }
 
     /// Serializa el ServerHello firmado para enviarlo por el wire.
@@ -184,6 +199,37 @@ impl ServerHandshake {
             kem_ciphertext,
         };
         self.complete(&response)
+    }
+
+    /// Recibe la respuesta del cliente firmada desde el wire, verifica la firma y completa el handshake.
+    ///
+    /// Formato esperado: [1120B ClientResponse] [3309B Signature ML-DSA-65]
+    ///
+    /// La firma cubre [CR_bytes(1120) || server_hello_raw(1248)] = 2368 bytes.
+    /// Esto vincula la respuesta del cliente al handshake especifico (anti-replay).
+    /// El caller provee la `VerifyingKey` pre-shared del cliente.
+    pub fn complete_from_wire_signed(
+        self,
+        bytes: &[u8; CLIENT_RESPONSE_SIGNED_LEN],
+        client_vk: &VerifyingKey,
+    ) -> Result<SessionKey, HandshakeError> {
+        let cr_bytes: &[u8; CLIENT_RESPONSE_LEN] = bytes[..CLIENT_RESPONSE_LEN]
+            .try_into()
+            .unwrap();
+        let sig_bytes = &bytes[CLIENT_RESPONSE_LEN..];
+
+        // Construir el mensaje firmado: CR_bytes || server_hello_raw
+        let mut message = [0u8; CLIENT_RESPONSE_LEN + SERVER_HELLO_LEN];
+        message[..CLIENT_RESPONSE_LEN].copy_from_slice(cr_bytes);
+        message[CLIENT_RESPONSE_LEN..].copy_from_slice(&self.server_hello_raw);
+
+        let sig = Signature::from_bytes(sig_bytes)
+            .map_err(|_| HandshakeError::ClientAuthFailed)?;
+
+        verify(client_vk, &message, &sig)
+            .map_err(|_| HandshakeError::ClientAuthFailed)?;
+
+        self.complete_from_wire(cr_bytes)
     }
 
     /// El servidor recibe la respuesta del cliente y deriva la clave de sesion.
@@ -254,6 +300,35 @@ pub fn serialize_client_response(response: &ClientResponse) -> [u8; CLIENT_RESPO
     let ct_bytes: &[u8] = response.kem_ciphertext.as_ref();
     buf[X25519_KEY_LEN..].copy_from_slice(ct_bytes);
     buf
+}
+
+/// Serializa un `ClientResponse` firmado para enviarlo por el wire.
+///
+/// Formato: [1120B ClientResponse] [3309B Signature ML-DSA-65]
+///
+/// La firma cubre [CR_bytes(1120) || server_hello(1248)] = 2368 bytes.
+/// Esto vincula la respuesta al handshake especifico iniciado por ese servidor.
+pub fn serialize_client_response_signed(
+    resp: &ClientResponse,
+    sk: &SigningKey,
+    server_hello: &[u8; SERVER_HELLO_LEN],
+    rng: &mut impl CryptoRngCore,
+) -> Result<[u8; CLIENT_RESPONSE_SIGNED_LEN], HandshakeError> {
+    let cr_bytes = serialize_client_response(resp);
+
+    // Mensaje = CR_bytes(1120) || server_hello(1248)
+    let mut message = [0u8; CLIENT_RESPONSE_LEN + SERVER_HELLO_LEN];
+    message[..CLIENT_RESPONSE_LEN].copy_from_slice(&cr_bytes);
+    message[CLIENT_RESPONSE_LEN..].copy_from_slice(server_hello);
+
+    let sig = sign(sk, &message, rng)
+        .map_err(|_| HandshakeError::ClientAuthFailed)?;
+
+    let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
+    buf[..CLIENT_RESPONSE_LEN].copy_from_slice(&cr_bytes);
+    buf[CLIENT_RESPONSE_LEN..].copy_from_slice(sig.to_bytes());
+
+    Ok(buf)
 }
 
 /// Logica del cliente: recibe el ClientHello del servidor, encapsula, deriva la clave.
@@ -484,5 +559,111 @@ mod tests {
         //  pero la clave de sesion no va a coincidir)
         let _ = response.kem_ciphertext; // el tipo no permite mutacion directa — esto es intencional
         // Este test verifica que el tipo es opaco y no se puede mutar accidentalmente
+    }
+
+    // ── Client authentication (mutual auth, pre-shared VerifyingKey) ─────────
+
+    #[test]
+    fn test_client_response_signed_roundtrip() {
+        let mut rng = OsRng;
+
+        // Claves del servidor (server-auth)
+        let (server_sk, server_vk) = generate_keypair(&mut rng);
+        // Claves del cliente (client-auth)
+        let (client_sk, client_vk) = generate_keypair(&mut rng);
+
+        // Servidor genera ServerHello firmado
+        let server = ServerHandshake::new(&mut rng);
+        let signed_hello = server.server_hello_signed_bytes(&server_sk, &mut rng).unwrap();
+        let server_hello_raw: &[u8; SERVER_HELLO_LEN] = signed_hello[..SERVER_HELLO_LEN].try_into().unwrap();
+
+        // Cliente verifica ServerHello y responde
+        let hello = parse_server_hello_signed(&signed_hello, &server_vk).unwrap();
+        let (response, client_key) = client_respond(&hello, &mut rng).unwrap();
+
+        // Cliente firma su respuesta
+        let signed_cr = serialize_client_response_signed(&response, &client_sk, server_hello_raw, &mut rng).unwrap();
+        assert_eq!(signed_cr.len(), CLIENT_RESPONSE_SIGNED_LEN);
+
+        // Servidor verifica la firma del cliente y completa el handshake
+        let server_key = server.complete_from_wire_signed(&signed_cr, &client_vk).unwrap();
+
+        assert_eq!(
+            client_key.as_bytes(),
+            server_key.as_bytes(),
+            "mutual auth: cliente y servidor deben derivar la misma session key"
+        );
+    }
+
+    #[test]
+    fn test_client_response_signed_wrong_vk() {
+        let mut rng = OsRng;
+
+        let (client_sk, _client_vk) = generate_keypair(&mut rng);
+        let (_wrong_sk, wrong_vk) = generate_keypair(&mut rng);
+
+        let server = ServerHandshake::new(&mut rng);
+        let sh_raw = server.server_hello_raw;
+        // Usar parse_server_hello para no mover server antes de complete_from_wire_signed
+        let ch = parse_server_hello(&sh_raw);
+        let (resp, _) = client_respond(&ch, &mut rng).unwrap();
+        let scr = serialize_client_response_signed(&resp, &client_sk, &sh_raw, &mut rng).unwrap();
+
+        // Verificar con una VK incorrecta — debe fallar con ClientAuthFailed
+        let result = server.complete_from_wire_signed(&scr, &wrong_vk);
+        assert!(
+            matches!(result, Err(HandshakeError::ClientAuthFailed)),
+            "VK incorrecta debe fallar con ClientAuthFailed"
+        );
+    }
+
+    #[test]
+    fn test_client_response_signed_tampered_cr() {
+        let mut rng = OsRng;
+
+        let (client_sk, client_vk) = generate_keypair(&mut rng);
+
+        let server = ServerHandshake::new(&mut rng);
+        let sh_raw = server.server_hello_raw;
+        let ch = parse_server_hello(&sh_raw);
+        let (resp, _) = client_respond(&ch, &mut rng).unwrap();
+
+        let mut signed_cr = serialize_client_response_signed(&resp, &client_sk, &sh_raw, &mut rng).unwrap();
+
+        // Corromper un byte en la porcion CR (primeros 1120 bytes)
+        signed_cr[0] ^= 0xFF;
+
+        let result = server.complete_from_wire_signed(&signed_cr, &client_vk);
+        assert!(
+            matches!(result, Err(HandshakeError::ClientAuthFailed)),
+            "CR corrompido debe fallar con ClientAuthFailed"
+        );
+    }
+
+    #[test]
+    fn test_client_response_signed_wrong_server_hello() {
+        let mut rng = OsRng;
+
+        let (client_sk, client_vk) = generate_keypair(&mut rng);
+
+        // Servidor A genera su hello
+        let server_a = ServerHandshake::new(&mut rng);
+        let sh_raw_a = server_a.server_hello_raw;
+
+        // Servidor B genera su hello (distinto)
+        let server_b = ServerHandshake::new(&mut rng);
+        let sh_raw_b = server_b.server_hello_raw;
+
+        // Cliente responde al hello de A pero firma con el hello de B (incorrecto)
+        let ch_a = parse_server_hello(&sh_raw_a);
+        let (resp, _) = client_respond(&ch_a, &mut rng).unwrap();
+        let signed_cr = serialize_client_response_signed(&resp, &client_sk, &sh_raw_b, &mut rng).unwrap();
+
+        // Servidor A verifica — debe fallar porque el server_hello en la firma es el de B
+        let result = server_a.complete_from_wire_signed(&signed_cr, &client_vk);
+        assert!(
+            matches!(result, Err(HandshakeError::ClientAuthFailed)),
+            "server_hello incorrecto en la firma debe fallar con ClientAuthFailed"
+        );
     }
 }

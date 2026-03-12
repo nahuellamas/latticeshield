@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use latticeshield_crypto::{ServerHandshake, CLIENT_RESPONSE_LEN, SERVER_HELLO_SIGNED_LEN};
+use latticeshield_crypto::{ServerHandshake, CLIENT_RESPONSE_LEN, CLIENT_RESPONSE_SIGNED_LEN, SERVER_HELLO_SIGNED_LEN};
 use rand_core::{OsRng, RngCore};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -31,13 +31,14 @@ use tracing::{debug, info, warn};
 
 use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 use crate::config::ValidConfig;
-use crate::identity::ServerIdentity;
+use crate::identity::{ClientVerifyingIdentity, ServerIdentity};
 use crate::metrics::{ActiveGuard, MetricsActiveGuard, MetricsState};
 
 pub async fn handle(
     mut client: TcpStream,
     peer: SocketAddr,
     identity: Arc<ServerIdentity>,
+    client_auth: Option<Arc<ClientVerifyingIdentity>>,
     metrics_state: Arc<MetricsState>,
     rotate_tx: Arc<watch::Sender<u64>>,
     config: ValidConfig,
@@ -62,16 +63,33 @@ pub async fn handle(
         .context("envio ServerHello firmado")?;
     debug!(%peer, "ServerHello firmado enviado ({} bytes)", SERVER_HELLO_SIGNED_LEN);
 
-    let mut response_buf = [0u8; CLIENT_RESPONSE_LEN];
-    client
-        .read_exact(&mut response_buf)
-        .await
-        .context("lectura ClientResponse")?;
-    debug!(%peer, "ClientResponse recibido ({} bytes)", CLIENT_RESPONSE_LEN);
-
-    let session_key = server
-        .complete_from_wire(&response_buf)
-        .context("handshake PQC fallido")?;
+    let session_key = match &client_auth {
+        Some(client_identity) => {
+            let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
+            client
+                .read_exact(&mut buf)
+                .await
+                .context("lectura ClientResponse firmado")?;
+            debug!(%peer, "ClientResponse firmado recibido ({} bytes)", CLIENT_RESPONSE_SIGNED_LEN);
+            server
+                .complete_from_wire_signed(&buf, &client_identity.verifying_key)
+                .map_err(|e| {
+                    warn!(%peer, "autenticacion del cliente fallida: {e}");
+                    anyhow::anyhow!("client authentication failed: {e}")
+                })?
+        }
+        None => {
+            let mut buf = [0u8; CLIENT_RESPONSE_LEN];
+            client
+                .read_exact(&mut buf)
+                .await
+                .context("lectura ClientResponse")?;
+            debug!(%peer, "ClientResponse recibido ({} bytes)", CLIENT_RESPONSE_LEN);
+            server
+                .complete_from_wire(&buf)
+                .context("handshake PQC fallido")?
+        }
+    };
     metrics::histogram!(crate::metrics::HANDSHAKE_DURATION).record(t_handshake.elapsed().as_secs_f64());
     info!(%peer, "handshake PQC completado — canal cifrado activo");
 

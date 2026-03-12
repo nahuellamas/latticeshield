@@ -54,8 +54,10 @@ fn make_client_config(bridge_addr: SocketAddr) -> ValidClientConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         bridge_addr,
         server_vk_path: PathBuf::from("./keys/server.vk"),
+        client_sk_path: None,
         max_frame_size: 65536,
         log_level: "info".to_string(),
+        reconnect: latticeshield_client::config::ReconnectConfig::default(),
     }
 }
 
@@ -213,7 +215,7 @@ async fn full_bridge_client_relay() {
 
     // Spawn client_session::handle
     let handle_task = tokio::spawn(async move {
-        client_session::handle(user_server_side, peer, config, Arc::new(vk))
+        client_session::handle(user_server_side, peer, config, Arc::new(vk), None, latticeshield_client::config::ReconnectConfig::default())
             .await
             .expect("client_session::handle failed")
     });
@@ -325,7 +327,7 @@ async fn key_rotate_survives_relay() {
     let config = make_client_config(bridge_addr);
 
     let handle_task = tokio::spawn(async move {
-        client_session::handle(user_server_side, peer, config, Arc::new(vk))
+        client_session::handle(user_server_side, peer, config, Arc::new(vk), None, latticeshield_client::config::ReconnectConfig::default())
             .await
             .expect("client_session::handle failed")
     });

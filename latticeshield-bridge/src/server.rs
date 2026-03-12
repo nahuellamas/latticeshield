@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::ServerIdentity, metrics, metrics::MetricsState, quic, session, tls};
+use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
@@ -49,6 +49,21 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
             ))?,
     );
     info!(path = %config.signing_key_path.display(), "identidad del servidor cargada");
+
+    // ── Cargar VK del cliente para autenticacion mutua (opcional) ───────────
+    let client_vk: Option<Arc<ClientVerifyingIdentity>> = if config.client_auth_enabled {
+        let path = config.client_vk_path.as_ref().expect("client_auth_enabled => client_vk_path is Some");
+        let vk = ClientVerifyingIdentity::load(path)
+            .map_err(|e| anyhow::anyhow!(
+                "no se pudo cargar la VK del cliente desde {}: {e}\n\
+                 Hint: distribuye la VK del cliente en la ruta configurada en [auth].client_vk_path.",
+                path.display()
+            ))?;
+        info!(path = %path.display(), "autenticacion mutua habilitada — VK del cliente cargada");
+        Some(Arc::new(vk))
+    } else {
+        None
+    };
 
     // ── Metrics HTTP server (puerto dedicado, plain HTTP) ───────────────────
     let app_state = MetricsAppState {
@@ -90,12 +105,13 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let identity = Arc::clone(&identity);
+        let client_vk = client_vk.clone();
         let ms = Arc::clone(&metrics_state);
         let rtx = Arc::clone(&rotate_tx);
         let cfg = config.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = session::handle(socket, peer, identity, ms, rtx, cfg).await {
+            if let Err(e) = session::handle(socket, peer, identity, client_vk, ms, rtx, cfg).await {
                 error!(%peer, "sesion error: {e:#}");
             }
         });

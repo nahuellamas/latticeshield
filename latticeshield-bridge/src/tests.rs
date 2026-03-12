@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use latticeshield_crypto::{
-    client_respond, generate_keypair, parse_server_hello_signed, serialize_client_response,
+    client_respond, generate_keypair, parse_server_hello_signed,
+    serialize_client_response, serialize_client_response_signed,
     SigningKey, VerifyingKey, SERVER_HELLO_SIGNED_LEN, CLIENT_RESPONSE_LEN,
 };
 use rand_core::OsRng;
@@ -21,7 +22,7 @@ use tokio::sync::watch;
 
 use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 use crate::config::ValidConfig;
-use crate::identity::ServerIdentity;
+use crate::identity::{ClientVerifyingIdentity, ServerIdentity};
 use crate::metrics::MetricsState;
 
 const MAX_FRAME: usize = 64 * 1024;
@@ -58,6 +59,8 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         quic_listen_addr: "127.0.0.1:0".parse().unwrap(),
         quic_cert_path: std::path::PathBuf::from("./keys/tls.crt"),
         quic_key_path: std::path::PathBuf::from("./keys/tls.key"),
+        client_auth_enabled: false,
+        client_vk_path: None,
     }
 }
 
@@ -120,7 +123,7 @@ async fn full_pqc_handshake_and_relay() {
 
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, identity, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await;
+        let _ = crate::session::handle(socket, peer, identity, None, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await;
     });
 
     // ── Cliente: realiza el handshake autenticado ────────────────────────────
@@ -168,7 +171,7 @@ async fn two_sessions_produce_different_keys() {
         let bridge_addr = bridge_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, peer) = bridge_listener.accept().await.unwrap();
-            let _ = crate::session::handle(socket, peer, identity, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await;
+            let _ = crate::session::handle(socket, peer, identity, None, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await;
         });
 
         let mut client = TcpStream::connect(bridge_addr).await.unwrap();
@@ -205,7 +208,7 @@ async fn tampered_client_response_is_rejected() {
 
     let bridge_result = tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        crate::session::handle(socket, peer, identity, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await
+        crate::session::handle(socket, peer, identity, None, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await
     });
 
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
@@ -405,7 +408,7 @@ async fn full_session_records_connections_and_bytes() {
     let bridge_addr = bridge_listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, identity, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await;
+        let _ = crate::session::handle(socket, peer, identity, None, MetricsState::new(), test_rotate_tx(), test_config(backend_addr)).await;
     });
 
     let mut client = TcpStream::connect(bridge_addr).await.unwrap();
@@ -486,7 +489,7 @@ async fn full_relay_survives_key_rotation() {
 
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, identity, MetricsState::new(), test_rotate_tx(), cfg).await;
+        let _ = crate::session::handle(socket, peer, identity, None, MetricsState::new(), test_rotate_tx(), cfg).await;
     });
 
     // Cliente: handshake completo
@@ -555,7 +558,7 @@ async fn byte_threshold_triggers_rotation() {
 
     tokio::spawn(async move {
         let (socket, peer) = bridge_listener.accept().await.unwrap();
-        let _ = crate::session::handle(socket, peer, identity, MetricsState::new(), test_rotate_tx(), cfg).await;
+        let _ = crate::session::handle(socket, peer, identity, None, MetricsState::new(), test_rotate_tx(), cfg).await;
     });
 
     // Cliente: handshake
@@ -635,4 +638,179 @@ async fn post_rotate_endpoint_returns_200() {
     assert!(*rotate_rx.borrow() > 0, "rotate_tx debe haber enviado una senal");
 
     let _ = recorder;
+}
+
+// ── Tests de autenticacion mutua (Mes 9) ─────────────────────────────────────
+
+/// Crea un `Arc<ClientVerifyingIdentity>` de prueba y devuelve tambien el `SigningKey`
+/// del cliente para que el test pueda firmar el ClientResponse.
+fn test_client_auth() -> (Arc<ClientVerifyingIdentity>, SigningKey) {
+    let (client_sk, client_vk) = generate_keypair(&mut OsRng);
+    let client_sk = SigningKey::from_bytes(client_sk.to_bytes()).unwrap();
+    let client_vk = VerifyingKey::from_bytes(client_vk.to_bytes()).unwrap();
+    let client_auth = Arc::new(ClientVerifyingIdentity { verifying_key: client_vk });
+    (client_auth, client_sk)
+}
+
+/// TEST 9 — Autenticacion mutua: happy path.
+///
+/// El cliente firma su ClientResponse con su SK. El bridge tiene la VK correspondiente.
+/// El handshake debe completarse y el relay debe funcionar.
+#[tokio::test]
+async fn test_session_with_client_auth() {
+    let identity = test_identity();
+    let server_vk = VerifyingKey::from_bytes(identity.verifying_key.to_bytes()).unwrap();
+
+    let (client_auth, client_sk) = test_client_auth();
+
+    // Backend: echo server
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut conn, _) = backend_listener.accept().await.unwrap();
+        let mut buf = vec![0u8; MAX_FRAME];
+        let n = conn.read(&mut buf).await.unwrap();
+        conn.write_all(&buf[..n]).await.unwrap();
+    });
+
+    // Bridge con autenticacion mutua habilitada
+    let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_addr = bridge_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (socket, peer) = bridge_listener.accept().await.unwrap();
+        let _ = crate::session::handle(
+            socket, peer, identity, Some(client_auth), MetricsState::new(),
+            test_rotate_tx(), test_config(backend_addr),
+        ).await;
+    });
+
+    // Cliente: handshake con firma del ClientResponse
+    let mut client = TcpStream::connect(bridge_addr).await.unwrap();
+
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+    let hello = parse_server_hello_signed(&hello_buf, &server_vk).unwrap();
+
+    // Extraer server_hello_raw (primeros SERVER_HELLO_LEN bytes) para la firma del cliente
+    use latticeshield_crypto::SERVER_HELLO_LEN;
+    let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+    server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
+
+    let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
+    let signed_cr = serialize_client_response_signed(&response, &client_sk, &server_hello_raw, &mut OsRng).unwrap();
+    client.write_all(&signed_cr).await.unwrap();
+
+    // Canal cifrado activo — enviar y recibir
+    let channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let payload = b"mutual auth test payload";
+    channel.write_frame(&mut client, payload).await.unwrap();
+
+    let received = match channel.read_frame(&mut client).await.unwrap() {
+        FrameResult::Data(data) => data,
+        FrameResult::KeyRotate(_) => panic!("inesperado KEY_ROTATE"),
+    };
+
+    assert_eq!(received, payload, "el relay debe funcionar con autenticacion mutua");
+}
+
+/// TEST 10 — Sin autenticacion mutua: el flujo original (unauthenticated) sigue funcionando.
+///
+/// Verifica que pasar `None` como `client_auth` mantiene el comportamiento previo.
+#[tokio::test]
+async fn test_session_without_client_auth() {
+    let identity = test_identity();
+    let server_vk = VerifyingKey::from_bytes(identity.verifying_key.to_bytes()).unwrap();
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut conn, _) = backend_listener.accept().await.unwrap();
+        let mut buf = vec![0u8; MAX_FRAME];
+        let n = conn.read(&mut buf).await.unwrap();
+        conn.write_all(&buf[..n]).await.unwrap();
+    });
+
+    let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_addr = bridge_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (socket, peer) = bridge_listener.accept().await.unwrap();
+        let _ = crate::session::handle(
+            socket, peer, identity, None, MetricsState::new(),
+            test_rotate_tx(), test_config(backend_addr),
+        ).await;
+    });
+
+    let mut client = TcpStream::connect(bridge_addr).await.unwrap();
+
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+    let hello = parse_server_hello_signed(&hello_buf, &server_vk).unwrap();
+    let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
+    client.write_all(&serialize_client_response(&response)).await.unwrap();
+
+    let channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let payload = b"unauthenticated path still works";
+    channel.write_frame(&mut client, payload).await.unwrap();
+
+    let received = match channel.read_frame(&mut client).await.unwrap() {
+        FrameResult::Data(data) => data,
+        FrameResult::KeyRotate(_) => panic!("inesperado KEY_ROTATE"),
+    };
+
+    assert_eq!(received, payload);
+}
+
+/// TEST 11 — VK incorrecta: la sesion es rechazada.
+///
+/// El bridge tiene una VK distinta a la del cliente. La firma del cliente
+/// no puede verificarse → la sesion debe cerrarse con error.
+#[tokio::test]
+async fn test_session_wrong_client_vk() {
+    let identity = test_identity();
+    let server_vk = VerifyingKey::from_bytes(identity.verifying_key.to_bytes()).unwrap();
+
+    // VK incorrecta: generamos un keypair diferente y usamos su VK
+    let (_, wrong_vk_raw) = generate_keypair(&mut OsRng);
+    let wrong_vk = VerifyingKey::from_bytes(wrong_vk_raw.to_bytes()).unwrap();
+    let wrong_client_auth = Arc::new(ClientVerifyingIdentity { verifying_key: wrong_vk });
+
+    // Keypair real del cliente (su firma sera invalida para la wrong_vk del bridge)
+    let (client_sk_raw, _) = generate_keypair(&mut OsRng);
+    let client_sk = SigningKey::from_bytes(client_sk_raw.to_bytes()).unwrap();
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap();
+    tokio::spawn(async move { let _ = backend_listener.accept().await; });
+
+    let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_addr = bridge_listener.local_addr().unwrap();
+
+    let bridge_result = tokio::spawn(async move {
+        let (socket, peer) = bridge_listener.accept().await.unwrap();
+        crate::session::handle(
+            socket, peer, identity, Some(wrong_client_auth), MetricsState::new(),
+            test_rotate_tx(), test_config(backend_addr),
+        ).await
+    });
+
+    let mut client = TcpStream::connect(bridge_addr).await.unwrap();
+
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+    let hello = parse_server_hello_signed(&hello_buf, &server_vk).unwrap();
+
+    use latticeshield_crypto::SERVER_HELLO_LEN;
+    let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+    server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
+
+    let (response, _client_key) = client_respond(&hello, &mut OsRng).unwrap();
+    let signed_cr = serialize_client_response_signed(&response, &client_sk, &server_hello_raw, &mut OsRng).unwrap();
+    client.write_all(&signed_cr).await.unwrap();
+    drop(client);
+
+    // El bridge debe rechazar la sesion con un error (no Ok)
+    let result = bridge_result.await.unwrap();
+    assert!(result.is_err(), "sesion con VK incorrecta debe ser rechazada con error");
 }

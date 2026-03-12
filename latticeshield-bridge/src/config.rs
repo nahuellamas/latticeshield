@@ -117,6 +117,16 @@ fn default_tls_key_path() -> PathBuf { PathBuf::from("./keys/tls.key") }
 fn default_quic_enabled() -> bool { false }
 fn default_quic_listen_addr() -> String { "0.0.0.0:8441".to_string() }
 
+// ── AuthConfig ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Ruta a la clave de verificacion publica del cliente (material publico).
+    /// Si se configura, el bridge exige autenticacion mutua ML-DSA-65 del cliente.
+    pub client_vk_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneConfig {
@@ -221,6 +231,8 @@ pub struct Config {
     pub key_rotation: KeyRotationConfig,
     pub tls: TlsConfig,
     pub quic: QuicConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl Default for Config {
@@ -234,6 +246,7 @@ impl Default for Config {
             key_rotation: KeyRotationConfig::default(),
             tls: TlsConfig::default(),
             quic: QuicConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -263,6 +276,10 @@ pub struct ValidConfig {
     pub quic_listen_addr: SocketAddr,
     pub quic_cert_path: PathBuf,   // only meaningful when quic_enabled = true
     pub quic_key_path: PathBuf,    // only meaningful when quic_enabled = true
+    /// true si se configuro [auth].client_vk_path — el bridge exigira autenticacion del cliente.
+    pub client_auth_enabled: bool,
+    /// Ruta a la VK del cliente (solo significativa cuando client_auth_enabled = true).
+    pub client_vk_path: Option<PathBuf>,
 }
 
 // ── Config::load + validate ────────────────────────────────────────────────────
@@ -409,6 +426,9 @@ impl Config {
             }
         }
 
+        let client_auth_enabled = self.auth.client_vk_path.is_some();
+        let client_vk_path = self.auth.client_vk_path;
+
         Ok(ValidConfig {
             listen_addr,
             backend_addr,
@@ -431,6 +451,8 @@ impl Config {
             quic_listen_addr,
             quic_cert_path: self.quic.cert_path.unwrap_or_default(),
             quic_key_path: self.quic.key_path.unwrap_or_default(),
+            client_auth_enabled,
+            client_vk_path,
         })
     }
 }
@@ -835,5 +857,31 @@ listen_addr = "not_an_addr"
             "[quic]\nenabled = false\nlisten_addr = \"0.0.0.0:8443\"\n"
         );
         Config::load(f.path()).unwrap();
+    }
+
+    // ── AuthConfig tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_section_absent_gives_client_auth_disabled() {
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.client_auth_enabled);
+        assert!(cfg.client_vk_path.is_none());
+    }
+
+    #[test]
+    fn auth_section_with_client_vk_path_enables_client_auth() {
+        let f = write_toml("[auth]\nclient_vk_path = \"./keys/client.vk\"\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.client_auth_enabled);
+        assert_eq!(cfg.client_vk_path, Some(PathBuf::from("./keys/client.vk")));
+    }
+
+    #[test]
+    fn auth_section_without_client_vk_path_gives_client_auth_disabled() {
+        let f = write_toml("[auth]\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.client_auth_enabled);
+        assert!(cfg.client_vk_path.is_none());
     }
 }
