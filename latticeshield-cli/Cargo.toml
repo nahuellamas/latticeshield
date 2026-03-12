@@ -1,0 +1,24 @@
+[package]
+name        = "latticeshield-cli"
+description = "Unified CLI for LatticeShield key management"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "latticeshield"
+path = "src/main.rs"
+
+[dependencies]
+latticeshield-bridge = { path = "../latticeshield-bridge", features = ["tls-keygen"] }
+latticeshield-client = { path = "../latticeshield-client" }
+anyhow  = { workspace = true }
+clap    = { version = "4", features = ["derive"] }
+colored = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile   = "3"

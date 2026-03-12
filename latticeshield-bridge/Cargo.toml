@@ -7,6 +7,10 @@ authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[lib]
+name = "latticeshield_bridge"
+path = "src/lib.rs"
+
 [[bin]]
 name = "latticeshield-bridge"
 path = "src/main.rs"
