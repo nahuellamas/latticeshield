@@ -198,16 +198,17 @@ cargo build --release
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
 | 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Complete |
 | 10 | Unified CLI `latticeshield` (keygen/setup for full stack) + identity.rs disk tests (bridge debt) | Planned |
-| 11 | Distribution: pre-compiled binaries (GitHub Actions) + systemd service files + `curl \| sh` installer | Planned |
-| 12 | Control Plane SaaS: tenant registry, VK distribution API, bridge management backend | Planned |
-| 13 | Web dashboard: real-time metrics, session status, tenant overview | Planned |
-| 14 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
+| 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Planned |
+| 12 | Distribution: pre-compiled binaries (GitHub Actions) + systemd service files + `curl \| sh` installer | Planned |
+| 13 | Control Plane SaaS: tenant registry, VK distribution API, bridge management backend | Planned |
+| 14 | Web dashboard: real-time metrics, session status, tenant overview | Planned |
+| 15 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
 
 ---
 
 ## Product Vision — Installation & Distribution
 
-> ⚠️ **NOTA IMPORTANTE**: Todo este circuito requiere una revisión completa de UI/UX antes de implementarse — flujo del operador del bridge, flujo del usuario final, flujo de distribución del server.vk, onboarding en el control plane, y cada pantalla/comando que el usuario toca. No implementar Mes 11-12 sin ese ejercicio previo.
+> ⚠️ **NOTA IMPORTANTE**: Todo este circuito requiere una revisión completa de UI/UX antes de implementarse — flujo del operador del bridge, flujo del usuario final, flujo de distribución del server.vk, onboarding en el control plane, y cada pantalla/comando que el usuario toca. No implementar Mes 12-13 sin ese ejercicio previo.
 
 ### Roles
 
@@ -275,7 +276,7 @@ Servidor del cliente (ejemplo — convive con lo que ya tiene):
 
 ---
 
-### Control Plane SaaS (Mes 12)
+### Control Plane SaaS (Mes 13)
 
 API HTTPS central que:
 - **Registro de bridges**: recibe el `POST /register` que `control_plane.rs` ya envía
@@ -299,9 +300,10 @@ El bridge ya tiene `control_plane.rs` implementado — solo falta el servidor qu
 | Prometheus metrics | ✅ Mes 3 |
 | `control_plane.rs` (heartbeat sender) | ✅ Mes 6 |
 | CLI keygen unificado | ⏳ Mes 10 |
-| Binarios + installer (`curl \| sh`) | ⏳ Mes 11 |
-| **Control Plane SaaS** (receptor de heartbeats + VK registry) | ⏳ Mes 12 |
-| **Web dashboard** | ⏳ Mes 13 |
+| Connection pool (lazy close + proactive warming) | ⏳ Mes 11 |
+| Binarios + installer (`curl \| sh`) | ⏳ Mes 12 |
+| **Control Plane SaaS** (receptor de heartbeats + VK registry) | ⏳ Mes 13 |
+| **Web dashboard** | ⏳ Mes 14 |
 
 ## License
 
