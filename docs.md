@@ -451,3 +451,474 @@ Lo más importante: es completamente no-fatal. Si el control plane está caído,
 reqwest es el cliente HTTP que usamos para hacer esos POST. serde_json convierte las structs de Rust en JSON automáticamente.
 
 Los tests de este módulo usan wiremock — un servidor HTTP falso que levanta en memoria durante el test. Podés programarle respuestas específicas y verificar que el código mandó exactamente lo que debía.
+
+---
+
+---
+
+# Mes 9 — Autenticación Mutua y Reconexión Automática
+
+---
+
+## El problema que existía
+
+Hasta Mes 9, LatticeShield tenía autenticación en una sola dirección: el bridge le demostraba al cliente que era legítimo (firmando el ServerHello con ML-DSA-65), pero el cliente era completamente anónimo para el bridge.
+
+Es como un boliche donde el portero te muestra su credencial para que sepas que es el portero real, pero a vos no te pide documento. Cualquiera que sepa la dirección del bridge podía intentar conectarse.
+
+Eso significa que si alguien descubre la IP y el puerto del bridge, puede golpear la puerta. No va a poder descifrar nada (no tiene las claves de sesión), pero puede generar tráfico ilegítimo, ocupar recursos, o en el futuro intentar explotar alguna vulnerabilidad del protocolo.
+
+La solución es **autenticación mutua**: ambos lados se identifican criptográficamente. El bridge verifica quién es el cliente antes de completar el handshake.
+
+---
+
+## Cómo funciona una firma digital (en términos simples)
+
+Antes de entrar al código, conviene entender el concepto.
+
+Una firma digital es matemáticamente equivalente a firmar un documento con tu puño y letra, pero con una propiedad extra: es **imposible de falsificar** y **verificable por cualquiera que tenga tu clave pública**.
+
+Funciona con dos claves que forman un par:
+
+- **Clave privada (SK — Signing Key)**: la guardás vos, nunca sale de tu máquina. Es con la que firmás. Si alguien la obtiene, puede hacerse pasar por vos.
+- **Clave pública (VK — Verifying Key)**: la compartís con quien necesite verificar tu firma. No es secreta. Compartirla no compromete nada.
+
+El proceso de autenticación es:
+1. Vos firmás un mensaje con tu SK → produce una firma (un bloque de bytes)
+2. El receptor tiene tu VK, el mensaje original, y la firma
+3. La verificación matemática dice: "¿esta firma fue producida por el SK correspondiente a esta VK?" → sí o no
+
+Si la firma no es válida, la conexión se cierra. Sin excepciones.
+
+En LatticeShield usamos **ML-DSA-65** (un algoritmo resistente a computadoras cuánticas) para estas firmas. La clave privada ocupa 4032 bytes, la pública 1952 bytes, y la firma resultante 3309 bytes.
+
+---
+
+## latticeshield-crypto/src/handshake.rs — la nueva constante y las nuevas funciones
+
+Este es el archivo que define el protocolo de comunicación entre bridge y cliente. Los cambios de Mes 9 agregan tres cosas:
+
+### Nueva constante
+
+```rust
+pub const CLIENT_RESPONSE_SIGNED_LEN: usize = CLIENT_RESPONSE_LEN + SIGNATURE_LEN;
+// = 1120 + 3309 = 4429 bytes
+```
+
+Antes el cliente mandaba 1120 bytes (datos puros de criptografía de sesión). Ahora manda 4429: los mismos 1120 bytes más una firma de 3309 bytes. Ambos lados tienen que saber exactamente cuántos bytes leer — por eso la constante.
+
+### nueva función del lado cliente: serialize_client_response_signed
+
+```rust
+pub fn serialize_client_response_signed(
+    resp: &ClientResponse,
+    sk: &SigningKey,
+    server_hello: &[u8; SERVER_HELLO_LEN],
+    rng: &mut impl CryptoRngCore,
+) -> Result<[u8; CLIENT_RESPONSE_SIGNED_LEN], HandshakeError>
+```
+
+Qué hace paso a paso:
+1. Serializa el `ClientResponse` a sus 1120 bytes de siempre
+2. Construye el **mensaje a firmar**: `CR_bytes (1120) || server_hello_raw (1248)` = 2368 bytes
+3. Firma ese mensaje con `sk` usando ML-DSA-65 → produce 3309 bytes de firma
+4. Retorna `[CR_bytes (1120) || firma (3309)]` = 4429 bytes — esto es lo que viaja por el cable
+
+### nuevo método del lado servidor: complete_from_wire_signed
+
+```rust
+impl ServerHandshake {
+    pub fn complete_from_wire_signed(
+        self,
+        bytes: &[u8; CLIENT_RESPONSE_SIGNED_LEN],
+        client_vk: &VerifyingKey,
+    ) -> Result<SessionKey, HandshakeError>
+}
+```
+
+Es el método que el bridge llama para completar el handshake cuando la autenticación está habilitada:
+1. Divide los 4429 bytes: primeros 1120 son el CR, últimos 3309 son la firma
+2. Reconstruye el mensaje firmado: `CR_bytes || self.server_hello_raw`
+3. Verifica la firma con `client_vk` → si falla, retorna `Err(HandshakeError::ClientAuthFailed)`
+4. Si la firma es válida, llama al decap KEM interno igual que antes y deriva la SessionKey
+
+### Por qué server_hello_raw y no server_hello_signed
+
+El ServerHello tiene dos versiones:
+- `server_hello_raw` (1248 bytes): los datos crudos del handshake (clave X25519 + clave KEM + nonce)
+- `server_hello_signed` (4557 bytes): los datos crudos + la firma del servidor
+
+La firma del cliente cubre el `server_hello_raw` (1248 bytes), no el signed (4557 bytes). Razón: la firma del servidor ya está separada — el cliente la verifica en su propio paso. Incluir la firma del servidor en la firma del cliente sería reduntante e inflaría el mensaje innecesariamente. Los 1248 bytes del raw ya contienen el nonce único que ata la firma a esta sesión específica.
+
+Para que el bridge pueda usar `server_hello_raw` al verificar, `ServerHandshake` ahora lo guarda en un campo interno desde el momento en que se construye:
+
+```rust
+pub struct ServerHandshake {
+    x25519_secret: EphemeralSecret,
+    decap_key: DecapsulationKey<MlKem768>,
+    nonce: [u8; 32],
+    server_hello_raw: [u8; SERVER_HELLO_LEN],  // ← nuevo en Mes 9
+}
+```
+
+Se llena en `new()` serializando la clave X25519 pública + la clave de encapsulación KEM + el nonce. Así el bridge siempre tiene esos bytes disponibles sin recomputar nada.
+
+---
+
+## latticeshield-bridge/src/identity.rs — ClientVerifyingIdentity
+
+El bridge necesita cargar la clave pública del cliente para verificar sus firmas. Se agregó un nuevo struct al lado de `ServerIdentity`:
+
+```rust
+pub struct ClientVerifyingIdentity {
+    pub verifying_key: VerifyingKey,
+}
+
+impl ClientVerifyingIdentity {
+    pub fn load(vk_path: &Path) -> Result<Self, IdentityError> {
+        let bytes = std::fs::read(vk_path)?;
+        if bytes.len() != VERIFYING_KEY_LEN {
+            return Err(IdentityError::WrongSize { expected: VERIFYING_KEY_LEN, got: bytes.len() });
+        }
+        let verifying_key = VerifyingKey::from_bytes(&bytes)?;
+        Ok(Self { verifying_key })
+    }
+}
+```
+
+Diferencias con `ServerIdentity`:
+- Solo carga la **clave pública** (VK), no la privada
+- No verifica permisos del archivo (una clave pública no es secreta — 0o644 es correcto)
+- No hay `zeroize` ni `mlock` (no hay material secreto que proteger)
+- No tiene `generate_and_save()` — las claves las genera el cliente con `--client-keygen`, el bridge solo recibe el archivo `client.vk`
+
+---
+
+## latticeshield-bridge/src/config.rs — la sección [auth]
+
+Se agregó una nueva sección opcional al `config.toml` del bridge:
+
+```toml
+[auth]
+client_vk_path = "./keys/client.vk"
+```
+
+Si la sección existe y tiene `client_vk_path`, la autenticación mutua está habilitada. Si no está, el bridge funciona igual que antes (sin verificar al cliente).
+
+En código, el config tiene:
+
+```rust
+#[derive(Debug, Deserialize, Default)]
+pub struct AuthConfig {
+    pub client_vk_path: Option<PathBuf>,
+}
+```
+
+Y en `ValidConfig` se deriva un bool conveniente:
+
+```rust
+pub struct ValidConfig {
+    // ... campos existentes ...
+    pub client_auth_enabled: bool,       // true si client_vk_path está configurado
+    pub client_vk_path: Option<PathBuf>, // la ruta al archivo client.vk
+}
+```
+
+Así el resto del código pregunta `if config.client_auth_enabled { ... }` sin tener que hacer el `.is_some()` en cada lugar.
+
+---
+
+## latticeshield-bridge/src/server.rs — cargar la VK al arrancar
+
+Cuando el bridge arranca, si `client_auth_enabled` es true, carga la VK del cliente en memoria y la pasa a cada sesión:
+
+```rust
+// Al arrancar:
+let client_auth: Option<Arc<ClientVerifyingIdentity>> = if config.client_auth_enabled {
+    let path = config.client_vk_path.as_ref().unwrap();
+    Some(Arc::new(ClientVerifyingIdentity::load(path)?))
+} else {
+    None
+};
+
+// Al spawnear cada sesión:
+tokio::spawn(session::handle(
+    stream,
+    backend_addr,
+    Arc::clone(&identity),
+    client_auth.clone(), // ← Option<Arc<...>> — None si auth deshabilitada
+    // ...
+));
+```
+
+El `Arc` (puntero con contador de referencias) permite que todas las sesiones simultáneas compartan el mismo objeto `ClientVerifyingIdentity` en memoria sin copiarlo. Funciona igual que con `ServerIdentity`.
+
+---
+
+## latticeshield-bridge/src/session.rs — el branching autenticado
+
+Este es el cambio más visible en el bridge. Después de enviar el ServerHello firmado, en vez de leer siempre 1120 bytes, ahora hace un branch:
+
+```rust
+// Antes (Mes 8 y anteriores):
+let mut response_buf = [0u8; CLIENT_RESPONSE_LEN]; // 1120 bytes siempre
+stream.read_exact(&mut response_buf).await?;
+let session_key = server_handshake.complete_from_wire(&response_buf)?;
+
+// Ahora (Mes 9):
+let session_key = match &client_auth {
+    Some(client_identity) => {
+        // Auth habilitada: leer 4429 bytes y verificar firma
+        let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
+        stream.read_exact(&mut buf).await?;
+        server_handshake.complete_from_wire_signed(&buf, &client_identity.verifying_key)?
+    }
+    None => {
+        // Auth deshabilitada: comportamiento original
+        let mut buf = [0u8; CLIENT_RESPONSE_LEN];
+        stream.read_exact(&mut buf).await?;
+        server_handshake.complete_from_wire(&buf)?
+    }
+};
+```
+
+Si `complete_from_wire_signed` retorna `Err(ClientAuthFailed)`, la sesión se cierra y se loguea. El bridge sigue aceptando otras conexiones — es un error de sesión, no del proceso.
+
+**Advertencia de compatibilidad**: si el bridge tiene `client_auth_enabled = true` pero el cliente no está configurado para firmar, el bridge va a bloquear esperando 4429 bytes mientras el cliente mandó solo 1120. La conexión va a colgarse hasta timeout. Ambos lados tienen que estar en el mismo modo.
+
+---
+
+## latticeshield-client/src/identity.rs — ClientIdentity
+
+En el cliente, el archivo `identity.rs` ya existía, pero solo se usaba para cargar la VK del **servidor**. Ahora tiene un nuevo struct: la identidad propia del cliente.
+
+```rust
+pub struct ClientIdentity {
+    pub signing_key: SigningKey,
+    pub verifying_key: VerifyingKey,
+}
+```
+
+### load() — cargar desde disco
+
+```rust
+impl ClientIdentity {
+    pub fn load(sk_path: &Path) -> Result<Self, IdentityError> {
+        // 1. Verificar permisos: solo 0o600 es aceptable
+        let meta = std::fs::metadata(sk_path)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(IdentityError::InsecurePermissions { mode });
+        }
+
+        // 2. Leer exactamente SIGNING_KEY_LEN bytes (4032)
+        let mut sk_buf = [0u8; SIGNING_KEY_LEN];
+        File::open(sk_path)?.read_exact(&mut sk_buf)?;
+
+        // 3. Construir SigningKey y derivar VerifyingKey
+        let signing_key = SigningKey::from_bytes(&sk_buf)?;
+        sk_buf.zeroize(); // ← borrar el buffer: la clave ya está en signing_key
+        let verifying_key = signing_key.verifying_key();
+
+        Ok(Self { signing_key, verifying_key })
+    }
+}
+```
+
+El check de permisos es idéntico al de `ServerIdentity` en el bridge. Si el archivo `client.sk` tiene permisos más abiertos que 0o600 (por ejemplo, 0o644 que significa "todos pueden leer"), el cliente rechaza arrancar. Una clave privada legible por otros usuarios del sistema está comprometida.
+
+### generate_and_save() — generar un par de claves nuevas
+
+```rust
+pub fn generate_and_save(dir: &Path) -> Result<(), IdentityError> {
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let verifying_key = signing_key.verifying_key();
+
+    let sk_path = dir.join("client.sk");
+    let vk_path = dir.join("client.vk");
+
+    // Guardar SK con permisos 0o600 (solo el dueño puede leer/escribir)
+    let mut sk_file = OpenOptions::new()
+        .write(true).create(true).truncate(true)
+        .mode(0o600)
+        .open(&sk_path)?;
+    sk_file.write_all(signing_key.as_bytes())?;
+
+    // Guardar VK con permisos 0o644 (pública, todos pueden leer)
+    let mut vk_file = OpenOptions::new()
+        .write(true).create(true).truncate(true)
+        .mode(0o644)
+        .open(&vk_path)?;
+    vk_file.write_all(verifying_key.as_bytes())?;
+
+    Ok(())
+}
+```
+
+Genera dos archivos en el directorio especificado:
+- `client.sk` — 4032 bytes, permisos 0o600. Guardalo con cuidado.
+- `client.vk` — 1952 bytes, permisos 0o644. Copialo al bridge.
+
+### Zeroize on drop — borrar la clave cuando el proceso termina
+
+```rust
+impl Drop for ClientIdentity {
+    fn drop(&mut self) {
+        // Cuando ClientIdentity se destruye (proceso termina, o la variable sale de scope),
+        // los bytes de la signing_key se sobreescriben con ceros antes de liberar la memoria.
+        self.signing_key.zeroize();
+    }
+}
+```
+
+Esto garantiza que los bytes de la clave privada no queden flotando en RAM después de que el proceso termina. Sin esto, la memoria podría ser inspeccionada por otro proceso o quedar en un core dump.
+
+---
+
+## latticeshield-client/src/config.rs — client_sk_path y [reconnect]
+
+El config del cliente tiene dos adiciones en Mes 9:
+
+### client_sk_path — ruta a la clave privada del cliente
+
+```toml
+[client]
+listen_addr   = "127.0.0.1:9090"
+bridge_addr   = "127.0.0.1:8443"
+max_frame_size = 65536
+client_sk_path = "./keys/client.sk"   # ← nuevo en Mes 9 (opcional)
+```
+
+Si está presente, el cliente carga su identidad y firma los mensajes. Si no está, el cliente funciona en modo anónimo (igual que Mes 8). El bridge y el cliente tienen que estar de acuerdo.
+
+### [reconnect] — configuración de reintentos
+
+```toml
+[reconnect]
+max_retries    = 3    # cuántas veces reintentar antes de rendirse
+base_delay_ms  = 500  # tiempo base de espera entre intentos (en milisegundos)
+```
+
+Ambos campos tienen defaults — si no ponés la sección, el comportamiento es `max_retries = 3` y `base_delay_ms = 500`. La sección completa es opcional.
+
+---
+
+## latticeshield-client/src/client_session.rs — firmar y reconectar
+
+Este es el archivo más modificado en el cliente. Recibe dos parámetros nuevos: la identidad opcional y la config de reconexión.
+
+### El loop de reconexión
+
+Antes de Mes 9, si el bridge no estaba disponible al momento de conectar, el usuario recibía un error inmediato. Ahora:
+
+```rust
+let mut bridge_stream = None;
+for attempt in 0..=reconnect.max_retries {
+    match TcpStream::connect(bridge_addr).await {
+        Ok(stream) => {
+            bridge_stream = Some(stream);
+            break;
+        }
+        Err(_) if attempt < reconnect.max_retries => {
+            // Calcular tiempo de espera con backoff exponencial + jitter
+            let base = reconnect.base_delay_ms;
+            let jitter = OsRng.next_u64() % base;
+            let delay = base * (1u64 << attempt) + jitter;
+            //
+            // attempt=0: espera entre 500ms y 1000ms
+            // attempt=1: espera entre 1000ms y 1500ms
+            // attempt=2: espera entre 2000ms y 2500ms
+            //
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        Err(e) => return Err(e.into()), // agotó los intentos
+    }
+}
+let bridge_stream = bridge_stream.unwrap();
+```
+
+El **backoff exponencial** significa que cada intento espera el doble que el anterior. El **jitter** es un número aleatorio que se suma para que si hay 100 clientes intentando reconectarse al mismo tiempo, no lo hagan todos exactamente en el mismo milisegundo y colapsen el bridge con 100 conexiones simultáneas.
+
+**Regla crítica de seguridad**: el loop solo reintenta en **errores de transporte** (el bridge no está prendido, el puerto está cerrado). Si el handshake falla (firma inválida, VK incorrecta), el error es inmediato sin reintentos. Reintentar una autenticación fallida no tiene sentido y podría enmascarar problemas de configuración.
+
+### Firmar el ClientResponse
+
+Después de recibir y verificar el ServerHello del bridge, el cliente ahora puede firmar su respuesta:
+
+```rust
+// Guardar los primeros 1248 bytes del ServerHello (el raw, no el firmado)
+let server_hello_raw: [u8; SERVER_HELLO_LEN] = signed_buf[..SERVER_HELLO_LEN]
+    .try_into()
+    .unwrap();
+
+// ... calcular response y session_key como siempre ...
+
+// Enviar: firmado o sin firmar según configuración
+match &client_identity {
+    Some(identity) => {
+        let signed = serialize_client_response_signed(
+            &response,
+            &identity.signing_key,
+            &server_hello_raw,
+            &mut OsRng,
+        )?;
+        bridge_stream.write_all(&signed).await?; // 4429 bytes
+    }
+    None => {
+        bridge_stream.write_all(&serialize_client_response(&response)).await?; // 1120 bytes
+    }
+}
+```
+
+---
+
+## latticeshield-client/src/main.rs — el subcomando --client-keygen
+
+Así como el bridge tiene `--keygen` para generar su par de claves, el cliente ahora tiene `--client-keygen`:
+
+```
+latticeshield-client --client-keygen ./keys
+```
+
+Esto llama a `ClientIdentity::generate_and_save("./keys")` y genera:
+- `./keys/client.sk` — clave privada (guardala, no la compartas)
+- `./keys/client.vk` — clave pública (copiala al bridge)
+
+Workflow completo para habilitar mutual auth:
+
+```sh
+# En la máquina del cliente: generar las claves
+latticeshield-client --client-keygen ./keys
+
+# Copiar la clave pública al bridge (scp, rsync, lo que uses)
+scp ./keys/client.vk usuario@servidor-bridge:/etc/latticeshield/keys/
+
+# En el bridge: configurar [auth] en config.toml
+echo '[auth]' >> config.toml
+echo 'client_vk_path = "/etc/latticeshield/keys/client.vk"' >> config.toml
+
+# En el cliente: configurar client_sk_path en el toml
+echo 'client_sk_path = "./keys/client.sk"' >> latticeshield-client.toml
+```
+
+---
+
+## Por qué la firma está atada a la sesión (el ataque de replay)
+
+Este es el detalle de seguridad más importante de la implementación.
+
+Imaginá que la firma cubriera solo los datos del cliente (1120 bytes). Un atacante podría:
+1. Espiar una conexión legítima y capturar los 4429 bytes que manda el cliente
+2. En otra sesión diferente, mandar esos mismos 4429 bytes → la firma sería válida porque cubre los mismos datos
+
+Esto se llama **replay attack** — reutilizar datos válidos de una sesión para otra.
+
+La solución: la firma cubre `CR_bytes (1120) || server_hello_raw (1248)`. El `server_hello_raw` contiene un **nonce aleatorio de 32 bytes** que el bridge genera nuevo en cada sesión. Es imposible predecir o reproducir.
+
+Entonces si el atacante captura los 4429 bytes de una sesión A e intenta usarlos en una sesión B:
+- El bridge de la sesión B generó un nonce diferente
+- La firma fue calculada con el nonce de la sesión A
+- La verificación falla: `Err(ClientAuthFailed)`
+
+La firma no solo dice "yo soy el cliente autorizado", sino "yo soy el cliente autorizado **y estoy respondiendo a esta sesión específica**".
