@@ -18,8 +18,7 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-- Old key generation subcommands (`keygen`, `tls-keygen`, `quic-keygen`) now print a deprecation warning (that means: a notice that this approach is outdated and will be removed) pointing operators to the new `latticeshield` command instead.
-- A library interface was added so that latticeshield-cli can reuse the key generation code without running the full server binary.
+- Removed outdated setup subcommands (`keygen`, `tls-keygen`, `quic-keygen`) that were replaced by the `latticeshield` command in the previous release. Starting the bridge now goes directly to loading the configuration and running the server, with no extra steps.
 
 ---
-*Last updated: 2026-03-12 — latticeshield-mes10-cli*
+*Last updated: 2026-03-16 — latticeshield-mes11-pool*
