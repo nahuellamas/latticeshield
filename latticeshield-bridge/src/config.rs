@@ -100,11 +100,6 @@ impl Default for LoggingConfig {
     }
 }
 
-fn default_cp_enabled() -> bool { false }
-fn default_cp_endpoint() -> String { String::new() }
-fn default_cp_agent_name() -> String { String::new() }
-fn default_cp_interval() -> u64 { 30 }
-
 fn default_kr_enabled() -> bool { false }
 fn default_kr_max_bytes() -> u64 { 10_737_418_240 } // 10 GB
 fn default_kr_max_seconds() -> u64 { 86_400 }       // 24 hours
@@ -125,30 +120,6 @@ pub struct AuthConfig {
     /// Ruta a la clave de verificacion publica del cliente (material publico).
     /// Si se configura, el bridge exige autenticacion mutua ML-DSA-65 del cliente.
     pub client_vk_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct ControlPlaneConfig {
-    #[serde(default = "default_cp_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_cp_endpoint")]
-    pub endpoint: String,
-    #[serde(default = "default_cp_agent_name")]
-    pub agent_name: String,
-    #[serde(default = "default_cp_interval")]
-    pub heartbeat_interval_secs: u64,
-}
-
-impl Default for ControlPlaneConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_cp_enabled(),
-            endpoint: default_cp_endpoint(),
-            agent_name: default_cp_agent_name(),
-            heartbeat_interval_secs: default_cp_interval(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,7 +198,6 @@ pub struct Config {
     pub crypto: CryptoConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
-    pub control_plane: ControlPlaneConfig,
     pub key_rotation: KeyRotationConfig,
     pub tls: TlsConfig,
     pub quic: QuicConfig,
@@ -242,7 +212,6 @@ impl Default for Config {
             crypto: CryptoConfig::default(),
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),
-            control_plane: ControlPlaneConfig::default(),
             key_rotation: KeyRotationConfig::default(),
             tls: TlsConfig::default(),
             quic: QuicConfig::default(),
@@ -261,10 +230,6 @@ pub struct ValidConfig {
     pub max_frame_size: usize,
     pub signing_key_path: PathBuf,
     pub log_level: String,
-    pub control_plane_enabled: bool,
-    pub control_plane_endpoint: String,
-    pub control_plane_agent_name: String,
-    pub heartbeat_interval: std::time::Duration,
     pub key_rotation_enabled: bool,
     pub max_bytes_per_key: u64,
     pub key_rotation_interval: std::time::Duration,
@@ -326,31 +291,6 @@ impl Config {
         if self.crypto.signing_key_path.as_os_str().is_empty() {
             anyhow::bail!("crypto.signing_key_path must not be empty");
         }
-
-        // ── Control plane validation ────────────────────────────────────────
-        let control_plane_enabled = self.control_plane.enabled;
-        let control_plane_endpoint = self.control_plane.endpoint.clone();
-
-        if control_plane_enabled && control_plane_endpoint.is_empty() {
-            anyhow::bail!(
-                "control_plane.endpoint must be set when control_plane.enabled = true"
-            );
-        }
-
-        if control_plane_enabled && !control_plane_endpoint.is_empty() {
-            url::Url::parse(&control_plane_endpoint)
-                .with_context(|| "control_plane.endpoint is not a valid URL")?;
-        }
-
-        let control_plane_agent_name = if self.control_plane.agent_name.is_empty() {
-            std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
-        } else {
-            self.control_plane.agent_name.clone()
-        };
-
-        let heartbeat_interval = std::time::Duration::from_secs(
-            self.control_plane.heartbeat_interval_secs.max(5),
-        );
 
         // ── Key rotation validation ─────────────────────────────────────────
         if self.key_rotation.max_bytes_per_key < 1_048_576 {
@@ -436,10 +376,6 @@ impl Config {
             max_frame_size: self.server.max_frame_size,
             signing_key_path: self.crypto.signing_key_path,
             log_level: self.logging.level,
-            control_plane_enabled,
-            control_plane_endpoint,
-            control_plane_agent_name,
-            heartbeat_interval,
             key_rotation_enabled: self.key_rotation.enabled,
             max_bytes_per_key: self.key_rotation.max_bytes_per_key,
             key_rotation_interval: std::time::Duration::from_secs(self.key_rotation.max_seconds_per_key),
@@ -615,69 +551,6 @@ listen_addr = "not_an_addr"
             err.contains("listen_addr"),
             "error should reference listen_addr, got: {err}"
         );
-    }
-
-    // ── ControlPlane config tests ─────────────────────────────────────────────
-
-    #[test]
-    fn control_plane_defaults_when_section_absent() {
-        let f = write_toml("");
-        let cfg = Config::load(f.path()).unwrap();
-        assert!(!cfg.control_plane_enabled);
-        assert_eq!(cfg.control_plane_endpoint, "");
-        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_secs(30));
-    }
-
-    #[test]
-    fn control_plane_full_section_accepted() {
-        let f = write_toml(
-            "[control_plane]\nenabled = true\nendpoint = \"http://cp.example.com:9000\"\nagent_name = \"edge-01\"\nheartbeat_interval_secs = 60\n",
-        );
-        let cfg = Config::load(f.path()).unwrap();
-        assert!(cfg.control_plane_enabled);
-        assert_eq!(cfg.control_plane_endpoint, "http://cp.example.com:9000");
-        assert_eq!(cfg.control_plane_agent_name, "edge-01");
-        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_secs(60));
-    }
-
-    #[test]
-    fn control_plane_enabled_empty_endpoint_rejected() {
-        let f = write_toml("[control_plane]\nenabled = true\n");
-        let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(
-            err.contains("control_plane.endpoint"),
-            "error should reference control_plane.endpoint, got: {err}"
-        );
-    }
-
-    #[test]
-    fn control_plane_enabled_malformed_url_rejected() {
-        let f = write_toml(
-            "[control_plane]\nenabled = true\nendpoint = \"not a url\"\n",
-        );
-        let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(
-            err.contains("control_plane.endpoint"),
-            "error should reference control_plane.endpoint, got: {err}"
-        );
-    }
-
-    #[test]
-    fn control_plane_disabled_non_empty_endpoint_accepted() {
-        let f = write_toml(
-            "[control_plane]\nenabled = false\nendpoint = \"garbage string\"\n",
-        );
-        // should NOT error even with garbage endpoint when disabled
-        Config::load(f.path()).unwrap();
-    }
-
-    #[test]
-    fn control_plane_heartbeat_interval_floored_at_5s() {
-        let f = write_toml(
-            "[control_plane]\nenabled = true\nendpoint = \"http://localhost:9000\"\nheartbeat_interval_secs = 2\n",
-        );
-        let cfg = Config::load(f.path()).unwrap();
-        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_secs(5));
     }
 
     // ── KeyRotation config tests ──────────────────────────────────────────────
