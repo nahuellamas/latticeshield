@@ -2,12 +2,11 @@
 //!
 //! Usage:
 //!   latticeshield-bridge [--config <path>]
-//!   latticeshield-bridge keygen <dir>
 //!   latticeshield-bridge --version
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 mod config;
 mod control_plane;
@@ -32,73 +31,11 @@ struct Cli {
     /// Path to config.toml (default: ./config.toml)
     #[arg(long, default_value = "./config.toml")]
     config: PathBuf,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Generate a new ML-DSA-65 server keypair (server.sk + server.vk)
-    Keygen {
-        /// Directory to write server.sk (0600) and server.vk (0644)
-        #[arg(default_value = "./keys")]
-        dir: PathBuf,
-    },
-    /// Generate a self-signed TLS certificate and private key for dev/test use.
-    /// Writes tls.crt (0644) and tls.key (0600) to the specified directory.
-    TlsKeygen {
-        /// Directory to write tls.crt and tls.key (created if absent)
-        #[arg(default_value = "./keys")]
-        dir: PathBuf,
-    },
-    /// Generate a self-signed TLS cert+key for QUIC (same PEM format as tls-keygen).
-    /// Writes tls.crt (0644) and tls.key (0600) to the specified directory.
-    QuicKeygen {
-        /// Directory to write tls.crt and tls.key into (created if absent)
-        #[arg(default_value = "./keys")]
-        dir: PathBuf,
-    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
-    if let Some(Commands::Keygen { dir }) = &cli.command {
-        eprintln!("[DEPRECATED] Use 'latticeshield keygen server <dir>' instead. This subcommand will be removed in Mes 11.");
-        return identity::ServerIdentity::generate_and_save(dir);
-    }
-
-    if let Some(Commands::TlsKeygen { dir }) = &cli.command {
-        eprintln!("[DEPRECATED] Use 'latticeshield keygen tls <dir>' instead. This subcommand will be removed in Mes 11.");
-        #[cfg(feature = "tls-keygen")]
-        return tls::generate_self_signed(dir);
-        #[cfg(not(feature = "tls-keygen"))]
-        {
-            let _ = dir;
-            eprintln!(
-                "Error: tls-keygen feature not enabled.\n\
-                 Rebuild with: cargo build --features tls-keygen"
-            );
-            std::process::exit(1);
-        }
-    }
-
-    if let Some(Commands::QuicKeygen { dir }) = &cli.command {
-        eprintln!("[DEPRECATED] Use 'latticeshield keygen tls <dir>' instead (covers both TLS and QUIC). Removed in Mes 11.");
-        #[cfg(feature = "tls-keygen")]
-        return tls::generate_self_signed(dir);
-        #[cfg(not(feature = "tls-keygen"))]
-        {
-            let _ = dir;
-            eprintln!(
-                "Error: tls-keygen feature not enabled.\n\
-                 Rebuild with: cargo build --features tls-keygen"
-            );
-            std::process::exit(1);
-        }
-    }
 
     // Load config FIRST so log_level is available for tracing init
     let config = config::Config::load(&cli.config)?;

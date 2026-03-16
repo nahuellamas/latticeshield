@@ -3,4 +3,5 @@
 pub mod client_session;
 pub mod config;
 pub mod identity;
+pub mod pool;
 pub mod server;

@@ -2,10 +2,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
@@ -17,71 +16,63 @@ use latticeshield_crypto::{
     SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 
-use crate::config::{ReconnectConfig, ValidClientConfig};
+use crate::config::ValidClientConfig;
 use crate::identity::ClientIdentity;
+use crate::pool::ConnectionPool;
 
 /// Maneja una conexion de usuario: realiza el handshake PQC con el bridge
 /// y luego relay bidireccional cifrado.
 ///
 /// - `client_identity`: `Some` habilita autenticacion mutua (firma la ClientResponse).
-/// - `reconnect`: configura el bucle de reintentos para la conexion al bridge.
+/// - `pool`: pool de conexiones pre-calentadas al bridge.
 ///
-/// INVARIANTE: el bucle de reintentos aplica SOLO a errores de `TcpStream::connect`.
-/// Errores de handshake (incluyendo autenticacion fallida) fallan inmediatamente.
+/// INVARIANTE: errores de handshake (incluyendo autenticacion fallida) fallan inmediatamente.
 pub async fn handle(
     user: TcpStream,
     peer: SocketAddr,
     config: ValidClientConfig,
     vk: Arc<VerifyingKey>,
     client_identity: Option<Arc<ClientIdentity>>,
-    reconnect: ReconnectConfig,
+    pool: Arc<ConnectionPool>,
 ) -> anyhow::Result<()> {
-    // ── Conectar al bridge con reintentos ────────────────────────────────────
-    let mut bridge_stream = None;
-    for attempt in 0..=reconnect.max_retries {
-        match TcpStream::connect(config.bridge_addr).await {
-            Ok(s) => {
-                bridge_stream = Some(s);
-                break;
-            }
-            Err(e) => {
-                if attempt == reconnect.max_retries {
-                    warn!(
-                        peer = %peer,
-                        bridge = %config.bridge_addr,
-                        attempt,
-                        "bridge connect failed after all retries: {e}"
-                    );
-                    let (_, mut user_w) = tokio::io::split(user);
-                    let _ = user_w.shutdown().await;
-                    return Ok(());
-                }
-                let jitter = OsRng.next_u64() % reconnect.base_delay_ms.max(1);
-                let delay = reconnect.base_delay_ms * (1u64 << attempt) + jitter;
-                warn!(
-                    peer = %peer,
-                    bridge = %config.bridge_addr,
-                    attempt,
-                    delay_ms = delay,
-                    "bridge connect failed, retrying: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
+    // ── Adquirir conexion del pool ───────────────────────────────────────────
+    let bridge = match pool.acquire().await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!(peer = %peer, bridge = %config.bridge_addr, "pool.acquire failed: {e}");
+            let (_, mut user_w) = tokio::io::split(user);
+            let _ = user_w.shutdown().await;
+            return Ok(());
         }
-    }
-    let bridge = bridge_stream.unwrap();
+    };
 
     // ── Split streams ────────────────────────────────────────────────────────
     let (mut user_r, mut user_w) = tokio::io::split(user);
     let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge);
 
-    // ── Leer ServerHello firmado ─────────────────────────────────────────────
+    // ── Leer ServerHello firmado (con stale-retry) ───────────────────────────
     let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
     if let Err(e) = bridge_r.read_exact(&mut hello_buf).await {
-        warn!(peer = %peer, "failed to read server hello: {e}");
-        let _ = user_w.shutdown().await;
-        let _ = bridge_w.shutdown().await;
-        return Ok(());
+        warn!(peer = %peer, "server hello read failed (possible stale conn): {e} — retrying with fresh connect");
+        match TcpStream::connect(config.bridge_addr).await {
+            Ok(fresh) => {
+                fresh.set_nodelay(true).ok();
+                let (fresh_r, fresh_w) = tokio::io::split(fresh);
+                bridge_r = fresh_r;
+                bridge_w = fresh_w;
+                if let Err(e2) = bridge_r.read_exact(&mut hello_buf).await {
+                    warn!(peer = %peer, "server hello read failed on fresh connect: {e2}");
+                    let _ = user_w.shutdown().await;
+                    let _ = bridge_w.shutdown().await;
+                    return Ok(());
+                }
+            }
+            Err(e2) => {
+                warn!(peer = %peer, "fresh connect after stale pool conn failed: {e2}");
+                let _ = user_w.shutdown().await;
+                return Ok(());
+            }
+        }
     }
 
     // Los primeros SERVER_HELLO_LEN (1248) bytes son el ServerHello raw (sin firma).
@@ -187,7 +178,7 @@ mod tests {
     use latticeshield_crypto::generate_keypair;
     use rand_core::OsRng;
 
-    use crate::config::{ReconnectConfig, ValidClientConfig};
+    use crate::config::{PoolConfig, ValidClientConfig};
 
     fn make_config(bridge_addr: SocketAddr) -> ValidClientConfig {
         ValidClientConfig {
@@ -197,12 +188,15 @@ mod tests {
             client_sk_path: None,
             max_frame_size: 65536,
             log_level: "info".to_string(),
-            reconnect: ReconnectConfig::default(),
+            pool: PoolConfig::default(),
         }
     }
 
-    fn no_retry() -> ReconnectConfig {
-        ReconnectConfig { max_retries: 0, base_delay_ms: 0 }
+    fn make_pool(bridge_addr: SocketAddr) -> Arc<ConnectionPool> {
+        Arc::new(ConnectionPool::new(
+            bridge_addr,
+            PoolConfig { max_size: 1, idle_timeout_secs: 30, warm_size: 0, warm_interval_secs: 5 },
+        ))
     }
 
     #[tokio::test]
@@ -227,9 +221,10 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:19999".parse().unwrap();
         let config = make_config(bridge_addr);
+        let pool = make_pool(bridge_addr);
 
         // handle debe retornar Ok(()) — error de sesion, no fatal.
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, no_retry()).await;
+        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
         assert!(result.is_ok(), "handle should return Ok(()) on bridge refused, got: {result:?}");
 
         // El usuario debe recibir EOF (handle hace shutdown del user write side).
@@ -269,23 +264,19 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let config = make_config(bridge_addr);
+        let pool = make_pool(bridge_addr);
 
         // handle debe retornar Ok(()) — error de sesion, no fatal
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, no_retry()).await;
+        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
         assert!(result.is_ok(), "handle should return Ok(()) for auth failure, got: {result:?}");
     }
 
     #[tokio::test]
-    async fn test_reconnect_succeeds_on_second_attempt() {
+    async fn handle_retries_on_stale_connection() {
         let mut rng = OsRng;
         let (_sk, vk) = generate_keypair(&mut rng);
 
-        // Puerto cerrado para que el primer intento falle.
-        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _closed_addr = closed_listener.local_addr().unwrap();
-        drop(closed_listener);
-
-        // El segundo intento conectara a un bridge real que acepta y cierra.
+        // El bridge acepta la conexion y cierra inmediatamente (simula EOF → stale retry path).
         let real_bridge = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let real_addr = real_bridge.local_addr().unwrap();
 
@@ -305,12 +296,7 @@ mod tests {
         let (user_server_side, _) = user_listener.accept().await.unwrap();
         let _user_client_side = connect_task.await.unwrap();
 
-        // Primer addr falla, segundo addr exito. Simulamos esto usando la addr del real
-        // bridge directamente (no podemos cambiar la addr mid-loop con la interfaz actual).
-        // En este test usamos real_addr directamente con max_retries=1 y base_delay_ms=0
-        // para verificar que la sesion avanza si el bridge responde (con EOF → read_exact falla).
         let peer: SocketAddr = "127.0.0.1:22222".parse().unwrap();
-        let reconnect = ReconnectConfig { max_retries: 1, base_delay_ms: 0 };
         let config = ValidClientConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             bridge_addr: real_addr,
@@ -318,11 +304,12 @@ mod tests {
             client_sk_path: None,
             max_frame_size: 65536,
             log_level: "info".to_string(),
-            reconnect: reconnect.clone(),
+            pool: PoolConfig::default(),
         };
+        let pool = make_pool(real_addr);
 
-        // El bridge cierra sin enviar datos → read_exact del hello falla → handle Ok(())
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, reconnect).await;
+        // El bridge cierra sin enviar datos → read_exact del hello falla → stale retry → falla también → handle Ok(())
+        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
         assert!(result.is_ok(), "handle should return Ok(()) when bridge closes early, got: {result:?}");
     }
 
@@ -331,7 +318,7 @@ mod tests {
         let mut rng = OsRng;
         let (_sk, vk) = generate_keypair(&mut rng);
 
-        // Puerto cerrado — todos los intentos fallarán.
+        // Puerto cerrado — acquire fallara.
         let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closed_addr = closed_listener.local_addr().unwrap();
         drop(closed_listener);
@@ -345,7 +332,6 @@ mod tests {
         let mut user_client_side = connect_task.await.unwrap();
 
         let peer: SocketAddr = "127.0.0.1:33333".parse().unwrap();
-        let reconnect = ReconnectConfig { max_retries: 2, base_delay_ms: 0 };
         let config = ValidClientConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             bridge_addr: closed_addr,
@@ -353,16 +339,17 @@ mod tests {
             client_sk_path: None,
             max_frame_size: 65536,
             log_level: "info".to_string(),
-            reconnect: reconnect.clone(),
+            pool: PoolConfig::default(),
         };
+        let pool = make_pool(closed_addr);
 
-        // Todos los intentos fallan → Ok(()) con user recibiendo EOF.
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, reconnect).await;
-        assert!(result.is_ok(), "handle should return Ok(()) after exhausting retries, got: {result:?}");
+        // acquire falla → Ok(()) con user recibiendo EOF.
+        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
+        assert!(result.is_ok(), "handle should return Ok(()) after acquire fails, got: {result:?}");
 
         let mut buf = [0u8; 1];
         let n = user_client_side.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "user side should receive EOF after all retries exhausted");
+        assert_eq!(n, 0, "user side should receive EOF after acquire failure");
     }
 
     #[tokio::test]
@@ -395,8 +382,6 @@ mod tests {
         let _user_client_side = connect_task.await.unwrap();
 
         let peer: SocketAddr = "127.0.0.1:44444".parse().unwrap();
-        // max_retries=3 pero el auth failure NO debe reintentar.
-        let reconnect = ReconnectConfig { max_retries: 3, base_delay_ms: 0 };
         let config = ValidClientConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             bridge_addr,
@@ -404,10 +389,11 @@ mod tests {
             client_sk_path: None,
             max_frame_size: 65536,
             log_level: "info".to_string(),
-            reconnect: reconnect.clone(),
+            pool: PoolConfig::default(),
         };
+        let pool = make_pool(bridge_addr);
 
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, reconnect).await;
+        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
         assert!(result.is_ok(), "handle should return Ok(()) on auth failure, got: {result:?}");
 
         // Solo debe haber 1 conexion al bridge — no reintentos por auth failure.

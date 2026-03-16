@@ -11,6 +11,7 @@ use latticeshield_crypto::VerifyingKey;
 use crate::client_session;
 use crate::config::ValidClientConfig;
 use crate::identity::ClientIdentity;
+use crate::pool::ConnectionPool;
 
 /// Arranca el listener TCP y acepta conexiones indefinidamente.
 ///
@@ -20,21 +21,50 @@ pub async fn run(
     vk: Arc<VerifyingKey>,
     client_identity: Option<Arc<ClientIdentity>>,
 ) -> anyhow::Result<()> {
+    let pool = Arc::new(ConnectionPool::new(config.bridge_addr, config.pool.clone()));
+
+    let pool_for_warmer = Arc::clone(&pool);
+    tokio::spawn(async move { pool_for_warmer.warm_loop().await });
+
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "LatticeShield Client listening");
     info!(bridge = %config.bridge_addr, "targeting bridge");
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
+
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let config = config.clone();
-        let vk = Arc::clone(&vk);
-        let client_identity = client_identity.clone();
-        let reconnect = config.reconnect.clone();
-        tokio::spawn(async move {
-            if let Err(e) = client_session::handle(stream, peer, config, vk, client_identity, reconnect).await {
-                tracing::warn!(peer = %peer, "session error: {e}");
+        #[cfg(unix)]
+        let shutdown_future = async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
             }
-        });
+        };
+        #[cfg(not(unix))]
+        let shutdown_future = tokio::signal::ctrl_c();
+
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, peer) = result?;
+                let config = config.clone();
+                let vk = Arc::clone(&vk);
+                let client_identity = client_identity.clone();
+                let pool = Arc::clone(&pool);
+                tokio::spawn(async move {
+                    if let Err(e) = client_session::handle(stream, peer, config, vk, client_identity, pool).await {
+                        tracing::warn!(peer = %peer, "session error: {e}");
+                    }
+                });
+            }
+            _ = shutdown_future => {
+                info!("shutdown signal received — stopping accept loop");
+                pool.shutdown().await;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -48,6 +78,8 @@ mod tests {
     use latticeshield_crypto::generate_keypair;
     use rand_core::OsRng;
     use tokio::net::TcpStream;
+
+    use crate::config::PoolConfig;
 
     #[tokio::test]
     async fn run_binds_and_accepts() {
@@ -67,7 +99,7 @@ mod tests {
             client_sk_path: None,
             max_frame_size: 65536,
             log_level: "info".to_string(),
-            reconnect: crate::config::ReconnectConfig::default(),
+            pool: PoolConfig::default(),
         };
 
         let task = tokio::spawn(run(config, Arc::clone(&vk), None));

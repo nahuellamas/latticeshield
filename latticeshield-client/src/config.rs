@@ -28,8 +28,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_max_retries() -> u32 { 3 }
-fn default_base_delay_ms() -> u64 { 500 }
+fn default_pool_max_size() -> usize { 4 }
+fn default_pool_idle_timeout_secs() -> u64 { 30 }
+fn default_pool_warm_size() -> usize { 2 }
+fn default_pool_warm_interval_secs() -> u64 { 5 }
 
 // ── Sub-structs ────────────────────────────────────────────────────────────────
 
@@ -61,18 +63,24 @@ impl Default for ClientSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct ReconnectConfig {
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_base_delay_ms")]
-    pub base_delay_ms: u64,
+pub struct PoolConfig {
+    #[serde(default = "default_pool_max_size")]
+    pub max_size: usize,
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_pool_warm_size")]
+    pub warm_size: usize,
+    #[serde(default = "default_pool_warm_interval_secs")]
+    pub warm_interval_secs: u64,
 }
 
-impl Default for ReconnectConfig {
+impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_retries: default_max_retries(),
-            base_delay_ms: default_base_delay_ms(),
+            max_size: default_pool_max_size(),
+            idle_timeout_secs: default_pool_idle_timeout_secs(),
+            warm_size: default_pool_warm_size(),
+            warm_interval_secs: default_pool_warm_interval_secs(),
         }
     }
 }
@@ -100,7 +108,7 @@ pub struct ClientConfig {
     pub client: ClientSection,
     pub logging: LoggingSection,
     #[serde(default)]
-    pub reconnect: ReconnectConfig,
+    pub pool: PoolConfig,
 }
 
 impl Default for ClientConfig {
@@ -108,7 +116,7 @@ impl Default for ClientConfig {
         Self {
             client: ClientSection::default(),
             logging: LoggingSection::default(),
-            reconnect: ReconnectConfig::default(),
+            pool: PoolConfig::default(),
         }
     }
 }
@@ -123,7 +131,7 @@ pub struct ValidClientConfig {
     pub client_sk_path: Option<PathBuf>,
     pub max_frame_size: usize,
     pub log_level: String,
-    pub reconnect: ReconnectConfig,
+    pub pool: PoolConfig,
 }
 
 // ── ClientConfig::load + validate ─────────────────────────────────────────────
@@ -162,6 +170,19 @@ impl ClientConfig {
             anyhow::bail!("crypto.server_vk_path must not be empty");
         }
 
+        if self.pool.max_size < 1 {
+            anyhow::bail!("pool.max_size must be >= 1");
+        }
+        if self.pool.warm_size > self.pool.max_size {
+            anyhow::bail!("pool.warm_size must be <= pool.max_size");
+        }
+        if self.pool.idle_timeout_secs < 1 {
+            anyhow::bail!("pool.idle_timeout_secs must be >= 1");
+        }
+        if self.pool.warm_interval_secs < 1 {
+            anyhow::bail!("pool.warm_interval_secs must be >= 1");
+        }
+
         Ok(ValidClientConfig {
             listen_addr,
             bridge_addr,
@@ -169,7 +190,7 @@ impl ClientConfig {
             client_sk_path: self.client.client_sk_path,
             max_frame_size: self.client.max_frame_size,
             log_level: self.logging.level,
-            reconnect: self.reconnect,
+            pool: self.pool,
         })
     }
 }
@@ -303,24 +324,73 @@ client_sk_path = "./keys/client.sk"
     }
 
     #[test]
-    fn reconnect_defaults_when_section_absent() {
+    fn pool_defaults_when_section_absent() {
         let f = write_toml("");
         let cfg = ClientConfig::load(f.path()).unwrap();
-        assert_eq!(cfg.reconnect.max_retries, 3);
-        assert_eq!(cfg.reconnect.base_delay_ms, 500);
+        assert_eq!(cfg.pool.max_size, 4);
+        assert_eq!(cfg.pool.idle_timeout_secs, 30);
+        assert_eq!(cfg.pool.warm_size, 2);
+        assert_eq!(cfg.pool.warm_interval_secs, 5);
     }
 
     #[test]
-    fn reconnect_custom_values_parsed() {
+    fn pool_explicit_values_parsed() {
         let f = write_toml(
             r#"
-[reconnect]
-max_retries = 5
-base_delay_ms = 1000
+[pool]
+max_size = 8
+warm_size = 4
 "#,
         );
         let cfg = ClientConfig::load(f.path()).unwrap();
-        assert_eq!(cfg.reconnect.max_retries, 5);
-        assert_eq!(cfg.reconnect.base_delay_ms, 1000);
+        assert_eq!(cfg.pool.max_size, 8);
+        assert_eq!(cfg.pool.warm_size, 4);
+    }
+
+    #[test]
+    fn pool_warm_size_gt_max_size_rejected() {
+        let f = write_toml("[pool]\nmax_size = 2\nwarm_size = 5\n");
+        let err = ClientConfig::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("pool.warm_size"),
+            "error should reference pool.warm_size, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pool_max_size_zero_rejected() {
+        let f = write_toml("[pool]\nmax_size = 0\n");
+        let err = ClientConfig::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("pool.max_size"),
+            "error should reference pool.max_size, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pool_idle_timeout_zero_rejected() {
+        let f = write_toml("[pool]\nidle_timeout_secs = 0\n");
+        let err = ClientConfig::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("pool.idle_timeout_secs"),
+            "error should reference pool.idle_timeout_secs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pool_warm_size_zero_accepted() {
+        let f = write_toml("[pool]\nwarm_size = 0\n");
+        let cfg = ClientConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.pool.warm_size, 0);
+    }
+
+    #[test]
+    fn pool_warm_interval_zero_rejected() {
+        let f = write_toml("[pool]\nwarm_interval_secs = 0\n");
+        let err = ClientConfig::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("pool.warm_interval_secs"),
+            "error should reference pool.warm_interval_secs, got: {err}"
+        );
     }
 }
