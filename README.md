@@ -226,8 +226,8 @@ cargo build --release
 | 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Complete |
 | 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner, deprecation warnings in old subcommands | Complete |
 | 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Complete |
-| 12 | Control Plane SaaS + `latticeshield vk-share` CLI | Planned |
-| 13 | Distribution: pre-compiled binaries + systemd + installer | Planned |
+| 12 | Control Plane SaaS: `server_vk` in registration payload + `latticeshield vk-share` CLI | Planned |
+| 13 | Distribution: pre-compiled binaries (GitHub Actions) + systemd + `curl \| sh` installer | Planned |
 | 14 | Web dashboard | Planned |
 | 15 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
 
