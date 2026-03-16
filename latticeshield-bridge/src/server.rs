@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls};
+use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
@@ -92,6 +92,15 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "LatticeShield escuchando");
     info!(backend = %config.backend_addr, "backend configurado");
+
+    // ── Control plane heartbeat task (non-blocking, optional) ────────────────
+    if config.control_plane_enabled && !config.control_plane_endpoint.is_empty() {
+        let cfg = config.clone();
+        let ms = Arc::clone(&metrics_state);
+        tokio::spawn(async move {
+            control_plane::start(cfg, ms).await;
+        });
+    }
 
     loop {
         let (socket, peer) = listener.accept().await?;

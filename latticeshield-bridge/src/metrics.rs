@@ -8,7 +8,8 @@
 //!   - latticeshield_channel_errors_total    (counter)
 //!
 //! Also provides `MetricsState` — parallel `AtomicU64` counters that can be
-//! read back programmatically (the `metrics` crate facade has no read-back API).
+//! read back for control-plane heartbeat reporting (the `metrics` crate facade
+//! has no read-back API).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
