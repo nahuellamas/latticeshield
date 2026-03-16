@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 mod config;
+mod control_plane;
 mod http_relay;
 pub(crate) mod identity;
 mod metrics;
