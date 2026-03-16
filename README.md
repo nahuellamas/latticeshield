@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Connection Pool in the Client Agent (2026-03-16)
+
+We added a connection pool so that the client agent no longer waits to open a fresh connection to the server every time a request arrives. Now a small number of connections are kept ready in the background, so requests start faster and the agent handles more simultaneous traffic without slowing down. Old configuration files continue to work with no changes.
+
 ### Unified `latticeshield` Command (2026-03-12)
 
 We added a single `latticeshield` command so that you can generate all your security keys — for the server, the client, and TLS certificates — without needing to know which internal program to call. Previously, key generation was split across two different programs; now everything lives under one roof with a guided welcome screen.
@@ -89,7 +93,7 @@ latticeshield/
 │       └── anti_replay.rs       # 0-RTT anti-replay filter
 ├── latticeshield-bridge/        # Server-side proxy agent (also exposes [lib] for identity + tls)
 │   └── src/
-│       ├── main.rs              # Entry point — keygen / tls-keygen / quic-keygen (deprecated since Mes 10)
+│       ├── main.rs              # Entry point — config load + server startup (deprecated keygen subcommands removed)
 │       ├── server.rs            # Three listeners: PQC + TLS + QUIC
 │       ├── session.rs           # PQC handshake (server) + AES-GCM relay + key rotation
 │       ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
@@ -101,11 +105,12 @@ latticeshield/
 │       └── control_plane.rs     # Heartbeat to remote control plane
 ├── latticeshield-client/        # Client-side proxy agent
 │   └── src/
-│       ├── main.rs              # Entry point — vk-info / --client-keygen (deprecated since Mes 10), tracing init
-│       ├── server.rs            # TCP listener on listen_addr, tokio::spawn per connection
-│       ├── client_session.rs    # PQC handshake (client) + mutual auth signing + reconnect/backoff + AES-GCM relay
+│       ├── main.rs              # Entry point — tracing init, config load, server startup
+│       ├── server.rs            # TCP listener on listen_addr, connection pool construction + warmer spawn, tokio::spawn per connection, graceful shutdown
+│       ├── pool.rs              # Pre-warmed TCP connection pool — acquire(), warm_loop(), shutdown()
+│       ├── client_session.rs    # PQC handshake (client) + mutual auth signing + pool acquire + stale conn retry + AES-GCM relay
 │       ├── identity.rs          # load_verifying_key() + ClientIdentity (load/generate/zeroize) + SHA-256 fingerprint
-│       └── config.rs            # TOML config — ClientConfig + ValidClientConfig + ReconnectConfig
+│       └── config.rs            # TOML config — ClientConfig + ValidClientConfig + ReconnectConfig + PoolConfig
 └── latticeshield-cli/           # Unified CLI — single entry point for all setup and key operations
     └── src/
         └── main.rs              # Binary `latticeshield` — keygen server/client/tls + vk-info + ASCII banner
@@ -160,7 +165,7 @@ cargo build --release
 
 ## Tests
 
-176 unit + integration tests across all four crates — all passing.
+215 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -184,15 +189,16 @@ cargo build --release
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
 | `session` (integration) | Full PQC handshake + relay, mutual auth (with/without client auth, wrong VK rejection), tampered response rejection, key uniqueness, POST `/rotate`, time-based and byte-threshold key rotation |
 
-### latticeshield-client (33 tests)
+### latticeshield-client (92 tests)
 
 | Module | Tests |
 |---|---|
-| `config` | TOML defaults, custom values, missing file, bad TOML, invalid addrs, out-of-range max_frame_size, empty vk_path, client_sk_path, reconnect section |
+| `pool` | acquire from non-empty pool (no connect), acquire from empty pool (fresh connect fallback), acquire fails when bridge down, idle timeout eviction, partial eviction, max_size cap respected, warm_size=0 makes no connects, TCP_NODELAY set on warmed and fallback streams, shutdown drains connections with FIN, shutdown with empty pool |
+| `config` | TOML defaults, custom values, missing file, bad TOML, invalid addrs, out-of-range max_frame_size, empty vk_path, client_sk_path, reconnect section, pool section defaults, explicit pool values, warm_size > max_size rejected, max_size=0 rejected, idle_timeout_secs=0 rejected, warm_size=0 accepted |
 | `identity` | ServerVK: load roundtrip, wrong size, nonexistent file, fingerprint. ClientIdentity: load roundtrip, wrong permissions rejected, wrong size, generate_and_save (files, permissions 0o600/0o644) |
-| `client_session` | Bridge connect refused → EOF, tampered signature → Ok(()), reconnect succeeds on 2nd attempt, reconnect exhausts max_retries, auth failure does not trigger reconnect |
-| `server` | Listener binds and accepts connections |
-| integration | Full PQC relay round-trip (client ↔ mock bridge ↔ echo backend), KEY_ROTATE survives relay, `vk-info` binary output |
+| `client_session` | Bridge connect refused → EOF, tampered signature → Ok(()), stale pooled conn → fresh connect retry, stale and fresh both fail → Ok(()), auth failure does not retry, pool.acquire() error → user EOF |
+| `server` | Listener binds and accepts connections, shutdown stops warmer |
+| integration | Full PQC relay round-trip (client ↔ mock bridge ↔ echo backend), KEY_ROTATE survives relay, pool-enabled session flow |
 
 ### latticeshield-cli (7 tests)
 
@@ -219,7 +225,7 @@ cargo build --release
 | 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
 | 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Complete |
 | 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner, deprecation warnings in old subcommands | Complete |
-| 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Planned |
+| 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Complete |
 | 12 | Distribution: pre-compiled binaries (GitHub Actions) + systemd service files + `curl \| sh` installer | Planned |
 | 13 | Control Plane SaaS: tenant registry, VK distribution API, bridge management backend | Planned |
 | 14 | Web dashboard: real-time metrics, session status, tenant overview | Planned |
@@ -321,7 +327,7 @@ El bridge ya tiene `control_plane.rs` implementado — solo falta el servidor qu
 | Prometheus metrics | ✅ Mes 3 |
 | `control_plane.rs` (heartbeat sender) | ✅ Mes 6 |
 | CLI keygen unificado (`latticeshield keygen` + `vk-info`) | ✅ Mes 10 |
-| Connection pool (lazy close + proactive warming) | ⏳ Mes 11 |
+| Connection pool (lazy close + proactive warming) | ✅ Mes 11 |
 | Binarios + installer (`curl \| sh`) | ⏳ Mes 12 |
 | **Control Plane SaaS** (receptor de heartbeats + VK registry) | ⏳ Mes 13 |
 | **Web dashboard** | ⏳ Mes 14 |
