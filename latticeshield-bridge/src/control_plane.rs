@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::ValidConfig;
+use crate::identity::ServerIdentity;
 use crate::metrics::MetricsState;
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -23,6 +24,7 @@ struct RegistrationPayload {
     capabilities: Vec<String>,
     listen_addr: String,
     backend_addr: String,
+    server_vk: String, // lowercase hex-encoded ML-DSA-65 VerifyingKey (3904 chars)
 }
 
 #[derive(Deserialize)]
@@ -51,7 +53,7 @@ struct HeartbeatMetrics {
 
 /// Registers the agent and starts the heartbeat loop.
 /// Non-fatal: logs warnings on any failure, never panics.
-pub async fn start(config: ValidConfig, metrics: Arc<MetricsState>) {
+pub async fn start(config: ValidConfig, metrics: Arc<MetricsState>, identity: Arc<ServerIdentity>) {
     let client = match Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -63,7 +65,7 @@ pub async fn start(config: ValidConfig, metrics: Arc<MetricsState>) {
         }
     };
 
-    let agent_id = match try_register(&client, &config).await {
+    let agent_id = match try_register(&client, &config, &identity).await {
         Some(id) => id,
         None => {
             warn!("control plane: registration failed, heartbeat disabled");
@@ -100,7 +102,11 @@ pub async fn start(config: ValidConfig, metrics: Arc<MetricsState>) {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-async fn try_register(client: &Client, config: &ValidConfig) -> Option<String> {
+async fn try_register(client: &Client, config: &ValidConfig, identity: &ServerIdentity) -> Option<String> {
+    let server_vk: String = identity.verifying_key.to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let payload = RegistrationPayload {
         name: config.control_plane_agent_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -111,6 +117,7 @@ async fn try_register(client: &Client, config: &ValidConfig) -> Option<String> {
         ],
         listen_addr: config.listen_addr.to_string(),
         backend_addr: config.backend_addr.to_string(),
+        server_vk,
     };
 
     let url = format!("{}/api/v1/agents/register", config.control_plane_endpoint);
@@ -171,8 +178,16 @@ async fn send_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_test_identity() -> (Arc<ServerIdentity>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        let identity = ServerIdentity::load(&dir.path().join("server.sk")).unwrap();
+        (Arc::new(identity), dir)
+    }
 
     fn make_config(endpoint: String) -> ValidConfig {
         ValidConfig {
@@ -217,7 +232,8 @@ mod tests {
 
         let client = Client::new();
         let config = make_config(server.uri());
-        let agent_id = try_register(&client, &config).await;
+        let (identity, _dir) = make_test_identity();
+        let agent_id = try_register(&client, &config, &identity).await;
         assert_eq!(agent_id, Some("test-id-42".to_string()));
     }
 
@@ -233,7 +249,8 @@ mod tests {
 
         let client = Client::new();
         let config = make_config(server.uri());
-        let result = try_register(&client, &config).await;
+        let (identity, _dir) = make_test_identity();
+        let result = try_register(&client, &config, &identity).await;
         assert!(result.is_none());
     }
 
@@ -251,7 +268,8 @@ mod tests {
 
         let client = Client::new();
         let config = make_config(server.uri());
-        let agent_id = try_register(&client, &config).await;
+        let (identity, _dir) = make_test_identity();
+        let agent_id = try_register(&client, &config, &identity).await;
         assert!(agent_id.is_some());
 
         // Verify the request body contained correct capabilities via the received requests
@@ -261,6 +279,35 @@ mod tests {
         let caps = body["capabilities"].as_array().unwrap();
         let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
         assert_eq!(cap_strs, vec!["pqc-proxy", "ml-kem-768", "ml-dsa-65"]);
+    }
+
+    #[tokio::test]
+    async fn registration_body_contains_server_vk() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "agent_id": "vk-test" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let agent_id = try_register(&client, &config, &identity).await;
+        assert!(agent_id.is_some());
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let server_vk = body["server_vk"].as_str().expect("server_vk must be present in payload");
+        assert_eq!(server_vk.len(), 3904, "server_vk must be 3904 hex chars (1952 bytes * 2)");
+        assert!(
+            server_vk.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "server_vk must be lowercase hex"
+        );
     }
 
     #[tokio::test]

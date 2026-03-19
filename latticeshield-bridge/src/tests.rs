@@ -346,6 +346,10 @@ async fn http_endpoint_returns_200_ok_with_prometheus_content_type() {
         prometheus_handle: handle,
         rotate_tx: Arc::new(rotate_tx),
         metrics_state: MetricsState::new(),
+        vk_store: crate::vk_share::new_store(),
+        identity: test_identity(),
+        tls_base_url: "https://127.0.0.1:8440".to_string(),
+        admin_token: "test-token".to_string(),
     };
     let app = crate::server::metrics_app(app_state);
 
@@ -605,6 +609,10 @@ async fn post_rotate_endpoint_returns_200() {
         prometheus_handle: handle,
         rotate_tx: Arc::clone(&rotate_tx),
         metrics_state: Arc::clone(&metrics_state),
+        vk_store: crate::vk_share::new_store(),
+        identity: test_identity(),
+        tls_base_url: "https://127.0.0.1:8440".to_string(),
+        admin_token: "test-token".to_string(),
     };
     let app = crate::server::metrics_app(app_state);
 

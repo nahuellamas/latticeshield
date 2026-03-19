@@ -17,6 +17,7 @@ mod quic;
 mod server;
 mod session;
 mod tls;
+mod vk_share;
 
 #[cfg(test)]
 mod tests;
@@ -46,6 +47,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // SECURITY: Classical bearer token for :8444 admin API — placeholder until Mes 13
+    // replaces with PQC mutual auth (ML-KEM + ML-DSA). Keep :8444 firewall-protected.
+    let admin_token = std::env::var("LATTICESHIELD_ADMIN_TOKEN")
+        .expect("LATTICESHIELD_ADMIN_TOKEN must be set — use a strong random token");
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %config.listen_addr,
@@ -54,5 +60,5 @@ async fn main() -> anyhow::Result<()> {
         "LatticeShield Bridge starting"
     );
 
-    server::run(config).await
+    server::run(config, admin_token).await
 }

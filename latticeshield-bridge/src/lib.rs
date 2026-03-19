@@ -3,3 +3,4 @@
 
 pub mod identity;
 pub mod tls;
+pub mod vk_share;

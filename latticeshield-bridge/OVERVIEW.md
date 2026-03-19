@@ -10,7 +10,8 @@ This is the server-side gateway — like a security guard at the entrance of a b
 - Accepts connections from three types of clients: the LatticeShield agent, standard HTTPS web clients like browsers or curl, and QUIC (that means: a newer, faster connection protocol used by modern browsers) clients — all on separate ports.
 - Publishes live metrics (that means: a real-time count of connections, bytes, and errors) to a monitoring endpoint so you can watch what is happening.
 - Generates and manages its own signing keys so it can prove its identity to connecting clients.
-- Reports its status to a central control plane (that means: a management service that tracks all deployed gateways) periodically.
+- Reports its status to a management server (that means: a central service that tracks all deployed gateways) periodically, including its own digital ID card so the management server can store and display it for operator reference.
+- Issues one-time secure download links so new client operators can safely obtain the server's digital ID card without manual file transfers.
 
 ## How It Fits Together
 
@@ -18,7 +19,10 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-- Removed outdated setup subcommands (`keygen`, `tls-keygen`, `quic-keygen`) that were replaced by the `latticeshield` command in the previous release. Starting the bridge now goes directly to loading the configuration and running the server, with no extra steps.
+- The bridge now includes its digital ID card in every status report sent to the management server. This lets operators view and confirm the server's identity from a central location.
+- A new key distribution feature was added. An admin can call a new management endpoint to generate a one-time download link. That link is valid for 10 minutes and can only be used once. A client operator visits the link over a standard secure web connection (port 8440) and receives the server's digital ID card as a file they can save locally. The link cannot be reused after the first download.
+- The management endpoint that creates download links requires a secret admin password (set via the `LATTICESHIELD_ADMIN_TOKEN` environment variable). This prevents unauthorized parties from generating links even if they can reach the management port.
+- Tokens are kept in memory only. They do not survive a bridge restart. This is intentional — each distribution session is fresh.
 
 ---
-*Last updated: 2026-03-16 — latticeshield-mes11-pool*
+*Last updated: 2026-03-19 — latticeshield-mes12-vk-share*

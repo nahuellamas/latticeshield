@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Secure Key Distribution via vk-share (2026-03-19)
+
+The bridge can now hand out its digital ID card — the proof that it is a trusted server — to new client operators without requiring manual file transfers. An admin runs `latticeshield vk-share` to create a one-time download link with a 10-minute expiry, shares that link with the client operator, and the client operator uses it to fetch the key over a standard secure web connection. The link stops working after one use or after 10 minutes, whichever comes first.
+
 ### Connection Pool in the Client Agent (2026-03-16)
 
 We added a connection pool so that the client agent no longer waits to open a fresh connection to the server every time a request arrives. Now a small number of connections are kept ready in the background, so requests start faster and the agent handles more simultaneous traffic without slowing down. Old configuration files continue to work with no changes.
@@ -227,9 +231,10 @@ cargo build --release
 | 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner, deprecation warnings in old subcommands | Complete |
 | 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Complete |
 | 12 | Control Plane SaaS: `server_vk` in registration payload + `latticeshield vk-share` CLI | Planned |
-| 13 | Distribution: pre-compiled binaries (GitHub Actions) + systemd + `curl \| sh` installer | Planned |
-| 14 | Web dashboard | Planned |
-| 15 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
+| 13 | Admin Post-Quantum Channel (`:8444`) — ML-KEM key exchange + ML-DSA mutual auth for the control plane; separation of concerns between user traffic (`:8443`) and admin channel (`:8444`) | Planned |
+| 14 | Distribution: pre-compiled binaries (GitHub Actions) + systemd + `curl \| sh` installer | Planned |
+| 15 | Web dashboard | Planned |
+| 16 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
 
 ## License
 
