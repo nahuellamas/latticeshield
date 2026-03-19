@@ -14,9 +14,11 @@ path = "src/main.rs"
 [dependencies]
 latticeshield-bridge = { path = "../latticeshield-bridge", features = ["tls-keygen"] }
 latticeshield-client = { path = "../latticeshield-client" }
-anyhow  = { workspace = true }
-clap    = { version = "4", features = ["derive"] }
-colored = "2"
+anyhow     = { workspace = true }
+clap       = { version = "4", features = ["derive", "env"] }
+colored    = "2"
+reqwest    = { version = "0.12", features = ["json", "blocking"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

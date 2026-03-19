@@ -24,9 +24,8 @@ use zeroize::Zeroize;
 /// entre tareas de sesion como `Arc<ServerIdentity>`.
 pub struct ServerIdentity {
     pub signing_key: SigningKey,
-    /// Clave de verificacion publica. No se usa en el hot path del servidor —
-    /// se distribuye out-of-band a los clientes para que puedan verificar firmas.
-    #[allow(dead_code)]
+    /// Clave de verificacion publica. Se expone via vk-share y en el payload
+    /// de registro del control plane. Se distribuye out-of-band a los clientes.
     pub verifying_key: VerifyingKey,
 }
 
