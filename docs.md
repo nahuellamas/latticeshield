@@ -1154,3 +1154,653 @@ Serán removidos en Mes 11.
 | `vk_info_client_vk` | `vk-info client.vk` imprime File, Size (1952), SHA-256 |
 | `vk_info_nonexistent` | `vk-info` con archivo inexistente retorna código de salida no-cero |
 | `help_shows_banner` | `--help` incluye "LatticeShield" en la salida |
+
+---
+
+---
+
+# Mes 12 — VK Share (`vk-share`)
+
+---
+
+## The problem that existed
+
+After Mes 10, operators had a solid key management CLI but no automated way to distribute the server's VerifyingKey (VK) to new clients. The only path was to manually `scp` the `server.vk` file out-of-band to every machine that needed it. This worked fine in small deployments, but it had two problems:
+
+1. **No cloud visibility.** When the bridge registered with the control plane (added in earlier milestones), the registration POST body contained only metadata — name, version, capabilities, addresses. The cloud had no way to cryptographically identify which ML-DSA-65 identity a given bridge instance was using. If two bridge instances registered, the cloud could not distinguish them by their signing key.
+
+2. **No programmatic distribution.** An operator managing dozens of client machines had no mechanism to fetch the current VK from a running bridge instance without SSH access to the bridge server's filesystem.
+
+Mes 12 solves both problems:
+- The bridge now includes its ML-DSA-65 VerifyingKey (hex-encoded) in every registration POST to the control plane.
+- A new `vk-share` mechanism allows an authenticated admin to request a one-time HTTPS download URL for the VK. Clients can retrieve the VK over TLS without needing filesystem access to the bridge.
+
+---
+
+## latticeshield-bridge/src/vk_share.rs — One-time token store for VK distribution
+
+This is a new module responsible for generating and validating single-use, time-limited tokens that grant access to the bridge's VerifyingKey via `GET /vk/:token` on the TLS port (:8440).
+
+### VkShareStore — the in-memory token store
+
+```rust
+pub type VkShareStore = Arc<Mutex<HashMap<String, VkShareEntry>>>;
+
+pub struct VkShareEntry {
+    pub vk_hex: String,        // lowercase hex encoding of the raw VK bytes (3904 chars)
+    pub fingerprint: String,   // SHA-256 hex digest of the raw VK bytes (64 chars)
+    pub expires_at: Instant,   // wall-clock expiry computed at token creation
+    pub used: bool,            // single-use flag — set to true on first successful redemption
+}
+```
+
+`VkShareStore` is a type alias for `Arc<Mutex<HashMap<String, VkShareEntry>>>`. It is initialized once at bridge startup with `vk_share::new_store()` and shared via `Arc::clone` between two places: the admin endpoint handler (which creates tokens) and the TLS listener (which redeems them).
+
+**Why `Mutex` and not `RwLock`?** The `GET /vk/:token` handler that "reads" a token actually writes — it sets `entry.used = true` to enforce single-use semantics. Under any realistic workload, a token is redeemed once. A `Mutex` is simpler, has less surface area, and performs identically for this access pattern.
+
+**Why in-memory only?** Tokens are ephemeral by design. If the bridge restarts, a token that was issued but not yet redeemed is lost. The operator simply requests a new one. Persisting tokens to disk would add complexity (and a new attack surface) for no meaningful benefit — tokens have a 10-minute TTL and grant access only to public material.
+
+### create_token() — generating a token
+
+```rust
+pub fn create_token(store: &VkShareStore, vk_bytes: &[u8], ttl: Duration) -> (String, String) {
+    let token = uuid::Uuid::new_v4().to_string();
+    let vk_hex = hex_encode(vk_bytes);
+    let fingerprint = sha256_hex(vk_bytes);
+    let entry = VkShareEntry {
+        vk_hex,
+        fingerprint: fingerprint.clone(),
+        expires_at: Instant::now() + ttl,
+        used: false,
+    };
+    store.lock().unwrap().insert(token.clone(), entry);
+    (token, fingerprint)
+}
+```
+
+Tokens are UUID v4 strings — 122 bits of entropy from the OS CSPRNG via the `uuid` crate. The function returns both the token and the SHA-256 fingerprint so the admin sees the fingerprint immediately without having to redeem the token.
+
+The SHA-256 fingerprint matches exactly what `latticeshield vk-info <path>` prints. This is intentional: an operator can compare the fingerprint from `vk-share` with the fingerprint from `vk-info` on the bridge machine to verify the VK is the same without having the raw bytes.
+
+**Why no `hex` crate?** The codebase already uses `format!("{b:02x}")` for hex encoding in `latticeshield-client/src/identity.rs`. Adding a `hex` crate would introduce a new dependency for functionality that is trivially implementable with stdlib. Consistency with the existing pattern was preferred.
+
+### vk_response() — serving the token on the TLS port
+
+```rust
+pub fn vk_response(token: &str, store: &VkShareStore, peer: SocketAddr) -> Vec<u8> {
+    let mut guard = store.lock().unwrap();
+    match guard.get_mut(token) {
+        None => http_json_response(404, r#"{"error":"token not found"}"#),
+        Some(entry) if entry.expires_at < Instant::now() => {
+            guard.remove(token);
+            http_json_response(410, r#"{"error":"token expired"}"#)
+        }
+        Some(entry) if entry.used => {
+            http_json_response(410, r#"{"error":"token already used"}"#)
+        }
+        Some(entry) => {
+            entry.used = true;
+            let body = format!(
+                r#"{{"server_vk":"{}","fingerprint":"{}"}}"#,
+                entry.vk_hex, entry.fingerprint
+            );
+            http_json_response(200, &body)
+        }
+    }
+}
+```
+
+This function returns raw HTTP/1.1 response bytes (not axum/hyper). It is synchronous — it only touches in-memory state. The caller in `spawn_tls_listener` writes these bytes directly to the TLS stream.
+
+The lazy expiry pattern (checking `expires_at` at redemption time, not via a background task) is intentional. There are never enough tokens in the store to justify a background cleanup goroutine. The entry is removed immediately when an expired token is accessed, which prevents indefinite memory growth.
+
+The response contains **only** `server_vk` and `fingerprint` — two fields, nothing else. The bridge's signing key never appears in any response, log, or error message.
+
+### Why intercept on the TLS port (:8440) and not a dedicated port?
+
+Clients that want to download the VK via `GET /vk/:token` are using standard HTTPS. Putting a dedicated endpoint on the TLS port means clients do not need any LatticeShield-specific tooling — a plain `curl` command works. The TLS listener was already handling HTTPS traffic; adding VK routing to it is a natural fit.
+
+The routing logic (`extract_vk_token`) intercepts `GET /vk/<token>` and handles it locally. Every other path, and every other HTTP method on `/vk/` paths, is forwarded to the backend unchanged. This "GET only" restriction is a security decision: if the backend happens to have a `POST /vk/` API, the bridge does not silently hijack it.
+
+The HTTP head is read before routing (up to an 8192-byte hard cap to prevent memory exhaustion from malformed requests that never send `\r\n\r\n`). If the head exceeds 8KB, the bridge responds `400 Bad Request` and closes the connection.
+
+---
+
+## latticeshield-bridge/src/control_plane.rs — server_vk in RegistrationPayload
+
+### RegistrationPayload — the bridge tells the cloud who it is
+
+```rust
+#[derive(Serialize)]
+struct RegistrationPayload {
+    name: String,
+    version: String,
+    capabilities: Vec<String>,
+    listen_addr: String,
+    backend_addr: String,
+    server_vk: String,   // lowercase hex-encoded ML-DSA-65 VerifyingKey (3904 chars)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_token: Option<String>,
+}
+```
+
+The `server_vk` field is the lowercase hexadecimal encoding of the ML-DSA-65 VerifyingKey — 1952 raw bytes encoded as 3904 hex characters. The cloud stores this to identify the bridge instance cryptographically and to verify heartbeat signatures (added in Mes 14).
+
+The encoding is computed at registration time with no extra crate:
+
+```rust
+let server_vk: String = identity.verifying_key.to_bytes()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
+```
+
+`control_plane::start()` now accepts `Arc<ServerIdentity>` as a parameter alongside the existing `ValidConfig` and `Arc<MetricsState>`. This makes the VK available inside `try_register` without any global state or env-var lookup.
+
+### Why hex and not base64 for server_vk?
+
+`server_vk` is sent once at registration, not in every heartbeat. Wire size is not a concern. Hex is consistent with the rest of the codebase's convention (the `fingerprint` field in `vk-share`, the `vk-info` output, the existing `identity.rs` hex encoding). Base64 encoding was introduced in Mes 14 specifically for the heartbeat `signature` field where the 3309-byte signature at hex would be 6618 characters vs 4412 base64 characters — size matters there. For the VK, hex is the right call.
+
+---
+
+## latticeshield-cli/src/main.rs — the vk-share subcommand
+
+The CLI gains a new top-level `VkShare` command that automates the admin interaction:
+
+```rust
+VkShare {
+    /// Bridge admin URL (e.g. http://127.0.0.1:8444)
+    #[arg(long, default_value = "http://127.0.0.1:8444")]
+    bridge: String,
+
+    /// Admin bearer token (can also be set via LATTICESHIELD_ADMIN_TOKEN env var)
+    #[arg(long, env = "LATTICESHIELD_ADMIN_TOKEN")]
+    token: String,
+},
+```
+
+The command POSTs to `{bridge}/vk-token` with a `Authorization: Bearer <token>` header, then prints the resulting one-time URL and fingerprint:
+
+```
+One-time VK download URL:
+  https://bridge.example.com:8440/vk/f47ac10b-58cc-4372-a567-0e02b2c3d479
+Fingerprint (SHA-256):
+  a3f1c2d4e5b6...
+Expires in: 10 minutes (600 seconds)
+```
+
+The CLI uses `reqwest::blocking` — the CLI binary has no `#[tokio::main]` runtime and does not need one for a single synchronous HTTP request. Using the async reqwest API would require a `tokio::Runtime::new().unwrap().block_on(...)` wrapper for zero benefit.
+
+The bearer token on `:8444` was a conscious security placeholder. The admin endpoint was intentionally protected to prevent unauthenticated access on a trusted network (localhost, private VPC). Mes 13 replaces this with full PQC mutual authentication — the `LATTICESHIELD_ADMIN_TOKEN` env var and the bearer token infrastructure are removed entirely in that milestone.
+
+### Test coverage (260 tests total after Mes 12)
+
+| Test | What it verifies |
+|------|-----------------|
+| `create_token_returns_uuid_v4` | Token string parses as UUID v4 |
+| `create_token_fingerprint_is_sha256_hex` | Fingerprint is 64 lowercase hex chars |
+| `vk_response_valid_token_returns_200` | First redemption → HTTP 200 |
+| `vk_response_marks_token_used` | After redemption, `entry.used == true` |
+| `vk_response_second_use_returns_410` | Second redemption → HTTP 410 Gone |
+| `vk_response_expired_token_returns_410` | TTL=1ns then wait → HTTP 410 Gone |
+| `vk_response_unknown_token_returns_404` | Token not in store → HTTP 404 |
+| `vk_response_body_contains_only_vk_and_fingerprint_fields` | Response JSON has exactly 2 keys (no SK leakage) |
+| `registration_body_contains_server_vk` | `server_vk` field is 3904 lowercase hex chars |
+
+---
+
+---
+
+# Mes 13 — Admin PQC Channel (`:8445`)
+
+---
+
+## The problem that existed
+
+Mes 12 introduced a bearer token on `:8444` to guard the `POST /vk-token` admin endpoint. The route `POST /rotate` — which triggers key rotation across all active sessions — had no authentication at all. An attacker who could reach `:8444` on the network could trigger key rotations at will, causing session disruption.
+
+More fundamentally, `:8444` spoke plain HTTP with a classical secret token. This has two security gaps:
+
+1. **No quantum resistance.** The bearer token travels in plaintext HTTP. On a compromised network segment, it can be captured by a classical adversary today — and replayed. There is no forward secrecy, no identity binding, no replay protection.
+
+2. **No mutual authentication.** A bearer token proves "you know the secret" but not "you are the expected control plane instance". An attacker who steals the token can impersonate the control plane indefinitely until the token is rotated.
+
+Mes 13 replaces the entire `:8444` admin infrastructure with a new PQC-authenticated TCP channel on `:8445`. The new channel reuses the exact same `latticeshield-crypto` handshake primitives used for proxy clients on `:8443` — ML-KEM-768 hybrid key exchange for forward secrecy and ML-DSA-65 mutual authentication. Zero new cryptographic code was introduced.
+
+The port layout after Mes 13:
+
+| Port  | Protocol          | Authentication     | Purpose                               |
+|-------|-------------------|--------------------|---------------------------------------|
+| :8440 | TLS (rustls)      | none               | Standard HTTPS clients (optional)     |
+| :8441 | QUIC (quinn)      | none               | Standard QUIC clients (optional)      |
+| :8443 | PQC (raw TCP)     | ML-DSA-65 server   | LatticeShield proxy clients           |
+| :8444 | HTTP (plain)      | none               | Prometheus scrape only                |
+| :8445 | PQC (raw TCP)     | ML-DSA-65 mutual   | Control plane admin (NEW)             |
+
+---
+
+## latticeshield-bridge/src/admin.rs — the PQC admin channel
+
+This is a new module. It owns everything related to the admin channel: protocol types, handshake, command dispatch, rate limiting, and the listener task.
+
+### Protocol types — typed commands and responses
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandFrame {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub cmd: AdminCommand,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd")]
+pub enum AdminCommand {
+    GetMetrics,
+    Rotate,
+    GetVkToken,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AdminResponse {
+    Metrics { data: String },
+    Rotated { count: u64 },
+    VkToken { token: String, url: String },
+    Error { message: String },
+}
+```
+
+Commands are serialized as JSON inside the AES-256-GCM encrypted `EncryptedChannel` frame. The `#[serde(tag = "cmd")]` internally-tagged representation produces a flat JSON object like `{"seq": 1, "cmd": "GetMetrics"}` — human-readable and self-describing. An unknown command variant fails deserialization (the `AdminCommand` enum has no `#[serde(other)]` catch-all), which causes the connection to be closed with no response.
+
+**Why JSON and not a binary format?** The payload rides inside AES-256-GCM encryption so wire verbosity is irrelevant. `serde_json` is already a workspace dependency. JSON produces human-readable debug output when the encrypted channel is decrypted for testing. A binary format (postcard, bincode) would require a new crate dependency for no practical gain.
+
+### Sequence numbers — anti-replay protection
+
+```rust
+pub fn is_seq_valid(seq: u64, last_seen: u64) -> bool {
+    seq > last_seen
+}
+```
+
+Every `CommandFrame` carries a monotonic `seq: u64`. The bridge initializes `last_seen_seq = 0` at the start of each connection. A valid first command must have `seq >= 1`. The check `seq > last_seen` rejects replays (same seq), old sequences, and the initial zero value.
+
+**Why is this necessary if the handshake already uses an ephemeral ML-KEM key?** The ML-KEM handshake establishes a fresh session key for each TCP connection, which prevents cross-connection replays. The sequence number provides defense-in-depth within a connection: if the AES-256-GCM nonce counter ever wrapped (it doesn't in practice — 96-bit nonce, gigabytes of data before reuse), a sequence-number check would still catch replayed frames. More practically, the seq number is a guard against a future extension where multiple commands share one connection.
+
+The sequence check is a pure function with no I/O, which makes it directly unit-testable:
+
+```rust
+#[test] fn seq_zero_rejected()      { assert!(!is_seq_valid(0, 0)); }
+#[test] fn seq_one_accepted()       { assert!(is_seq_valid(1, 0)); }
+#[test] fn seq_replay_same_rejected(){ assert!(!is_seq_valid(5, 5)); }
+#[test] fn seq_old_rejected()       { assert!(!is_seq_valid(3, 5)); }
+```
+
+### One-command-per-connection model
+
+Each TCP connection to `:8445` follows exactly this sequence: PQC handshake → one command frame → one response frame → TCP close. There is no persistent session with multiple commands over a single connection.
+
+This simplicity is intentional. The admin channel is a machine-to-machine command protocol, not an interactive shell. Operations like "get metrics" or "trigger rotation" are fire-and-forget from the cloud's perspective. The cost of a new TCP connection + handshake (a few milliseconds) is acceptable for the simplicity it buys: no session state to manage, no command queuing, no half-open connection cleanup.
+
+### The handshake — mutual ML-DSA-65 over the existing PQC protocol
+
+```rust
+async fn do_handshake(
+    stream: &mut TcpStream,
+    identity: &ServerIdentity,
+    cp_vk: &ControlPlaneVerifyingIdentity,
+) -> Result<SessionKey, HandshakeError> {
+    let server = ServerHandshake::new(&mut OsRng);
+
+    // Sign and send ServerHello (4557 bytes: X25519 + ML-KEM EK + nonce + ML-DSA sig)
+    let hello_bytes = server.server_hello_signed_bytes(&identity.signing_key, &mut OsRng)?;
+    stream.write_all(&hello_bytes).await
+        .map_err(|_| HandshakeError::AuthenticationFailed)?;
+
+    // Read signed ClientResponse (4429 bytes: X25519 + ML-KEM CT + ML-DSA sig)
+    let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
+    stream.read_exact(&mut buf).await
+        .map_err(|_| HandshakeError::AuthenticationFailed)?;
+
+    // Verify the control plane's signature against its pre-shared VK
+    server.complete_from_wire_signed(&buf, &cp_vk.verifying_key)
+}
+```
+
+This is identical to the mutual-auth path in `session.rs` — the same `server_hello_signed_bytes` and `complete_from_wire_signed` calls. The admin channel simply makes mutual auth mandatory: there is no unauthenticated fallback, unlike the proxy channel where client auth is opt-in.
+
+**The bridge uses its existing `ServerIdentity`** to sign the ServerHello. The admin client authenticates the bridge using the same VK that proxy clients use — the one distributed at registration time. No separate bridge identity for the admin channel.
+
+**The control plane authenticates with a dedicated `ControlPlaneVerifyingIdentity`** loaded from `admin.control_plane_vk_path`. This keypair is generated with the new `admin-keygen` subcommand. Having a separate keypair for the admin client (instead of reusing the proxy client keypair) isolates security boundaries: if the admin SK is compromised, the proxy client keys are unaffected.
+
+### Rate limiting — no new crate
+
+```rust
+let mut rate_window_start = Instant::now();
+let mut rate_count: u32 = 0;
+
+loop {
+    let (stream, peer) = listener.accept().await?;
+
+    // Reset window every second
+    if rate_window_start.elapsed() >= Duration::from_secs(1) {
+        rate_window_start = Instant::now();
+        rate_count = 0;
+    }
+    rate_count += 1;
+    if rate_count > config.rate_limit_per_second {
+        warn!(%peer, "admin: connection dropped — rate limit exceeded");
+        drop(stream);
+        continue;
+    }
+    // ... spawn handler ...
+}
+```
+
+The rate limiter uses `(Instant, u32)` local state in the single accept-loop task. No mutex, no crate, no allocations. It resets the counter every second. The default limit is 5 connections per second — more than enough for any legitimate control plane, and low enough to limit the impact of a misconfigured or malicious client flooding the port.
+
+### Command dispatch — three handlers
+
+**`GetMetrics`**: calls `prometheus_handle.render()` and returns the full Prometheus text exposition format in `AdminResponse::Metrics { data }`. The same `PrometheusHandle` is shared with `GET /metrics` on `:8444`. The data is identical regardless of which channel is used to request it.
+
+**`Rotate`**: sends a modification signal on `rotate_tx: Arc<watch::Sender<u64>>` (incrementing the counter by 1) and returns the number of currently active proxy connections. The `rotate_tx` channel is the same one used by `session.rs` to detect rotation requests — the admin command triggers the same rotation path as the now-removed `POST /rotate` on `:8444`.
+
+**`GetVkToken`**: calls `vk_share::create_token()` and returns the one-time token URL in `AdminResponse::VkToken { token, url }`. The `vk_store` is the same `Arc<VkShareStore>` shared with the TLS listener — tokens created via the admin channel are redeemable at `GET /vk/:token` on `:8440`.
+
+---
+
+## latticeshield-bridge/src/identity.rs — ControlPlaneVerifyingIdentity
+
+A new identity type was added alongside the existing `ServerIdentity` and `ClientVerifyingIdentity`:
+
+```rust
+#[derive(Debug)]
+pub struct ControlPlaneVerifyingIdentity {
+    pub verifying_key: VerifyingKey,
+}
+
+impl ControlPlaneVerifyingIdentity {
+    pub fn load(vk_path: &Path) -> Result<Self, IdentityError> {
+        let data = std::fs::read(vk_path)?;
+        if data.len() != VERIFYING_KEY_LEN {
+            return Err(IdentityError::InvalidSize {
+                expected: VERIFYING_KEY_LEN,
+                found: data.len(),
+            });
+        }
+        let buf: &[u8; VERIFYING_KEY_LEN] = data.as_slice().try_into().expect("len ya validado");
+        let verifying_key = VerifyingKey::from_bytes(buf)
+            .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+        Ok(Self { verifying_key })
+    }
+}
+```
+
+**Why a distinct named type and not a type alias or reuse of `ClientVerifyingIdentity`?** Type safety. If `ControlPlaneVerifyingIdentity` were a type alias for `ClientVerifyingIdentity`, the compiler would not catch a bug where the proxy client VK and the admin VK are accidentally swapped. A distinct struct makes the semantic difference machine-enforced. The implementation is identical — that is fine. Duplication at the type level is preferable to a type alias that loses semantic meaning.
+
+**No file-permission check.** Unlike `ServerIdentity::load()`, which enforces `0o600` on the signing key file, `ControlPlaneVerifyingIdentity::load()` performs no permission check. The VerifyingKey is public material — it is distributed out-of-band and does not need to be kept secret. This mirrors the `ClientVerifyingIdentity` behavior.
+
+The key file convention: `admin-keygen <dir>` produces `admin.sk` (0o600, control plane signs with this) and `admin.vk` (0o644, bridge loads this as `ControlPlaneVerifyingIdentity`).
+
+---
+
+## latticeshield-bridge/src/config.rs — AdminConfig
+
+```toml
+[admin]
+enabled = true
+listen_addr = "0.0.0.0:8445"
+control_plane_vk_path = "./keys/admin.vk"
+rate_limit_per_second = 5
+handshake_timeout_secs = 10
+```
+
+The `[admin]` section is opt-in. When `enabled = false` (the default), no port is allocated. When `enabled = true`, `control_plane_vk_path` is required — the bridge refuses to start if the file is missing or contains an invalid key.
+
+Validation rejects port collisions between `admin.listen_addr` and all other configured listeners (`:8443`, `:8444`, `:8440`, `:8441`). Collision is detected at startup, before any socket is opened.
+
+**Why is the admin channel opt-in?** Not every deployment needs a control plane. A self-hosted bridge running on a single machine can be operated entirely via the CLI without the admin channel. Making it opt-in means the default configuration has zero attack surface on `:8445`.
+
+### Removing the bearer token from :8444
+
+Mes 13 removes `POST /rotate` and `POST /vk-token` from `metrics_app()`. The `admin_token: String` field is removed from `MetricsAppState`. `server::run()` no longer accepts an `admin_token` parameter. The `LATTICESHIELD_ADMIN_TOKEN` environment variable is no longer read.
+
+`GET /metrics` on `:8444` remains untouched — Prometheus scraping is unauthenticated by design, consistent with the standard Prometheus deployment model where `:8444` is firewalled from public access.
+
+### Test coverage (285 tests total after Mes 13)
+
+The bridge binary gained 29 new tests. Key scenarios:
+
+| Test | What it verifies |
+|------|-----------------|
+| `command_frame_get_metrics_roundtrip` | JSON round-trip for GetMetrics command frame |
+| `command_frame_unknown_cmd_fails` | Unknown `cmd` variant fails deserialization |
+| `seq_zero_rejected` | `is_seq_valid(0, 0)` → false |
+| `seq_replay_same_rejected` | `is_seq_valid(5, 5)` → false |
+| `cp_vk_load_roundtrip_ok` | `ControlPlaneVerifyingIdentity::load` with valid VK |
+| `cp_vk_load_wrong_size_rejected` | 16-byte file → `IdentityError::InvalidSize` |
+| `post_rotate_returns_404_after_mes13` | `POST /rotate` on :8444 now returns 404 |
+| Full handshake integration tests | Both sides (server + client) in the same process over an ephemeral port |
+
+---
+
+---
+
+# Mes 14 — Cloud Integration (Signed Heartbeats + BridgeCommand)
+
+---
+
+## The problem that existed
+
+The heartbeat channel between the bridge and the cloud was one-directional and unauthenticated. The bridge POSTed a JSON payload with metrics and status to the cloud control plane, but:
+
+1. **The cloud could not verify the sender.** Any process that knew the registration endpoint URL could send fake heartbeats. There was no cryptographic proof that a heartbeat came from the specific bridge instance that had registered with that `agent_id`.
+
+2. **The cloud could not send commands back.** The heartbeat response body was ignored. If the cloud needed to trigger a key rotation on a specific bridge, there was no mechanism — the `POST /rotate` admin route (now removed in Mes 13) was the only way, and it required direct network access to `:8444`.
+
+3. **Registration was open.** Any process could POST to `POST /api/v1/agents/register` and obtain an `agent_id`. There was no one-time provisioning secret that the cloud could use to validate that a registering bridge was deployed intentionally by an operator.
+
+Mes 14 closes all three gaps on the bridge side:
+- Every heartbeat is now signed with the bridge's ML-DSA-65 signing key. The cloud can verify the signature against the `server_vk` registered in Mes 12.
+- The cloud can include `BridgeCommand` values in the heartbeat response body. The bridge reads and dispatches them.
+- A one-time `install_token` can be included in the registration payload to authenticate the initial provisioning.
+
+---
+
+## latticeshield-bridge/src/control_plane.rs — signed heartbeats and BridgeCommand dispatch
+
+### The payload split: SignableHeartbeatPayload and SignedHeartbeatPayload
+
+Before Mes 14, a single `HeartbeatPayload` struct was built and POSTed. Mes 14 introduces a clean two-struct pattern:
+
+```rust
+#[derive(Serialize)]
+struct SignableHeartbeatPayload {
+    timestamp_unix: u64,
+    uptime_secs: u64,
+    status: &'static str,
+    version: &'static str,
+    metrics: HeartbeatMetrics,
+}
+
+#[derive(Serialize)]
+struct SignedHeartbeatPayload {
+    timestamp_unix: u64,
+    uptime_secs: u64,
+    status: &'static str,
+    version: &'static str,
+    metrics: HeartbeatMetrics,
+    signature: String,   // base64-encoded ML-DSA-65 signature (4412 chars)
+}
+```
+
+`SignableHeartbeatPayload` contains exactly the fields that are signed. `SignedHeartbeatPayload` contains those same fields plus the `signature` field. The layout is flat (no nesting) — the cloud reconstructs the canonical body by extracting the five known fields into a matching struct and calling `serde_json::to_vec`, then verifies the signature against the bridge's pre-registered `server_vk`.
+
+**Why flat and not nested?** If `SignedHeartbeatPayload` nested `SignableHeartbeatPayload` as a sub-object, the cloud would need to extract a `{"payload": {...}}` wrapper level before re-serializing. A flat layout means the cloud's canonical reconstruction mirrors the bridge's construction exactly — same field names, same JSON serialization order (serde_json preserves struct field declaration order).
+
+### The signing process in send_heartbeat()
+
+```rust
+async fn send_heartbeat(
+    client: &Client,
+    config: &ValidConfig,
+    agent_id: &str,
+    signable: &SignableHeartbeatPayload,
+    identity: &ServerIdentity,
+    rng: &mut impl rand_core::CryptoRngCore,
+) -> anyhow::Result<HeartbeatResponse> {
+    // Step 1: canonical bytes (serde_json preserves field declaration order)
+    let canonical = serde_json::to_vec(signable)?;
+
+    // Step 2: ML-DSA-65 sign — produces a 3309-byte Signature
+    let sig = latticeshield_crypto::signing::sign(&identity.signing_key, &canonical, rng)?;
+
+    // Step 3: base64 standard encoding — 3309 bytes → 4412 chars
+    let signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+    // Step 4: build flat POST body
+    let signed = SignedHeartbeatPayload {
+        timestamp_unix: signable.timestamp_unix,
+        // ... copy fields ...
+        metrics: signable.metrics.clone(),
+        signature,
+    };
+
+    // Step 5: POST + parse response
+    let resp = client.post(&url).json(&signed).timeout(Duration::from_secs(5)).send().await?;
+    let hb_resp = resp.json::<HeartbeatResponse>().await.unwrap_or_default();
+    Ok(hb_resp)
+}
+```
+
+A single `OsRng` instance is created once before the loop in `start()` and reused across heartbeats. `OsRng` is a zero-sized type — constructing it has no cost — but keeping one instance avoids any per-heartbeat syscall overhead for RNG initialization on platforms that care.
+
+**Why base64 for the signature and not hex?** The ML-DSA-65 signature is 3309 bytes. In hex that is 6618 characters; in base64 standard it is 4412 characters — 33% smaller. Since the heartbeat fires every 30 seconds and the signature rides in every POST body, base64 is the appropriate choice here. For the `server_vk` field (sent once at registration, 1952 bytes → 3904 hex chars), the wire-size argument does not apply and hex was kept for consistency with the rest of the codebase.
+
+`base64 = "0.22"` was added as a direct dependency in `latticeshield-bridge/Cargo.toml`. It was not previously in the workspace.
+
+### HeartbeatResponse and BridgeCommand
+
+```rust
+#[derive(Debug, Deserialize, Default)]
+struct HeartbeatResponse {
+    #[serde(default)]
+    pending_commands: Option<Vec<BridgeCommand>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum BridgeCommand {
+    Rotate,
+    #[serde(other)]
+    Unknown,
+}
+```
+
+`HeartbeatResponse` derives `Default` so that `resp.json().unwrap_or_default()` works when the cloud returns an empty body (`{}`) or the JSON parse fails for any non-fatal reason. `#[serde(default)]` on the `pending_commands` field ensures a missing key in the JSON is treated as `None` rather than a deserialization error.
+
+`BridgeCommand` uses `#[serde(other)]` to absorb unknown variants as `Unknown` without erroring. This is forward-compatibility: when the cloud adds a new command type (e.g., `Reload`, `UpdateConfig`) in a future milestone, older bridge versions gracefully skip it with a warning log instead of crashing.
+
+The dispatch loop in `start()`:
+
+```rust
+match send_heartbeat(&client, &config, &agent_id, &signable, &identity, &mut rng).await {
+    Ok(hb_resp) => {
+        for cmd in hb_resp.pending_commands.unwrap_or_default() {
+            match cmd {
+                BridgeCommand::Unknown => {
+                    tracing::warn!("unknown BridgeCommand received, skipping");
+                }
+                cmd => {
+                    if let Err(e) = cmd_tx.send(cmd).await {
+                        tracing::warn!("BridgeCommand channel closed: {e}");
+                    }
+                }
+            }
+        }
+    }
+    Err(e) => tracing::warn!("heartbeat failed (will retry): {e:#}"),
+}
+```
+
+`cmd_tx` is a `tokio::sync::mpsc::Sender<BridgeCommand>` with capacity 32. It is created in `server.rs` before the control-plane task is spawned. In Mes 14, the receiver is a stub drainer task that logs each received command. Mes 15 replaces it with the actual key rotation logic.
+
+**Why not dispatch directly in the heartbeat loop?** Separation of concerns. The heartbeat loop is responsible for talking to the cloud, not for executing bridge operations. If the command execution is slow or blocks, it would delay subsequent heartbeats. The mpsc channel decouples reception from execution.
+
+`control_plane::start()` gains a new parameter:
+
+```rust
+pub async fn start(
+    config: ValidConfig,
+    metrics: Arc<MetricsState>,
+    identity: Arc<ServerIdentity>,
+    cmd_tx: tokio::sync::mpsc::Sender<BridgeCommand>,
+)
+```
+
+`BridgeCommand` is `pub` so that `server.rs` can name the type for the channel.
+
+---
+
+## latticeshield-bridge/src/config.rs — install_token
+
+```toml
+[control_plane]
+enabled = true
+endpoint = "https://cloud.example.com"
+install_token = "one-time-secret-from-cloud"
+```
+
+`ControlPlaneConfig` gains `pub install_token: Option<String>`. `ValidConfig` gains `pub control_plane_install_token: Option<String>`. The resolution order in `validate()`:
+
+1. `INSTALL_TOKEN` environment variable — if set and non-empty, takes precedence.
+2. `control_plane.install_token` from TOML — used if env var is absent or empty.
+3. `None` — allowed. A `warn!` is emitted when `control_plane_enabled = true` but no token is configured.
+
+The warning is non-fatal. The bridge continues to start and register without a token. It is the operator's responsibility to provision the token before deployment; the warning is a reminder that without it, the cloud cannot authenticate the registration.
+
+### Why the install_token must never appear in logs
+
+`ValidConfig` previously derived `Debug`. With `control_plane_install_token` added as a field, a `#[derive(Debug)]` would print the token value in every debug-level log that prints the config. The `#[derive(Debug)]` was removed and replaced with a manual `impl Debug` that redacts the token:
+
+```rust
+impl std::fmt::Debug for ValidConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidConfig")
+            // ... all other fields ...
+            .field(
+                "control_plane_install_token",
+                &self.control_plane_install_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+```
+
+This outputs `control_plane_install_token: Some("[REDACTED]")` when set, `None` when absent. The raw token value never appears in any log, trace span, or debug output.
+
+The pattern is the same one used for `SigningKey`'s manual `Debug` impl in `signing.rs`. Consistent across all sensitive values in the codebase.
+
+### install_token in RegistrationPayload
+
+```rust
+#[serde(skip_serializing_if = "Option::is_none")]
+install_token: Option<String>,
+```
+
+`#[serde(skip_serializing_if = "Option::is_none")]` means the field is absent from the JSON when `None`. The cloud receives no `install_token` key at all (not even `null`) when the operator has not configured one. This matches real-world API conventions and avoids the cloud having to distinguish between `null` and absent.
+
+### Test coverage (+10 tests, 295 total after Mes 14)
+
+| Test | What it verifies |
+|------|-----------------|
+| `heartbeat_body_contains_base64_signature` | `signature` field present; base64-decodes to exactly 3309 bytes (`SIGNATURE_LEN`) |
+| `heartbeat_signature_verifies_with_verifying_key` | Full `signing::verify` round-trip against the bridge's verifying key |
+| `heartbeat_response_empty_body_returns_default` | `{}` response → `pending_commands: None` without panic |
+| `heartbeat_response_rotate_command_returned` | `{"pending_commands":[{"type":"Rotate"}]}` → `BridgeCommand::Rotate` |
+| `heartbeat_response_unknown_command_does_not_error` | Unknown command type → `BridgeCommand::Unknown`, no error |
+| `registration_body_contains_install_token_when_set` | `install_token` field present in registration body when configured |
+| `registration_body_omits_install_token_when_none` | `install_token` key absent from body when `None` |
+| `install_token_toml_field_accepted` | TOML `install_token` field parsed into `ValidConfig` |
+| `install_token_env_var_takes_precedence_over_toml` | `INSTALL_TOKEN` env var overrides TOML value |
+| `valid_config_debug_redacts_install_token` | `format!("{:?}", cfg)` does not contain the raw token value |
