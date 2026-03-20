@@ -61,6 +61,11 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         quic_key_path: std::path::PathBuf::from("./keys/tls.key"),
         client_auth_enabled: false,
         client_vk_path: None,
+        admin_enabled: false,
+        admin_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admin_control_plane_vk_path: None,
+        admin_rate_limit_per_second: 5,
+        admin_handshake_timeout_secs: 10,
     }
 }
 
@@ -341,15 +346,8 @@ async fn http_endpoint_returns_200_ok_with_prometheus_content_type() {
 
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
-    let (rotate_tx, _) = watch::channel(0u64);
     let app_state = MetricsAppState {
         prometheus_handle: handle,
-        rotate_tx: Arc::new(rotate_tx),
-        metrics_state: MetricsState::new(),
-        vk_store: crate::vk_share::new_store(),
-        identity: test_identity(),
-        tls_base_url: "https://127.0.0.1:8440".to_string(),
-        admin_token: "test-token".to_string(),
     };
     let app = crate::server::metrics_app(app_state);
 
@@ -596,23 +594,13 @@ async fn byte_threshold_triggers_rotation() {
     assert!(got_rotation, "byte threshold debe haber disparado KEY_ROTATE");
 }
 
-/// TEST 8 — POST /rotate responde 200 con JSON {"rotated": N}.
+/// TEST 8 — POST /rotate ya no existe en :8444 — retorna 404 (movido al canal admin PQC :8445).
 #[tokio::test]
-async fn post_rotate_endpoint_returns_200() {
+async fn post_rotate_endpoint_returns_404_after_mes13() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
-    let (rotate_tx, rotate_rx) = watch::channel(0u64);
-    let rotate_tx = Arc::new(rotate_tx);
-
-    let metrics_state = MetricsState::new();
     let app_state = MetricsAppState {
         prometheus_handle: handle,
-        rotate_tx: Arc::clone(&rotate_tx),
-        metrics_state: Arc::clone(&metrics_state),
-        vk_store: crate::vk_share::new_store(),
-        identity: test_identity(),
-        tls_base_url: "https://127.0.0.1:8440".to_string(),
-        admin_token: "test-token".to_string(),
     };
     let app = crate::server::metrics_app(app_state);
 
@@ -620,7 +608,7 @@ async fn post_rotate_endpoint_returns_200() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    // POST /rotate via TCP crudo
+    // POST /rotate via TCP crudo — debe retornar 404 (ruta eliminada)
     let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
     conn.write_all(b"POST /rotate HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await
@@ -631,19 +619,10 @@ async fn post_rotate_endpoint_returns_200() {
     let response_str = String::from_utf8(response).unwrap();
 
     assert!(
-        response_str.contains("200 OK"),
-        "POST /rotate debe retornar 200, got:\n{}",
+        response_str.contains("404"),
+        "POST /rotate debe retornar 404 en Mes 13+ (rota via canal admin PQC), got:\n{}",
         &response_str[..response_str.len().min(400)]
     );
-    assert!(
-        response_str.contains("rotated"),
-        "body debe contener 'rotated', got:\n{}",
-        &response_str[..response_str.len().min(400)]
-    );
-
-    // El watch channel debe haber recibido la senal
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(*rotate_rx.borrow() > 0, "rotate_tx debe haber enviado una senal");
 
     let _ = recorder;
 }
@@ -821,4 +800,338 @@ async fn test_session_wrong_client_vk() {
     // El bridge debe rechazar la sesion con un error (no Ok)
     let result = bridge_result.await.unwrap();
     assert!(result.is_err(), "sesion con VK incorrecta debe ser rechazada con error");
+}
+
+// ── Tests de canal admin PQC (Mes 13) ─────────────────────────────────────────
+
+use latticeshield_crypto::{
+    handshake::{
+        parse_server_hello_signed as psh_signed,
+        SERVER_HELLO_SIGNED_LEN as SHS_LEN,
+    },
+    channel::EncryptedChannel as EncCh,
+};
+use crate::admin::{AdminCommand, AdminResponse, CommandFrame};
+use crate::identity::ControlPlaneVerifyingIdentity;
+
+/// Crea un par de identidades para el canal admin:
+/// - `ServerIdentity` efimero para el bridge
+/// - SK + VK del control plane (simulado)
+fn test_admin_identities() -> (Arc<ServerIdentity>, Arc<ControlPlaneVerifyingIdentity>, latticeshield_crypto::SigningKey) {
+    let bridge_identity = test_identity();
+    let (cp_sk_raw, cp_vk_raw) = generate_keypair(&mut OsRng);
+    let cp_sk = latticeshield_crypto::SigningKey::from_bytes(cp_sk_raw.to_bytes()).unwrap();
+    let cp_vk_identity = ControlPlaneVerifyingIdentity {
+        verifying_key: latticeshield_crypto::VerifyingKey::from_bytes(cp_vk_raw.to_bytes()).unwrap(),
+    };
+    (bridge_identity, Arc::new(cp_vk_identity), cp_sk)
+}
+
+/// TEST 12 — Canal admin PQC: handshake completo + GetMetrics.
+///
+/// Topologia: control plane simulado (este test) ←→ admin listener
+/// Verifica que el handshake mutuo pase y que GetMetrics retorne datos.
+#[tokio::test]
+async fn admin_channel_get_metrics_full_handshake() {
+    use latticeshield_crypto::SERVER_HELLO_LEN;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (bridge_identity, cp_vk, cp_sk) = test_admin_identities();
+    let bridge_vk = latticeshield_crypto::VerifyingKey::from_bytes(
+        bridge_identity.verifying_key.to_bytes()
+    ).unwrap();
+
+    // Spawn del admin listener en puerto efimero
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = listener.local_addr().unwrap();
+    drop(listener); // re-bind via spawn_admin_listener
+
+    let rotate_tx = test_rotate_tx();
+    let metrics_state = MetricsState::new();
+    let vk_store = crate::vk_share::new_store();
+    let prometheus_handle = global_handle().clone();
+
+    crate::admin::spawn_admin_listener(
+        admin_addr,
+        Arc::clone(&bridge_identity),
+        Arc::clone(&cp_vk),
+        Arc::clone(&vk_store),
+        Arc::clone(&metrics_state),
+        Arc::clone(&rotate_tx),
+        prometheus_handle,
+        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminListenerConfig {
+            rate_limit_per_second: 100,
+            handshake_timeout_secs: 5,
+        },
+    );
+
+    // Pequeña espera para que el listener este listo
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // ── Control plane simulado: conectar y completar el handshake ─────────
+    let mut client = TcpStream::connect(admin_addr).await.unwrap();
+
+    // 1. Leer ServerHello firmado (4557 bytes)
+    let mut hello_buf = [0u8; SHS_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+
+    // 2. Verificar firma del bridge con VK pre-shared
+    let hello = psh_signed(&hello_buf, &bridge_vk).expect("bridge ServerHello debe verificar");
+
+    // 3. Generar ClientResponse y firmarlo
+    let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
+
+    let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+    server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
+    let signed_cr = serialize_client_response_signed(&response, &cp_sk, &server_hello_raw, &mut OsRng).unwrap();
+
+    client.write_all(&signed_cr).await.unwrap();
+
+    // 4. Canal cifrado activo — enviar GetMetrics
+    let channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
+    let cmd = CommandFrame { seq: 1, cmd: AdminCommand::GetMetrics };
+    let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
+    channel.write_frame(&mut client, &cmd_bytes).await.unwrap();
+
+    // 5. Leer respuesta
+    let resp_bytes = match channel.read_frame(&mut client).await.unwrap() {
+        latticeshield_crypto::FrameResult::Data(b) => b,
+        latticeshield_crypto::FrameResult::KeyRotate(_) => panic!("unexpected KEY_ROTATE"),
+    };
+
+    let response: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
+    assert!(
+        matches!(response, AdminResponse::Metrics { .. }),
+        "GetMetrics debe retornar AdminResponse::Metrics"
+    );
+}
+
+/// TEST 13 — Canal admin PQC: firma incorrecta del control plane es rechazada.
+///
+/// El cliente usa una SK diferente a la VK pre-shared en el bridge.
+/// El bridge debe cerrar la conexion sin respuesta de aplicacion.
+#[tokio::test]
+async fn admin_channel_wrong_client_sk_rejected() {
+    use latticeshield_crypto::SERVER_HELLO_LEN;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (bridge_identity, cp_vk, _cp_sk_correct) = test_admin_identities();
+    let bridge_vk = latticeshield_crypto::VerifyingKey::from_bytes(
+        bridge_identity.verifying_key.to_bytes()
+    ).unwrap();
+
+    // Generar una SK INCORRECTA (diferente al cp_vk pre-shared en el bridge)
+    let (wrong_sk_raw, _) = generate_keypair(&mut OsRng);
+    let wrong_sk = latticeshield_crypto::SigningKey::from_bytes(wrong_sk_raw.to_bytes()).unwrap();
+
+    let rotate_tx = test_rotate_tx();
+    let metrics_state = MetricsState::new();
+    let vk_store = crate::vk_share::new_store();
+    let prometheus_handle = global_handle().clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    crate::admin::spawn_admin_listener(
+        admin_addr,
+        Arc::clone(&bridge_identity),
+        Arc::clone(&cp_vk),
+        Arc::clone(&vk_store),
+        Arc::clone(&metrics_state),
+        Arc::clone(&rotate_tx),
+        prometheus_handle,
+        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminListenerConfig {
+            rate_limit_per_second: 100,
+            handshake_timeout_secs: 5,
+        },
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(admin_addr).await.unwrap();
+
+    // Leer ServerHello
+    let mut hello_buf = [0u8; SHS_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+    let hello = psh_signed(&hello_buf, &bridge_vk).expect("bridge hello debe verificar");
+
+    // Firmar con la SK INCORRECTA
+    let (response, _client_key) = client_respond(&hello, &mut OsRng).unwrap();
+    let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+    server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
+    let signed_cr = serialize_client_response_signed(&response, &wrong_sk, &server_hello_raw, &mut OsRng).unwrap();
+
+    client.write_all(&signed_cr).await.unwrap();
+
+    // El bridge debe cerrar la conexion — el cliente no deberia recibir datos de aplicacion
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.read(&mut buf),
+    ).await;
+
+    // El bridge cierra la conexion (n=0 EOF) o timeout — ambos son aceptables
+    match n {
+        Ok(Ok(0)) => { /* EOF — bridge cerro la conexion correctamente */ }
+        Ok(Ok(bytes_read)) => {
+            // Si llegan bytes, deben ser del handshake no de la aplicacion
+            // (El bridge rechaza el handshake y no envia respuesta de aplicacion)
+            panic!("bridge envio {bytes_read} bytes inesperados despues de firma incorrecta");
+        }
+        Ok(Err(_)) | Err(_) => { /* connection reset o timeout — aceptable */ }
+    }
+}
+
+/// TEST 14 — Canal admin PQC: handshake completo + Rotate.
+///
+/// Verifica que el comando Rotate es procesado y retorna AdminResponse::Rotated.
+#[tokio::test]
+async fn admin_channel_rotate_full_handshake() {
+    use latticeshield_crypto::SERVER_HELLO_LEN;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (bridge_identity, cp_vk, cp_sk) = test_admin_identities();
+    let bridge_vk = latticeshield_crypto::VerifyingKey::from_bytes(
+        bridge_identity.verifying_key.to_bytes()
+    ).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let rotate_tx = test_rotate_tx();
+    let metrics_state = MetricsState::new();
+    let vk_store = crate::vk_share::new_store();
+    let prometheus_handle = global_handle().clone();
+
+    crate::admin::spawn_admin_listener(
+        admin_addr,
+        Arc::clone(&bridge_identity),
+        Arc::clone(&cp_vk),
+        Arc::clone(&vk_store),
+        Arc::clone(&metrics_state),
+        Arc::clone(&rotate_tx),
+        prometheus_handle,
+        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminListenerConfig {
+            rate_limit_per_second: 100,
+            handshake_timeout_secs: 5,
+        },
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(admin_addr).await.unwrap();
+
+    // 1. Leer ServerHello firmado
+    let mut hello_buf = [0u8; SHS_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+
+    // 2. Verificar y completar el handshake
+    let hello = psh_signed(&hello_buf, &bridge_vk).expect("bridge ServerHello debe verificar");
+    let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
+
+    let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+    server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
+    let signed_cr = serialize_client_response_signed(&response, &cp_sk, &server_hello_raw, &mut OsRng).unwrap();
+    client.write_all(&signed_cr).await.unwrap();
+
+    // 3. Enviar Rotate
+    let channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
+    let cmd = CommandFrame { seq: 2, cmd: AdminCommand::Rotate };
+    let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
+    channel.write_frame(&mut client, &cmd_bytes).await.unwrap();
+
+    // 4. Leer respuesta
+    let resp_bytes = match channel.read_frame(&mut client).await.unwrap() {
+        latticeshield_crypto::FrameResult::Data(b) => b,
+        latticeshield_crypto::FrameResult::KeyRotate(_) => panic!("unexpected KEY_ROTATE"),
+    };
+
+    let resp: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
+    assert!(
+        matches!(resp, AdminResponse::Rotated { .. }),
+        "Rotate debe retornar AdminResponse::Rotated, got: {resp:?}"
+    );
+}
+
+/// TEST 15 — Canal admin PQC: handshake completo + GetVkToken.
+///
+/// Verifica que el comando GetVkToken retorna AdminResponse::VkToken con una URL valida.
+#[tokio::test]
+async fn admin_channel_get_vk_token_full_handshake() {
+    use latticeshield_crypto::SERVER_HELLO_LEN;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (bridge_identity, cp_vk, cp_sk) = test_admin_identities();
+    let bridge_vk = latticeshield_crypto::VerifyingKey::from_bytes(
+        bridge_identity.verifying_key.to_bytes()
+    ).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let rotate_tx = test_rotate_tx();
+    let metrics_state = MetricsState::new();
+    let vk_store = crate::vk_share::new_store();
+    let prometheus_handle = global_handle().clone();
+
+    crate::admin::spawn_admin_listener(
+        admin_addr,
+        Arc::clone(&bridge_identity),
+        Arc::clone(&cp_vk),
+        Arc::clone(&vk_store),
+        Arc::clone(&metrics_state),
+        Arc::clone(&rotate_tx),
+        prometheus_handle,
+        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminListenerConfig {
+            rate_limit_per_second: 100,
+            handshake_timeout_secs: 5,
+        },
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(admin_addr).await.unwrap();
+
+    // 1. Leer ServerHello firmado
+    let mut hello_buf = [0u8; SHS_LEN];
+    client.read_exact(&mut hello_buf).await.unwrap();
+
+    // 2. Verificar y completar el handshake
+    let hello = psh_signed(&hello_buf, &bridge_vk).expect("bridge ServerHello debe verificar");
+    let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
+
+    let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
+    server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
+    let signed_cr = serialize_client_response_signed(&response, &cp_sk, &server_hello_raw, &mut OsRng).unwrap();
+    client.write_all(&signed_cr).await.unwrap();
+
+    // 3. Enviar GetVkToken
+    let channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
+    let cmd = CommandFrame { seq: 3, cmd: AdminCommand::GetVkToken };
+    let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
+    channel.write_frame(&mut client, &cmd_bytes).await.unwrap();
+
+    // 4. Leer respuesta
+    let resp_bytes = match channel.read_frame(&mut client).await.unwrap() {
+        latticeshield_crypto::FrameResult::Data(b) => b,
+        latticeshield_crypto::FrameResult::KeyRotate(_) => panic!("unexpected KEY_ROTATE"),
+    };
+
+    let resp: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
+    match resp {
+        AdminResponse::VkToken { url, .. } => {
+            assert!(
+                url.contains("/vk/"),
+                "la URL del VkToken debe contener '/vk/', got: {url}"
+            );
+        }
+        other => panic!("GetVkToken debe retornar AdminResponse::VkToken, got: {other:?}"),
+    }
 }

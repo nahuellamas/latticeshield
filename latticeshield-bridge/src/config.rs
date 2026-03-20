@@ -117,6 +117,41 @@ fn default_tls_key_path() -> PathBuf { PathBuf::from("./keys/tls.key") }
 fn default_quic_enabled() -> bool { false }
 fn default_quic_listen_addr() -> String { "0.0.0.0:8441".to_string() }
 
+fn default_admin_enabled() -> bool { false }
+fn default_admin_listen_addr() -> String { "0.0.0.0:8445".to_string() }
+fn default_admin_rate_limit() -> u32 { 5 }
+fn default_admin_handshake_timeout() -> u64 { 10 }
+
+// ── AdminConfig ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_admin_listen_addr")]
+    pub listen_addr: String,
+    /// Ruta a la clave de verificacion publica del control plane (material publico).
+    /// Requerida cuando enabled = true.
+    pub control_plane_vk_path: Option<PathBuf>,
+    #[serde(default = "default_admin_rate_limit")]
+    pub rate_limit_per_second: u32,
+    #[serde(default = "default_admin_handshake_timeout")]
+    pub handshake_timeout_secs: u64,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_admin_enabled(),
+            listen_addr: default_admin_listen_addr(),
+            control_plane_vk_path: None,
+            rate_limit_per_second: default_admin_rate_limit(),
+            handshake_timeout_secs: default_admin_handshake_timeout(),
+        }
+    }
+}
+
 // ── AuthConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -233,6 +268,8 @@ pub struct Config {
     pub quic: QuicConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 impl Default for Config {
@@ -247,6 +284,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             quic: QuicConfig::default(),
             auth: AuthConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -280,6 +318,13 @@ pub struct ValidConfig {
     pub client_auth_enabled: bool,
     /// Ruta a la VK del cliente (solo significativa cuando client_auth_enabled = true).
     pub client_vk_path: Option<PathBuf>,
+    // ── Admin PQC listener (:8445) ──────────────────────────────────────────────
+    pub admin_enabled: bool,
+    pub admin_listen_addr: SocketAddr,
+    /// Ruta a la VK del control plane (requerida cuando admin_enabled = true).
+    pub admin_control_plane_vk_path: Option<PathBuf>,
+    pub admin_rate_limit_per_second: u32,
+    pub admin_handshake_timeout_secs: u64,
 }
 
 // ── Config::load + validate ────────────────────────────────────────────────────
@@ -429,6 +474,55 @@ impl Config {
         let client_auth_enabled = self.auth.client_vk_path.is_some();
         let client_vk_path = self.auth.client_vk_path;
 
+        // ── Admin PQC listener validation ────────────────────────────────────
+        let admin_listen_addr: SocketAddr = self.admin.listen_addr.parse()
+            .context("invalid admin.listen_addr")?;
+
+        if self.admin.enabled {
+            if self.admin.control_plane_vk_path.is_none() {
+                anyhow::bail!(
+                    "admin.control_plane_vk_path must be set when admin.enabled = true\n\
+                     Hint: ejecuta `latticeshield-bridge admin-keygen ./keys` para generar las claves."
+                );
+            }
+            if self.admin.rate_limit_per_second < 1 {
+                anyhow::bail!(
+                    "admin.rate_limit_per_second must be at least 1, got {}",
+                    self.admin.rate_limit_per_second
+                );
+            }
+            if self.admin.handshake_timeout_secs < 1 {
+                anyhow::bail!(
+                    "admin.handshake_timeout_secs must be at least 1, got {}",
+                    self.admin.handshake_timeout_secs
+                );
+            }
+            if admin_listen_addr == listen_addr {
+                anyhow::bail!(
+                    "admin.listen_addr ({}) conflicts with server.listen_addr — they must be different ports",
+                    admin_listen_addr
+                );
+            }
+            if admin_listen_addr == metrics_addr {
+                anyhow::bail!(
+                    "admin.listen_addr ({}) conflicts with metrics.listen_addr — they must be different ports",
+                    admin_listen_addr
+                );
+            }
+            if self.tls.enabled && admin_listen_addr == tls_listen_addr {
+                anyhow::bail!(
+                    "admin.listen_addr ({}) conflicts with tls.listen_addr — they must be different ports",
+                    admin_listen_addr
+                );
+            }
+            if self.quic.enabled && admin_listen_addr == quic_listen_addr {
+                anyhow::bail!(
+                    "admin.listen_addr ({}) conflicts with quic.listen_addr — they must be different ports",
+                    admin_listen_addr
+                );
+            }
+        }
+
         Ok(ValidConfig {
             listen_addr,
             backend_addr,
@@ -453,6 +547,11 @@ impl Config {
             quic_key_path: self.quic.key_path.unwrap_or_default(),
             client_auth_enabled,
             client_vk_path,
+            admin_enabled: self.admin.enabled,
+            admin_listen_addr,
+            admin_control_plane_vk_path: self.admin.control_plane_vk_path,
+            admin_rate_limit_per_second: self.admin.rate_limit_per_second,
+            admin_handshake_timeout_secs: self.admin.handshake_timeout_secs,
         })
     }
 }
@@ -883,5 +982,81 @@ listen_addr = "not_an_addr"
         let cfg = Config::load(f.path()).unwrap();
         assert!(!cfg.client_auth_enabled);
         assert!(cfg.client_vk_path.is_none());
+    }
+
+    // ── AdminConfig tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn admin_disabled_by_default() {
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.admin_enabled);
+        assert_eq!(cfg.admin_listen_addr.to_string(), "0.0.0.0:8445");
+        assert_eq!(cfg.admin_rate_limit_per_second, 5);
+        assert_eq!(cfg.admin_handshake_timeout_secs, 10);
+        assert!(cfg.admin_control_plane_vk_path.is_none());
+    }
+
+    #[test]
+    fn admin_enabled_all_fields_accepted() {
+        let f = write_toml(
+            r#"
+[admin]
+enabled = true
+listen_addr = "0.0.0.0:8445"
+control_plane_vk_path = "./keys/cp.vk"
+rate_limit_per_second = 10
+handshake_timeout_secs = 30
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.admin_enabled);
+        assert_eq!(cfg.admin_listen_addr.to_string(), "0.0.0.0:8445");
+        assert_eq!(cfg.admin_control_plane_vk_path, Some(PathBuf::from("./keys/cp.vk")));
+        assert_eq!(cfg.admin_rate_limit_per_second, 10);
+        assert_eq!(cfg.admin_handshake_timeout_secs, 30);
+    }
+
+    #[test]
+    fn admin_enabled_missing_vk_path_rejected() {
+        let f = write_toml("[admin]\nenabled = true\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("control_plane_vk_path"), "got: {err}");
+    }
+
+    #[test]
+    fn admin_listen_addr_collides_with_pqc_rejected() {
+        let f = write_toml(
+            "[admin]\nenabled = true\nlisten_addr = \"0.0.0.0:8443\"\ncontrol_plane_vk_path = \"./keys/cp.vk\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "got: {err}");
+    }
+
+    #[test]
+    fn admin_listen_addr_collides_with_metrics_rejected() {
+        let f = write_toml(
+            "[admin]\nenabled = true\nlisten_addr = \"0.0.0.0:8444\"\ncontrol_plane_vk_path = \"./keys/cp.vk\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "got: {err}");
+    }
+
+    #[test]
+    fn admin_handshake_timeout_zero_rejected() {
+        let f = write_toml(
+            "[admin]\nenabled = true\ncontrol_plane_vk_path = \"./keys/cp.vk\"\nhandshake_timeout_secs = 0\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("handshake_timeout_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn admin_rate_limit_zero_rejected() {
+        let f = write_toml(
+            "[admin]\nenabled = true\ncontrol_plane_vk_path = \"./keys/cp.vk\"\nrate_limit_per_second = 0\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("rate_limit_per_second"), "got: {err}");
     }
 }
