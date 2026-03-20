@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Signed Heartbeats and Cloud Onboarding Token (2026-03-20)
+
+The bridge now proves its identity to the cloud management server on every status update it sends. Before this release, any process that knew the bridge's ID could send fake status updates — there was no way for the server to tell real updates from imposters. Now every update carries a digital signature (that means: a mathematical proof, like a wax seal, that only this specific bridge can produce). The cloud can verify that seal without storing any secret. Operators can also configure a one-time onboarding token (a short secret code the cloud issues when you register a new bridge) so that only bridges holding that code can claim an agent slot — the token never appears in any log file, no matter the log level.
+
 ### Admin Post-Quantum Channel on `:8445` (2026-03-20)
 
 The bridge now exposes an optional dedicated admin channel for the control plane. When enabled, it listens on `:8445` (TCP) and requires **mutual ML-DSA-65 authentication** — both sides must prove their identity using post-quantum digital signatures before any data flows. This replaces the classical bearer-token approach for admin traffic and gives the control plane a cryptographically strong proof that it is talking to the real bridge, and vice versa. The channel is disabled by default and does not open any port unless explicitly enabled in the config file.
@@ -232,7 +236,7 @@ cargo build --release
 
 ## Tests
 
-285 unit + integration tests across all four crates — all passing.
+295 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -243,7 +247,7 @@ cargo build --release
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (197 tests)
+### latticeshield-bridge (207 tests)
 
 | Module | Tests |
 |---|---|
@@ -296,13 +300,14 @@ cargo build --release
 | 11 | Connection pool in client — proactive warming, lazy close, pure tokio |
 | 12 | `server_vk` in registration payload + `latticeshield vk-share` — one-time VK distribution link (10-min expiry, single-use) |
 | 13 | Admin PQC channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand |
+| 14 | Cloud Integration Foundation — signed heartbeats (ML-DSA-65), `HeartbeatResponse` + `BridgeCommand` parsing, `install_token` for automated onboarding, token redaction in logs |
 
 ### Upcoming
 
 | Month | Milestone |
 |---|---|
-| 14 | **Cloud Integration Foundation** — signed heartbeats (ML-DSA-65), command parsing in heartbeat response (`Rotate`, `GetVkToken`), additional metrics (`pqc_handshakes_total`, `tls_handshakes_total`, `quic_streams_total`), `install_token` for automated onboarding, Hybrid TLS (X25519Kyber768) on bridge→cloud channel |
-| 15 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
+| 15 | **Hybrid TLS + Command Wiring** — post-quantum–safe outbound HTTPS for bridge→cloud (reqwest + rustls, Hybrid TLS), wire `BridgeCommand::Rotate` to actual key rotation, cloud-side signature verification |
+| 16 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
 
 ## License
 
