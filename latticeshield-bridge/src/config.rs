@@ -173,6 +173,7 @@ pub struct ControlPlaneConfig {
     pub agent_name: String,
     #[serde(default = "default_cp_interval")]
     pub heartbeat_interval_secs: u64,
+    pub install_token: Option<String>,
 }
 
 impl Default for ControlPlaneConfig {
@@ -182,6 +183,7 @@ impl Default for ControlPlaneConfig {
             endpoint: default_cp_endpoint(),
             agent_name: default_cp_agent_name(),
             heartbeat_interval_secs: default_cp_interval(),
+            install_token: None,
         }
     }
 }
@@ -291,7 +293,7 @@ impl Default for Config {
 
 // ── ValidConfig — post-validation, what server::run() receives ─────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidConfig {
     pub listen_addr: SocketAddr,
     pub backend_addr: SocketAddr,
@@ -325,6 +327,46 @@ pub struct ValidConfig {
     pub admin_control_plane_vk_path: Option<PathBuf>,
     pub admin_rate_limit_per_second: u32,
     pub admin_handshake_timeout_secs: u64,
+    pub control_plane_install_token: Option<String>,
+}
+
+impl std::fmt::Debug for ValidConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("backend_addr", &self.backend_addr)
+            .field("metrics_addr", &self.metrics_addr)
+            .field("max_frame_size", &self.max_frame_size)
+            .field("signing_key_path", &self.signing_key_path)
+            .field("log_level", &self.log_level)
+            .field("control_plane_enabled", &self.control_plane_enabled)
+            .field("control_plane_endpoint", &self.control_plane_endpoint)
+            .field("control_plane_agent_name", &self.control_plane_agent_name)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("key_rotation_enabled", &self.key_rotation_enabled)
+            .field("max_bytes_per_key", &self.max_bytes_per_key)
+            .field("key_rotation_interval", &self.key_rotation_interval)
+            .field("tls_enabled", &self.tls_enabled)
+            .field("tls_listen_addr", &self.tls_listen_addr)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("quic_enabled", &self.quic_enabled)
+            .field("quic_listen_addr", &self.quic_listen_addr)
+            .field("quic_cert_path", &self.quic_cert_path)
+            .field("quic_key_path", &self.quic_key_path)
+            .field("client_auth_enabled", &self.client_auth_enabled)
+            .field("client_vk_path", &self.client_vk_path)
+            .field("admin_enabled", &self.admin_enabled)
+            .field("admin_listen_addr", &self.admin_listen_addr)
+            .field("admin_control_plane_vk_path", &self.admin_control_plane_vk_path)
+            .field("admin_rate_limit_per_second", &self.admin_rate_limit_per_second)
+            .field("admin_handshake_timeout_secs", &self.admin_handshake_timeout_secs)
+            .field(
+                "control_plane_install_token",
+                &self.control_plane_install_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 // ── Config::load + validate ────────────────────────────────────────────────────
@@ -396,6 +438,18 @@ impl Config {
         let heartbeat_interval = std::time::Duration::from_secs(
             self.control_plane.heartbeat_interval_secs.max(5),
         );
+
+        // ── install_token resolution (env var takes precedence over TOML) ───
+        let control_plane_install_token = match std::env::var("INSTALL_TOKEN") {
+            Ok(val) if !val.is_empty() => Some(val),
+            _ => self.control_plane.install_token.clone(),
+        };
+
+        if control_plane_enabled && control_plane_install_token.is_none() {
+            tracing::warn!(
+                "control_plane.install_token is not set — the cloud cannot authenticate this bridge on registration"
+            );
+        }
 
         // ── Key rotation validation ─────────────────────────────────────────
         if self.key_rotation.max_bytes_per_key < 1_048_576 {
@@ -552,6 +606,7 @@ impl Config {
             admin_control_plane_vk_path: self.admin.control_plane_vk_path,
             admin_rate_limit_per_second: self.admin.rate_limit_per_second,
             admin_handshake_timeout_secs: self.admin.handshake_timeout_secs,
+            control_plane_install_token,
         })
     }
 }
@@ -1058,5 +1113,117 @@ handshake_timeout_secs = 30
         );
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("rate_limit_per_second"), "got: {err}");
+    }
+
+    // ── install_token tests ───────────────────────────────────────────────────
+    // All env-var resolution cases are combined into one test to guarantee
+    // sequential execution. std::env is process-global; parallel tests that
+    // set/unset INSTALL_TOKEN race even with a mutex in some test harness
+    // configurations.
+
+    #[test]
+    fn install_token_env_var_resolution() {
+        // Case 1: TOML field accepted when env var absent
+        std::env::remove_var("INSTALL_TOKEN");
+        let f = write_toml("[control_plane]\ninstall_token = \"toml-token\"\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.control_plane_install_token,
+            Some("toml-token".to_string()),
+            "TOML install_token should be loaded into ValidConfig"
+        );
+
+        // Case 2: env var takes precedence over TOML
+        std::env::set_var("INSTALL_TOKEN", "env-token");
+        let f = write_toml("[control_plane]\ninstall_token = \"toml-token\"\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.control_plane_install_token,
+            Some("env-token".to_string()),
+            "env var INSTALL_TOKEN must take precedence over TOML install_token"
+        );
+
+        // Case 3: empty env var treated as absent — TOML value used
+        std::env::set_var("INSTALL_TOKEN", "");
+        let f = write_toml("[control_plane]\ninstall_token = \"toml-token\"\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.control_plane_install_token,
+            Some("toml-token".to_string()),
+            "empty INSTALL_TOKEN env var should fall back to TOML value"
+        );
+
+        // Case 4: None when neither TOML nor env var is set
+        std::env::remove_var("INSTALL_TOKEN");
+        let f = write_toml("[control_plane]\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.control_plane_install_token,
+            None,
+            "control_plane_install_token should be None when neither TOML nor env var is set"
+        );
+
+        // Cleanup
+        std::env::remove_var("INSTALL_TOKEN");
+    }
+
+    #[test]
+    fn valid_config_debug_redacts_install_token() {
+        // Build a minimal ValidConfig with a known token value
+        let cfg = ValidConfig {
+            listen_addr: "127.0.0.1:8443".parse().unwrap(),
+            backend_addr: "127.0.0.1:8080".parse().unwrap(),
+            metrics_addr: "127.0.0.1:8444".parse().unwrap(),
+            max_frame_size: 65536,
+            signing_key_path: PathBuf::from("./keys/server.sk"),
+            log_level: "info".to_string(),
+            control_plane_enabled: false,
+            control_plane_endpoint: String::new(),
+            control_plane_agent_name: String::new(),
+            heartbeat_interval: std::time::Duration::from_secs(30),
+            key_rotation_enabled: false,
+            max_bytes_per_key: 10_737_418_240,
+            key_rotation_interval: std::time::Duration::from_secs(86_400),
+            tls_enabled: false,
+            tls_listen_addr: "127.0.0.1:8440".parse().unwrap(),
+            tls_cert_path: PathBuf::from("./keys/tls.crt"),
+            tls_key_path: PathBuf::from("./keys/tls.key"),
+            quic_enabled: false,
+            quic_listen_addr: "127.0.0.1:8441".parse().unwrap(),
+            quic_cert_path: PathBuf::from("./keys/tls.crt"),
+            quic_key_path: PathBuf::from("./keys/tls.key"),
+            client_auth_enabled: false,
+            client_vk_path: None,
+            admin_enabled: false,
+            admin_listen_addr: "127.0.0.1:8445".parse().unwrap(),
+            admin_control_plane_vk_path: None,
+            admin_rate_limit_per_second: 5,
+            admin_handshake_timeout_secs: 10,
+            control_plane_install_token: Some("super-secret-value".to_string()),
+        };
+
+        let debug_str = format!("{cfg:?}");
+        assert!(
+            !debug_str.contains("super-secret-value"),
+            "Debug output must NOT contain the raw token value, got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug output must contain '[REDACTED]', got: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn control_plane_enabled_no_install_token_does_not_error() {
+        // Ensure no INSTALL_TOKEN env var from a parallel test contaminates this assertion.
+        std::env::remove_var("INSTALL_TOKEN");
+        // control_plane.enabled = true with valid endpoint but no install_token is non-fatal
+        let f = write_toml(
+            "[control_plane]\nenabled = true\nendpoint = \"http://localhost:9000\"\n",
+        );
+        // Must succeed — missing install_token is a warn, not an error
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.control_plane_enabled);
+        assert_eq!(cfg.control_plane_install_token, None);
     }
 }

@@ -39,6 +39,7 @@ quinn  = { workspace = true }
 rustls = { workspace = true }
 sha2   = { workspace = true }
 uuid   = { version = "1", features = ["v4"] }
+base64 = "0.22"
 
 [dependencies.rcgen]
 version  = "0.13"

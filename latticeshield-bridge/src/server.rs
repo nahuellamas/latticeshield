@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls, vk_share};
+use crate::{config::ValidConfig, control_plane, control_plane::BridgeCommand, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls, vk_share};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
@@ -120,12 +120,18 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     info!(backend = %config.backend_addr, "backend configurado");
 
     // ── Control plane heartbeat task (non-blocking, optional) ────────────────
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<BridgeCommand>(32);
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            tracing::info!(?cmd, "BridgeCommand received (stub handler — Mes 14)");
+        }
+    });
     if config.control_plane_enabled && !config.control_plane_endpoint.is_empty() {
         let cfg = config.clone();
         let ms = Arc::clone(&metrics_state);
         let id = Arc::clone(&identity);
         tokio::spawn(async move {
-            control_plane::start(cfg, ms, id).await;
+            control_plane::start(cfg, ms, id, cmd_tx).await;
         });
     }
 
