@@ -214,6 +214,11 @@ mod tests {
             quic_key_path: std::path::PathBuf::from("./keys/tls.key"),
             client_auth_enabled: false,
             client_vk_path: None,
+            admin_enabled: false,
+            admin_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            admin_control_plane_vk_path: None,
+            admin_rate_limit_per_second: 5,
+            admin_handshake_timeout_secs: 10,
         }
     }
 
