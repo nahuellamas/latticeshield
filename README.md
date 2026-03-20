@@ -282,23 +282,27 @@ cargo build --release
 
 ## Roadmap
 
-| Month | Milestone | Status |
-|---|---|---|
-| 1 | Cryptographic engine — hybrid handshake + anti-replay | Complete |
-| 2 | TCP proxy bridge + AES-256-GCM relay | Complete |
-| 3 | ML-DSA-65 OTA signing + Prometheus observability | Complete |
-| 4–5 | Server authentication — signed ServerHello, pre-shared VK, mlock | Complete |
-| 6 | Config file (toml), control plane heartbeat, session key rotation | Complete |
-| 7 | TLS listener (rustls 0.23) + QUIC listener (quinn 0.11), standard HTTPS/QUIC clients without agent | Complete |
-| 8 | Client agent — latticeshield-client (local proxy, PQC client-side, server.vk distribution) | Complete |
-| 9 | Mutual auth (ML-DSA-65 signed ClientResponse) + reconnect/backoff in client | Complete |
-| 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner, deprecation warnings in old subcommands | Complete |
-| 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Complete |
-| 12 | Control Plane SaaS: `server_vk` in registration payload + `latticeshield vk-share` CLI | Planned |
-| 13 | Admin Post-Quantum Channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand | Complete |
-| 14 | Distribution: pre-compiled binaries (GitHub Actions) + systemd + `curl \| sh` installer | Planned |
-| 15 | Web dashboard | Planned |
-| 16 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
+### Completed
+
+| Month | Milestone |
+|---|---|
+| 1–3 | Cryptographic engine — hybrid handshake (X25519 + ML-KEM-768), anti-replay, ML-DSA-65 OTA signing, Prometheus observability |
+| 4 | Server authentication — ML-DSA-65 signed ServerHello, pre-shared VK model, mlock on signing key |
+| 5 | Bridge server auth — `ServerIdentity` load/generate, `--keygen` subcommand, file permission enforcement |
+| 6 | Config file (TOML), control plane heartbeat, session key rotation |
+| 7 | TLS listener (rustls 0.23, `:8440`) + QUIC listener (quinn 0.11, `:8441`) — standard HTTPS/QUIC clients without agent |
+| 8–9 | Client agent — local PQC proxy, mutual ML-DSA-65 auth (signed ClientResponse), reconnect/backoff |
+| 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner |
+| 11 | Connection pool in client — proactive warming, lazy close, pure tokio |
+| 12 | `server_vk` in registration payload + `latticeshield vk-share` — one-time VK distribution link (10-min expiry, single-use) |
+| 13 | Admin PQC channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand |
+
+### Upcoming
+
+| Month | Milestone |
+|---|---|
+| 14 | **Cloud Integration Foundation** — signed heartbeats (ML-DSA-65), command parsing in heartbeat response (`Rotate`, `GetVkToken`), additional metrics (`pqc_handshakes_total`, `tls_handshakes_total`, `quic_streams_total`), `install_token` for automated onboarding, Hybrid TLS (X25519Kyber768) on bridge→cloud channel |
+| 15 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
 
 ## License
 
