@@ -66,6 +66,7 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         admin_control_plane_vk_path: None,
         admin_rate_limit_per_second: 5,
         admin_handshake_timeout_secs: 10,
+        control_plane_install_token: None,
     }
 }
 
