@@ -5,55 +5,31 @@
 //! via un tokio::sync::watch::Sender<u64>. Cada sesion subscribe al mismo canal.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    http::header::CONTENT_TYPE,
     response::IntoResponse,
-    routing::{get, post},
-    Json,
+    routing::get,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
-use serde_json::json;
-use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls, vk_share::{self, VkShareStore}};
+use crate::{config::ValidConfig, control_plane, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls, vk_share};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
 #[derive(Clone)]
 pub(crate) struct MetricsAppState {
     pub prometheus_handle: PrometheusHandle,
-    pub rotate_tx: Arc<watch::Sender<u64>>,
-    pub metrics_state: Arc<MetricsState>,
-    pub vk_store: VkShareStore,
-    pub identity: Arc<ServerIdentity>,
-    pub tls_base_url: String,
-    // SECURITY: Classical bearer token — placeholder until Mes 13 replaces :8444
-    // with a full PQC channel (ML-KEM + ML-DSA mutual auth). Do NOT expose :8444
-    // publicly until then. The bearer token provides protection only against
-    // unauthenticated access over a trusted network (localhost or private VPC).
-    pub admin_token: String,
 }
 
-/// Checks that `headers` contains `Authorization: Bearer <admin_token>`.
-fn check_bearer_auth(headers: &HeaderMap, admin_token: &str) -> bool {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t == admin_token)
-        .unwrap_or(false)
-}
-
-pub async fn run(config: ValidConfig, admin_token: String) -> anyhow::Result<()> {
+pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     let metrics_handle = metrics::init()?;
     let metrics_state = MetricsState::new();
 
@@ -92,13 +68,7 @@ pub async fn run(config: ValidConfig, admin_token: String) -> anyhow::Result<()>
     // ── Metrics HTTP server (puerto dedicado, plain HTTP) ───────────────────
     let tls_base_url = format!("https://{}", config.tls_listen_addr);
     let app_state = MetricsAppState {
-        prometheus_handle: metrics_handle,
-        rotate_tx: Arc::clone(&rotate_tx),
-        metrics_state: Arc::clone(&metrics_state),
-        vk_store: Arc::clone(&vk_store),
-        identity: Arc::clone(&identity),
-        tls_base_url,
-        admin_token,
+        prometheus_handle: metrics_handle.clone(),
     };
     spawn_metrics_server(config.metrics_addr, app_state);
 
@@ -115,6 +85,33 @@ pub async fn run(config: ValidConfig, admin_token: String) -> anyhow::Result<()>
                  Hint: use `latticeshield-bridge tls-keygen ./keys` to generate a self-signed cert."
             ))?;
         spawn_tls_listener(config.clone(), Arc::new(acceptor), Arc::clone(&vk_store));
+    }
+
+    // ── Admin PQC listener (:8445 — optional) ───────────────────────────────
+    if config.admin_enabled {
+        let path = config.admin_control_plane_vk_path.as_ref()
+            .expect("admin_enabled => admin_control_plane_vk_path is Some — validado en Config::validate()");
+        let cp_vk = crate::identity::ControlPlaneVerifyingIdentity::load(path)
+            .map_err(|e| anyhow::anyhow!(
+                "no se pudo cargar la VK del control plane desde {}: {e}\n\
+                 Hint: ejecuta `latticeshield-bridge admin-keygen ./keys` para generar las claves.",
+                path.display()
+            ))?;
+        crate::admin::spawn_admin_listener(
+            config.admin_listen_addr,
+            Arc::clone(&identity),
+            Arc::new(cp_vk),
+            Arc::clone(&vk_store),
+            Arc::clone(&metrics_state),
+            Arc::clone(&rotate_tx),
+            metrics_handle.clone(),
+            tls_base_url.clone(),
+            crate::admin::AdminListenerConfig {
+                rate_limit_per_second: config.admin_rate_limit_per_second,
+                handshake_timeout_secs: config.admin_handshake_timeout_secs,
+            },
+        );
+        info!(addr = %config.admin_listen_addr, "admin PQC listener iniciado");
     }
 
     // ── TCP proxy listener ───────────────────────────────────────────────────
@@ -151,8 +148,6 @@ pub async fn run(config: ValidConfig, admin_token: String) -> anyhow::Result<()>
 pub(crate) fn metrics_app(state: MetricsAppState) -> axum::Router {
     axum::Router::new()
         .route("/metrics", get(metrics_handler))
-        .route("/rotate", post(rotate_handler))
-        .route("/vk-token", post(vk_token_handler))
         .with_state(state)
 }
 
@@ -368,199 +363,64 @@ async fn metrics_handler(State(state): State<MetricsAppState>) -> impl IntoRespo
     )
 }
 
-/// POST /rotate — envia senal de rotacion a todas las sesiones activas.
-///
-/// Incrementa el contador del watch channel. Cada sesion que escucha via
-/// rotate_rx.changed() detecta el cambio y rota su clave de sesion.
-async fn rotate_handler(State(state): State<MetricsAppState>) -> impl IntoResponse {
-    let active = state.metrics_state.connections_active.load(Ordering::Relaxed);
-    state.rotate_tx.send_modify(|counter| *counter += 1);
-    Json(json!({"rotated": active}))
-}
-
-/// POST /vk-token — generates a one-time download token for the server's VerifyingKey.
-///
-/// Requires `Authorization: Bearer <admin_token>` header.
-/// Returns JSON: `{"url": "...", "fingerprint": "...", "expires_in_secs": 600}`.
-///
-/// SECURITY: This endpoint is NOT authenticated via PQC — it uses a classical bearer token
-/// as a placeholder. Do NOT expose :8444 publicly until Mes 13 replaces this with
-/// a full PQC channel (ML-KEM + ML-DSA mutual auth).
-/// The :8444 port MUST be firewall-protected and only accessible from trusted networks.
-async fn vk_token_handler(
-    State(state): State<MetricsAppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if !check_bearer_auth(&headers, &state.admin_token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    let ttl = Duration::from_secs(vk_share::DEFAULT_TOKEN_TTL_SECS);
-    let vk_bytes = state.identity.verifying_key.to_bytes();
-    let (token, fingerprint) = vk_share::create_token(&state.vk_store, vk_bytes, ttl);
-    let url = format!("{}/vk/{}", state.tls_base_url, token);
-    Json(json!({
-        "url": url,
-        "fingerprint": fingerprint,
-        "expires_in_secs": vk_share::DEFAULT_TOKEN_TTL_SECS,
-    }))
-    .into_response()
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use axum::body::Body;
-    use tempfile::TempDir;
     use tower::ServiceExt;
 
-    fn init_metrics() -> PrometheusHandle {
+    fn make_test_state() -> MetricsAppState {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        recorder.handle()
-    }
-
-    fn make_test_identity() -> (Arc<ServerIdentity>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        crate::identity::ServerIdentity::generate_and_save(dir.path()).unwrap();
-        let identity = crate::identity::ServerIdentity::load(&dir.path().join("server.sk")).unwrap();
-        (Arc::new(identity), dir)
-    }
-
-    fn make_test_state(admin_token: &str) -> (MetricsAppState, TempDir) {
-        let prometheus_handle = init_metrics();
-        let (rotate_tx, _) = watch::channel(0u64);
-        let (identity, dir) = make_test_identity();
-        let state = MetricsAppState {
-            prometheus_handle,
-            rotate_tx: Arc::new(rotate_tx),
-            metrics_state: MetricsState::new(),
-            vk_store: vk_share::new_store(),
-            identity,
-            tls_base_url: "https://127.0.0.1:8440".to_string(),
-            admin_token: admin_token.to_string(),
-        };
-        (state, dir)
+        MetricsAppState { prometheus_handle: recorder.handle() }
     }
 
     #[tokio::test]
-    async fn post_vk_token_with_valid_bearer_returns_200_with_fields() {
-        let (state, _dir) = make_test_state("test-secret");
+    async fn post_rotate_returns_404_on_metrics_app() {
+        let state = make_test_state();
+        let app = metrics_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rotate")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn post_vk_token_returns_404_on_metrics_app() {
+        let state = make_test_state();
         let app = metrics_app(state);
 
         let req = Request::builder()
             .method("POST")
             .uri("/vk-token")
-            .header("Authorization", "Bearer test-secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_metrics_still_returns_200() {
+        let state = make_test_state();
+        let app = metrics_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/metrics")
             .body(Body::empty())
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(body["url"].as_str().is_some(), "url must be present");
-        assert!(body["fingerprint"].as_str().is_some(), "fingerprint must be present");
-        assert_eq!(body["expires_in_secs"].as_u64(), Some(600));
-        let url = body["url"].as_str().unwrap();
-        assert!(url.starts_with("https://"), "url must use https scheme");
-    }
-
-    #[tokio::test]
-    async fn post_vk_token_without_bearer_returns_401() {
-        let (state, _dir) = make_test_state("test-secret");
-        let app = metrics_app(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/vk-token")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn post_vk_token_with_wrong_bearer_returns_401() {
-        let (state, _dir) = make_test_state("test-secret");
-        let app = metrics_app(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/vk-token")
-            .header("Authorization", "Bearer wrong-token")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    // ── REQ-3.3-B: token returned in URL is actually valid in the store ─────────
-
-    #[tokio::test]
-    async fn post_vk_token_url_token_is_valid_in_store() {
-        let (state, _dir) = make_test_state("test-secret");
-        let vk_store = Arc::clone(&state.vk_store);
-        let app = metrics_app(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/vk-token")
-            .header("Authorization", "Bearer test-secret")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let url = body["url"].as_str().expect("url must be present");
-
-        // Extract the token from the URL (/vk/<token>)
-        let token = url.rsplit('/').next().expect("URL must have a token segment");
-        assert!(
-            vk_store.lock().unwrap().contains_key(token),
-            "token from URL must be present in the store"
-        );
-    }
-
-    // ── REQ-3.5-A: two POST /vk-token calls create independent tokens ─────────
-
-    #[tokio::test]
-    async fn post_vk_token_twice_creates_independent_tokens() {
-        let (state, _dir) = make_test_state("test-secret");
-        let app = metrics_app(state);
-
-        let make_req = || {
-            Request::builder()
-                .method("POST")
-                .uri("/vk-token")
-                .header("Authorization", "Bearer test-secret")
-                .body(Body::empty())
-                .unwrap()
-        };
-
-        // First call
-        let resp1 = app.clone().oneshot(make_req()).await.unwrap();
-        assert_eq!(resp1.status(), StatusCode::OK);
-        let body1_bytes = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
-        let body1: serde_json::Value = serde_json::from_slice(&body1_bytes).unwrap();
-        let url1 = body1["url"].as_str().expect("url must be present").to_string();
-
-        // Second call
-        let resp2 = app.oneshot(make_req()).await.unwrap();
-        assert_eq!(resp2.status(), StatusCode::OK);
-        let body2_bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
-        let body2: serde_json::Value = serde_json::from_slice(&body2_bytes).unwrap();
-        let url2 = body2["url"].as_str().expect("url must be present").to_string();
-
-        assert_ne!(url1, url2, "two POST /vk-token calls must return distinct URLs");
     }
 
     // ── extract_vk_token unit tests (pure, no I/O) ────────────────────────────

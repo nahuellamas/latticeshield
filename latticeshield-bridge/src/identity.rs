@@ -202,6 +202,38 @@ impl ClientVerifyingIdentity {
     }
 }
 
+/// Clave de verificacion publica del control plane para el canal admin PQC.
+/// No requiere chequeo de permisos — la VK es material publico.
+#[derive(Debug)]
+pub struct ControlPlaneVerifyingIdentity {
+    pub verifying_key: VerifyingKey,
+}
+
+impl ControlPlaneVerifyingIdentity {
+    /// Carga la clave de verificacion del control plane desde disco.
+    ///
+    /// Falla si:
+    ///   - El archivo no existe o no es legible
+    ///   - El archivo no tiene exactamente `VERIFYING_KEY_LEN` bytes
+    ///   - Los bytes no representan una VK valida
+    pub fn load(vk_path: &Path) -> Result<Self, IdentityError> {
+        let data = std::fs::read(vk_path)?;
+
+        if data.len() != VERIFYING_KEY_LEN {
+            return Err(IdentityError::InvalidSize {
+                expected: VERIFYING_KEY_LEN,
+                found: data.len(),
+            });
+        }
+
+        let buf: &[u8; VERIFYING_KEY_LEN] = data.as_slice().try_into().expect("len ya validado");
+        let verifying_key = VerifyingKey::from_bytes(buf)
+            .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+
+        Ok(Self { verifying_key })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +392,75 @@ mod tests {
         let vk_path = dir.path().join("nonexistent.vk");
         let err = ClientVerifyingIdentity::load(&vk_path).unwrap_err();
         assert!(matches!(err, IdentityError::Io(_)), "error inesperado: {err}");
+    }
+
+    // -------------------------------------------------------------------------
+    // ControlPlaneVerifyingIdentity
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cp_vk_load_roundtrip_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        ServerIdentity::generate_and_save(dir.path()).unwrap();
+        let vk_path = dir.path().join("server.vk");
+        ControlPlaneVerifyingIdentity::load(&vk_path).unwrap();
+    }
+
+    #[test]
+    fn cp_vk_load_wrong_size_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("cp.vk");
+        std::fs::write(&vk_path, &[0u8; 16]).unwrap();
+        let err = ControlPlaneVerifyingIdentity::load(&vk_path).unwrap_err();
+        assert!(
+            matches!(err, IdentityError::InvalidSize { expected: VERIFYING_KEY_LEN, .. }),
+            "error inesperado: {err}"
+        );
+    }
+
+    #[test]
+    fn cp_vk_load_missing_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("nonexistent_cp.vk");
+        let err = ControlPlaneVerifyingIdentity::load(&vk_path).unwrap_err();
+        assert!(matches!(err, IdentityError::Io(_)), "error inesperado: {err}");
+    }
+
+    #[test]
+    fn cp_vk_generated_by_admin_keygen_is_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let (sk, vk) = latticeshield_crypto::generate_keypair(&mut rand_core::OsRng);
+        std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o600)
+            .open(dir.path().join("admin.sk")).unwrap()
+            .write_all(sk.to_bytes()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o644)
+            .open(dir.path().join("admin.vk")).unwrap()
+            .write_all(vk.to_bytes()).unwrap();
+        ControlPlaneVerifyingIdentity::load(&dir.path().join("admin.vk")).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path().join("admin.sk")).unwrap().len(),
+            latticeshield_crypto::SIGNING_KEY_LEN as u64
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("admin.vk")).unwrap().len(),
+            latticeshield_crypto::VERIFYING_KEY_LEN as u64
+        );
+        // Verificar permisos de los archivos generados
+        let sk_path = dir.path().join("admin.sk");
+        let vk_path = dir.path().join("admin.vk");
+        assert_eq!(
+            std::fs::metadata(&sk_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "admin.sk debe tener permisos 0o600"
+        );
+        assert_eq!(
+            std::fs::metadata(&vk_path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "admin.vk debe tener permisos 0o644"
+        );
     }
 }
