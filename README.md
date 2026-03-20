@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Admin Post-Quantum Channel on `:8445` (2026-03-20)
+
+The bridge now exposes an optional dedicated admin channel for the control plane. When enabled, it listens on `:8445` (TCP) and requires **mutual ML-DSA-65 authentication** — both sides must prove their identity using post-quantum digital signatures before any data flows. This replaces the classical bearer-token approach for admin traffic and gives the control plane a cryptographically strong proof that it is talking to the real bridge, and vice versa. The channel is disabled by default and does not open any port unless explicitly enabled in the config file.
+
 ### Secure Key Distribution via vk-share (2026-03-19)
 
 The bridge can now hand out its digital ID card — the proof that it is a trusted server — to new client operators without requiring manual file transfers. An admin runs `latticeshield vk-share` to create a one-time download link with a 10-minute expiry, shares that link with the client operator, and the client operator uses it to fetch the key over a standard secure web connection. The link stops working after one use or after 10 minutes, whichever comes first.
@@ -15,6 +19,31 @@ We added a connection pool so that the client agent no longer waits to open a fr
 ### Unified `latticeshield` Command (2026-03-12)
 
 We added a single `latticeshield` command so that you can generate all your security keys — for the server, the client, and TLS certificates — without needing to know which internal program to call. Previously, key generation was split across two different programs; now everything lives under one roof with a guided welcome screen.
+
+## Deployment Model
+
+LatticeShield follows a **sidecar model**: each component runs on a different server, and the PQC channel protects the entire network path between them.
+
+```
+Customer frontend server              Customer backend server
+[latticeshield-client]  ──── PQC ────  [latticeshield-bridge :8443]
+        |                                         |
+  User application                        127.0.0.1:8080 (local)
+  (plain TCP :9090)                               |
+                                           [Customer API]
+```
+
+- `latticeshield-bridge` runs on the **backend server**, next to the API it protects. `backend_addr` should always point to `127.0.0.1` (or a private-network address) — the local TCP connection never leaves the machine.
+- `latticeshield-client` runs on the **frontend / client server**. It accepts plain TCP from the user application and forwards it through the PQC channel.
+- The PQC channel (ML-KEM-768 + X25519 + ML-DSA-65 + AES-256-GCM) protects the entire network path between the two servers. No plaintext ever traverses the public internet.
+
+**What the PQC channel guarantees:**
+
+| Guarantee | Mechanism |
+|---|---|
+| Nobody in the middle can read the data | AES-256-GCM encrypted channel, session key derived via HKDF from hybrid KEM |
+| Nobody can impersonate the server | ML-DSA-65 signed ServerHello, verified against a pre-shared VerifyingKey |
+| Harvest-now-decrypt-later attacks are defeated | Hybrid ML-KEM-768 + X25519: an attacker must break both algorithms to recover the session key |
 
 ## Why
 
@@ -50,6 +79,7 @@ latticeshield-client          Standard HTTPS client (curl, browser)
 | `:8440` | Standard TLS / HTTPS (rustls 0.23) | curl, browsers, any HTTPS client |
 | `:8441` | QUIC / UDP (quinn 0.11) | QUIC-capable clients |
 | `:8444` | Plain HTTP (Prometheus metrics) | Monitoring systems |
+| `:8445` | Admin PQC channel — mutual ML-DSA-65 auth (opt-in) | Control plane (cloud admin) |
 
 Backends require no changes — the proxy is transparent.
 
@@ -104,9 +134,10 @@ latticeshield/
 │       ├── http_relay.rs        # HTTP/1.1 relay for TLS listener (httparse + tokio::io::copy)
 │       ├── quic.rs              # QUIC relay (quinn 0.11) — raw bidi stream → TCP
 │       ├── identity.rs          # ServerIdentity + ClientVerifyingIdentity: load/generate ML-DSA-65 keypairs
-│       ├── config.rs            # TOML config — BridgeConfig + ValidConfig + AuthConfig
+│       ├── config.rs            # TOML config — BridgeConfig + ValidConfig + AuthConfig + AdminConfig
 │       ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
-│       └── control_plane.rs     # Heartbeat to remote control plane
+│       ├── control_plane.rs     # Heartbeat to remote control plane
+│       └── admin.rs             # Admin PQC channel (:8445) — mutual ML-DSA-65 auth (opt-in)
 ├── latticeshield-client/        # Client-side proxy agent
 │   └── src/
 │       ├── main.rs              # Entry point — tracing init, config load, server startup
@@ -119,6 +150,38 @@ latticeshield/
     └── src/
         └── main.rs              # Binary `latticeshield` — keygen server/client/tls + vk-info + ASCII banner
 ```
+
+## Configuration
+
+### Admin PQC Channel (`[admin]`)
+
+The admin channel is disabled by default. To enable it, add an `[admin]` section to the bridge config file:
+
+```toml
+[admin]
+enabled = true
+listen_addr = "0.0.0.0:8445"
+control_plane_vk_path = "./keys/cp.vk"
+# Optional — defaults shown below
+rate_limit_per_second = 5
+handshake_timeout_secs = 10
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Set to `true` to open the admin listener |
+| `listen_addr` | `0.0.0.0:8445` | Address and port for the admin PQC channel |
+| `control_plane_vk_path` | *(required when enabled)* | Path to the control plane's ML-DSA-65 verifying key |
+| `rate_limit_per_second` | `5` | Max handshake attempts per second from a single IP |
+| `handshake_timeout_secs` | `10` | Seconds before an incomplete handshake is aborted |
+
+#### Generating the admin keypair
+
+```sh
+latticeshield-bridge admin-keygen ./keys
+```
+
+This writes `admin.sk` (0o600) and `admin.vk` (0o644) to `./keys`. The bridge loads `admin.sk` at startup to sign its side of the mutual handshake. The control plane must hold a copy of `admin.vk`, and the bridge must hold a copy of the control plane's `cp.vk` (set in `control_plane_vk_path`).
 
 ## Security Constraints
 
@@ -169,7 +232,7 @@ cargo build --release
 
 ## Tests
 
-215 unit + integration tests across all four crates — all passing.
+285 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -180,17 +243,18 @@ cargo build --release
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (97 tests)
+### latticeshield-bridge (197 tests)
 
 | Module | Tests |
 |---|---|
-| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, auth config, port collision detection |
+| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, auth config, admin config (enabled/disabled/field validation/port collision), port collision detection |
 | `tls` | `build_server_config`, `build_acceptor`, cert/key loading, self-signed generation (feature-gated) |
 | `http_relay` | HTTP head parsing (complete/partial/oversized), GET forwarding, POST with body, backend down → 502 |
 | `quic` | `build_endpoint`, `relay_stream` end-to-end, backend down → error, normal connection close |
 | `identity` | ServerIdentity: generate_and_save (files, permissions, sizes), load roundtrip, error paths. ClientVerifyingIdentity: load roundtrip, wrong size rejected |
 | `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
+| `admin` | Mutual ML-DSA-65 handshake (full round-trip), wrong client key rejected, `get-metrics` / `rotate` / `get-vk-token` command dispatch |
 | `session` (integration) | Full PQC handshake + relay, mutual auth (with/without client auth, wrong VK rejection), tampered response rejection, key uniqueness, POST `/rotate`, time-based and byte-threshold key rotation |
 
 ### latticeshield-client (92 tests)
@@ -231,7 +295,7 @@ cargo build --release
 | 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner, deprecation warnings in old subcommands | Complete |
 | 11 | Connection pool in client — lazy close + proactive warming (no new deps, pure tokio) | Complete |
 | 12 | Control Plane SaaS: `server_vk` in registration payload + `latticeshield vk-share` CLI | Planned |
-| 13 | Admin Post-Quantum Channel (`:8444`) — ML-KEM key exchange + ML-DSA mutual auth for the control plane; separation of concerns between user traffic (`:8443`) and admin channel (`:8444`) | Planned |
+| 13 | Admin Post-Quantum Channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand | Complete |
 | 14 | Distribution: pre-compiled binaries (GitHub Actions) + systemd + `curl \| sh` installer | Planned |
 | 15 | Web dashboard | Planned |
 | 16 | eBPF/XDP rate limiter (Linux, opt-in, enterprise feature) | Planned |
