@@ -1804,3 +1804,149 @@ install_token: Option<String>,
 | `install_token_toml_field_accepted` | TOML `install_token` field parsed into `ValidConfig` |
 | `install_token_env_var_takes_precedence_over_toml` | `INSTALL_TOKEN` env var overrides TOML value |
 | `valid_config_debug_redacts_install_token` | `format!("{:?}", cfg)` does not contain the raw token value |
+
+---
+
+---
+
+# Mes 15 — Hybrid TLS + Command Wiring
+
+---
+
+## El problema que existia
+
+El transporte entre el bridge y el cloud control plane usaba `reqwest` con `native-tls` — la misma TLS clasica vulnerable a ataques cuanticos que LatticeShield existe para mitigar. Toda la seguridad PQC del canal cliente→bridge se anulaba si un atacante con una computadora cuantica podia interceptar el canal bridge→cloud y leer heartbeats, tokens de instalacion, o inyectar respuestas falsas con `BridgeCommand`.
+
+Por otro lado, el pipeline de `BridgeCommand` estaba incompleto. Mes 14 introdujo la deserializacion de comandos desde la respuesta del heartbeat y un canal mpsc para despacharlos, pero el receptor era un stub que solo logueaba los comandos recibidos. Un `BridgeCommand::Rotate` enviado desde el cloud no generaba ninguna rotacion real de claves.
+
+Mes 15 cierra ambos gaps:
+1. El transporte HTTP saliente del bridge (heartbeats + registro) ahora usa rustls con X25519MLKEM768 — intercambio de claves hibrido post-cuantico.
+2. El stub drainer se reemplaza con un handler real que ejecuta la rotacion de claves e incrementa las metricas.
+
+---
+
+## latticeshield-bridge/Cargo.toml — cambio de feature de reqwest
+
+El cambio critico es una sola linea en las dependencias:
+
+```toml
+# Antes (Mes 14):
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+# Despues (Mes 15):
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
+```
+
+La diferencia es el sufijo `-no-provider`. Esto le dice a reqwest: "usa rustls para TLS, confia en los certificados raiz del sistema operativo, pero NO instales tu propio CryptoProvider — usa el que ya esta instalado en el proceso".
+
+### Por que `-no-provider` y no la variante normal?
+
+El workspace ya usa `rustls` directamente (para los listeners TLS y QUIC) con `aws-lc-rs` como CryptoProvider. rustls tiene un mecanismo de "CryptoProvider global" que se instala una sola vez por proceso. Si reqwest instala su propio provider (ring, que es el default de la variante sin `-no-provider`), hay dos providers compitiendo y rustls hace panic.
+
+La variante `-no-provider` delega al provider ya instalado (`aws-lc-rs`), que soporta la suite X25519MLKEM768. Esto significa que cuando reqwest negocia TLS con el cloud, si el servidor cloud soporta X25519MLKEM768, el handshake usa intercambio de claves hibrido post-cuantico automaticamente. Si el servidor no lo soporta, cae a X25519 clasico. El bridge no necesita saber — rustls negocia la mejor suite disponible.
+
+### Por que `native-roots` y no `webpki-roots`?
+
+`native-roots` usa los certificados raiz del sistema operativo (via `rustls-native-certs`). `webpki-roots` usa un bundle estatico embebido en el binario. El comportamiento anterior con `native-tls` usaba los certificados del OS, asi que `native-roots` mantiene la compatibilidad exacta — los mismos CAs que confiaba antes siguen siendo confiados. Ademas, si un operador agrega un CA interno al trust store del OS, el bridge lo reconoce sin recompilar.
+
+### Eliminacion de ring como dependencia
+
+Un efecto secundario positivo: con `-no-provider`, reqwest no trae `ring` como dependencia. El workspace queda con un unico proveedor criptografico (`aws-lc-rs`) en lugar de dos (`aws-lc-rs` + `ring`). Menos codigo compilado, menos superficie de ataque, menos binario.
+
+---
+
+## latticeshield-bridge/src/server.rs — BridgeCommand handler
+
+El stub drainer de Mes 14 era esto:
+
+```rust
+// Mes 14 — stub: solo loguea
+tokio::spawn(async move {
+    while let Some(cmd) = cmd_rx.recv().await {
+        tracing::info!(?cmd, "BridgeCommand received (stub — no action)");
+    }
+});
+```
+
+Mes 15 lo reemplaza con un handler real:
+
+```rust
+tokio::spawn(async move {
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            BridgeCommand::Rotate => {
+                // Incrementa el watch channel — todas las sesiones activas detectan
+                // el cambio via rotate_rx.changed() y rotan su clave
+                rotate_tx.send_modify(|c| *c += 1);
+                let active = metrics_state.connections_active
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                metrics_state.key_rotations_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    active_sessions = active,
+                    "BridgeCommand::Rotate executed — key rotation triggered"
+                );
+            }
+            BridgeCommand::Unknown => {
+                tracing::warn!("unknown BridgeCommand received, skipping");
+            }
+        }
+    }
+});
+```
+
+### Como funciona la rotacion
+
+El patron es identico al que usa `admin.rs` para el comando `AdminCommand::Rotate`:
+
+1. `rotate_tx.send_modify(|c| *c += 1)` — modifica el valor del watch channel atomicamente. Todas las sesiones PQC activas que llamaron a `rotate_tx.subscribe()` reciben una notificacion via `rotate_rx.changed()`.
+
+2. Cada sesion (en `session.rs`) tiene un brazo en su `select!` que espera `rotate_rx.changed()`. Cuando detecta el cambio, genera un nonce aleatorio, envia un frame `KEY_ROTATE` al cliente, y llama a `channel.rotate_key(nonce)`. El cliente hace lo mismo. La clave de sesion queda renovada.
+
+3. `metrics_state.key_rotations_total.fetch_add(1, ...)` incrementa el contador Prometheus `latticeshield_key_rotations_total`. Esto permite que el operador vea en Grafana cuantas rotaciones se dispararon desde el cloud vs. por tiempo vs. por bytes.
+
+### Por que reutilizar el patron de admin.rs?
+
+Porque es exactamente la misma operacion. El admin channel (`:8445`) ya tenia `handle_rotate()` que hacia `rotate_tx.send_modify(|c| *c += 1)` + `metrics.key_rotations_total.fetch_add(1)`. Duplicar el patron en lugar de extraer una funcion compartida fue una decision consciente: el handler del mpsc channel es un closure async dentro de `server::run()`, y el handler del admin es una funcion libre en `admin.rs`. Extraer una funcion compartida requeriria pasar `Arc<watch::Sender>` + `Arc<MetricsState>` como parametros, lo cual agrega complejidad sin beneficio real — el cuerpo es de 5 lineas.
+
+---
+
+## El flujo completo: cloud → bridge → sesiones
+
+Con Mes 14 + 15, el ciclo completo de un `BridgeCommand::Rotate` originado en el cloud es:
+
+```
+Cloud API                  Bridge control_plane.rs        Bridge server.rs             Sessions
+   |                              |                             |                         |
+   |  HeartbeatResponse           |                             |                         |
+   |  {pending_commands:          |                             |                         |
+   |    [{"type":"Rotate"}]}      |                             |                         |
+   |----------------------------->|                             |                         |
+   |                              | deserializa BridgeCommand   |                         |
+   |                              | filtra Unknown              |                         |
+   |                              | cmd_tx.send(Rotate)         |                         |
+   |                              |---------------------------->|                         |
+   |                              |                             | rotate_tx.send_modify() |
+   |                              |                             | key_rotations_total += 1|
+   |                              |                             |------------------------>|
+   |                              |                             |                         | rotate_rx.changed()
+   |                              |                             |                         | KEY_ROTATE frame
+   |                              |                             |                         | channel.rotate_key()
+```
+
+Todo el camino es asincrono y no-bloqueante. El heartbeat loop no espera a que la rotacion termine — el mpsc channel desacopla la recepcion de la ejecucion.
+
+---
+
+## Test coverage (+4 tests, 299 total despues de Mes 15)
+
+Los 4 tests nuevos estan en `server.rs` y cubren el dispatch de `BridgeCommand`:
+
+| Test | Que verifica |
+|------|-------------|
+| `bridge_command_rotate_increments_rotate_tx` | `BridgeCommand::Rotate` incrementa el watch channel a 1 |
+| `bridge_command_rotate_increments_key_rotations_metric` | `BridgeCommand::Rotate` incrementa `key_rotations_total` a 1 |
+| `bridge_command_unknown_does_not_touch_rotate_tx_or_metrics` | `BridgeCommand::Unknown` no modifica rotate_tx ni metricas |
+| `bridge_command_multiple_rotates_increment_n_times` | 3 Rotates consecutivos → rotate_tx=3, key_rotations_total=3 |
+
+Los tests usan un helper `spawn_cmd_handler()` que replica exactamente el closure del handler de produccion. Cada test crea su propio `MetricsState` y `watch::channel` aislados — sin estado compartido entre tests.
