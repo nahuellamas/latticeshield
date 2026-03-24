@@ -121,11 +121,27 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
 
     // ── Control plane heartbeat task (non-blocking, optional) ────────────────
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<BridgeCommand>(32);
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            tracing::info!(?cmd, "BridgeCommand received (stub handler — Mes 14)");
-        }
-    });
+    {
+        let rotate_tx = Arc::clone(&rotate_tx);
+        let metrics_state = Arc::clone(&metrics_state);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    BridgeCommand::Rotate => {
+                        rotate_tx.send_modify(|c| *c += 1);
+                        let active = metrics_state.connections_active
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        metrics_state.key_rotations_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(active_sessions = active, "BridgeCommand::Rotate executed — key rotation triggered");
+                    }
+                    BridgeCommand::Unknown => {
+                        tracing::warn!("unknown BridgeCommand received, skipping");
+                    }
+                }
+            }
+        });
+    }
     if config.control_plane_enabled && !config.control_plane_endpoint.is_empty() {
         let cfg = config.clone();
         let ms = Arc::clone(&metrics_state);
@@ -537,6 +553,122 @@ mod tests {
         assert!(
             matches!(result, HeadResult::Eof),
             "expected Eof when client drops connection"
+        );
+    }
+
+    // ── BridgeCommand dispatch tests ─────────────────────────────────────────
+
+    /// Helper: spawn the same command handler task used in server::run(),
+    /// returning the mpsc sender and a watch receiver to observe rotate_tx changes.
+    fn spawn_cmd_handler(
+        metrics_state: Arc<MetricsState>,
+        rotate_tx: Arc<watch::Sender<u64>>,
+    ) -> (tokio::sync::mpsc::Sender<BridgeCommand>, watch::Receiver<u64>) {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<BridgeCommand>(32);
+        let rotate_rx = rotate_tx.subscribe();
+        {
+            let rotate_tx = Arc::clone(&rotate_tx);
+            let metrics_state = Arc::clone(&metrics_state);
+            tokio::spawn(async move {
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        BridgeCommand::Rotate => {
+                            rotate_tx.send_modify(|c| *c += 1);
+                            let active = metrics_state.connections_active
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            metrics_state.key_rotations_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::info!(active_sessions = active, "BridgeCommand::Rotate executed — key rotation triggered");
+                        }
+                        BridgeCommand::Unknown => {
+                            tracing::warn!("unknown BridgeCommand received, skipping");
+                        }
+                    }
+                }
+            });
+        }
+        (cmd_tx, rotate_rx)
+    }
+
+    #[tokio::test]
+    async fn bridge_command_rotate_increments_rotate_tx() {
+        let ms = MetricsState::new();
+        let (rotate_tx, _) = watch::channel(0u64);
+        let rotate_tx = Arc::new(rotate_tx);
+        let (cmd_tx, mut rotate_rx) = spawn_cmd_handler(ms, Arc::clone(&rotate_tx));
+
+        cmd_tx.send(BridgeCommand::Rotate).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), rotate_rx.changed())
+            .await
+            .expect("timeout waiting for rotate_rx")
+            .expect("rotate_rx changed failed");
+        assert_eq!(*rotate_rx.borrow(), 1, "rotate_tx should have been incremented to 1");
+    }
+
+    #[tokio::test]
+    async fn bridge_command_rotate_increments_key_rotations_metric() {
+        let ms = MetricsState::new();
+        let (rotate_tx, _) = watch::channel(0u64);
+        let rotate_tx = Arc::new(rotate_tx);
+        let (cmd_tx, mut rotate_rx) = spawn_cmd_handler(Arc::clone(&ms), Arc::clone(&rotate_tx));
+
+        cmd_tx.send(BridgeCommand::Rotate).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), rotate_rx.changed())
+            .await.unwrap().unwrap();
+        assert_eq!(
+            ms.key_rotations_total.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "key_rotations_total should be 1 after one Rotate"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_command_unknown_does_not_touch_rotate_tx_or_metrics() {
+        let ms = MetricsState::new();
+        let (rotate_tx, _) = watch::channel(0u64);
+        let rotate_tx = Arc::new(rotate_tx);
+        let (cmd_tx, mut rotate_rx) = spawn_cmd_handler(Arc::clone(&ms), Arc::clone(&rotate_tx));
+
+        cmd_tx.send(BridgeCommand::Unknown).await.unwrap();
+        // Give the handler time to process
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // rotate_rx should NOT have changed
+        assert!(
+            rotate_rx.has_changed().is_ok_and(|changed| !changed),
+            "rotate_tx should NOT change on Unknown command"
+        );
+        assert_eq!(
+            ms.key_rotations_total.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "key_rotations_total should remain 0 on Unknown command"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_command_multiple_rotates_increment_n_times() {
+        let ms = MetricsState::new();
+        let (rotate_tx, _) = watch::channel(0u64);
+        let rotate_tx = Arc::new(rotate_tx);
+        let (cmd_tx, mut rotate_rx) = spawn_cmd_handler(Arc::clone(&ms), Arc::clone(&rotate_tx));
+
+        for _ in 0..3 {
+            cmd_tx.send(BridgeCommand::Rotate).await.unwrap();
+        }
+        // Drop sender so handler task ends after processing all 3
+        drop(cmd_tx);
+        // Wait until rotate_tx reaches 3 (watch coalesces rapid changes)
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while *rotate_rx.borrow() < 3 {
+            if tokio::time::Instant::now() > deadline {
+                panic!("timeout: rotate_tx value is {} (expected 3)", *rotate_rx.borrow());
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), rotate_rx.changed()).await;
+        }
+        assert_eq!(*rotate_rx.borrow(), 3, "rotate_tx value should be 3 after 3 Rotates");
+        assert_eq!(
+            ms.key_rotations_total.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "key_rotations_total should be 3 after 3 Rotates"
         );
     }
 }
