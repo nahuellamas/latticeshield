@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Hybrid Post-Quantum TLS and Cloud Command Wiring (2026-03-24)
+
+The bridge now uses post-quantum-safe encryption when talking to the cloud management server. Before this release, status updates and registration requests traveled over standard TLS, which a future quantum computer could break. Now the bridge negotiates a hybrid key exchange (that means: two independent mathematical locks — one classical, one quantum-resistant — must both be broken to read the data). Additionally, when the cloud sends a "rotate keys" instruction inside a status-update response, the bridge now actually performs the rotation across all active client sessions instead of just logging it. Operators can see rotation events in their monitoring dashboards.
+
 ### Signed Heartbeats and Cloud Onboarding Token (2026-03-20)
 
 The bridge now proves its identity to the cloud management server on every status update it sends. Before this release, any process that knew the bridge's ID could send fake status updates — there was no way for the server to tell real updates from imposters. Now every update carries a digital signature (that means: a mathematical proof, like a wax seal, that only this specific bridge can produce). The cloud can verify that seal without storing any secret. Operators can also configure a one-time onboarding token (a short secret code the cloud issues when you register a new bridge) so that only bridges holding that code can claim an agent slot — the token never appears in any log file, no matter the log level.
@@ -210,7 +214,8 @@ This writes `admin.sk` (0o600) and `admin.vk` (0o644) to `./keys`. The bridge lo
 | `aes-gcm` | 0.10 | AEAD encryption |
 | `tokio` | 1 | Async runtime |
 | `quinn` | 0.11 | QUIC transport |
-| `rustls` | 0.23 | TLS with post-quantum support |
+| `rustls` | 0.23 | TLS with post-quantum support (X25519MLKEM768) |
+| `reqwest` | 0.12 | HTTP client for control plane (rustls backend, hybrid PQ key exchange) |
 | `axum` | 0.7 | Control plane HTTP API |
 | `zeroize` | 1 | Secure key material cleanup |
 
@@ -236,7 +241,7 @@ cargo build --release
 
 ## Tests
 
-295 unit + integration tests across all four crates — all passing.
+299 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -247,7 +252,7 @@ cargo build --release
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (207 tests)
+### latticeshield-bridge (211 tests)
 
 | Module | Tests |
 |---|---|
@@ -259,6 +264,7 @@ cargo build --release
 | `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
 | `admin` | Mutual ML-DSA-65 handshake (full round-trip), wrong client key rejected, `get-metrics` / `rotate` / `get-vk-token` command dispatch |
+| `server` | BridgeCommand dispatch: Rotate increments rotate_tx + key_rotations_total, Unknown ignored, multiple Rotates accumulate correctly |
 | `session` (integration) | Full PQC handshake + relay, mutual auth (with/without client auth, wrong VK rejection), tampered response rejection, key uniqueness, POST `/rotate`, time-based and byte-threshold key rotation |
 
 ### latticeshield-client (92 tests)
@@ -301,12 +307,12 @@ cargo build --release
 | 12 | `server_vk` in registration payload + `latticeshield vk-share` — one-time VK distribution link (10-min expiry, single-use) |
 | 13 | Admin PQC channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand |
 | 14 | Cloud Integration Foundation — signed heartbeats (ML-DSA-65), `HeartbeatResponse` + `BridgeCommand` parsing, `install_token` for automated onboarding, token redaction in logs |
+| 15 | Hybrid TLS + Command Wiring — post-quantum-safe outbound HTTPS for bridge→cloud (reqwest + rustls, X25519MLKEM768), `BridgeCommand::Rotate` wired to actual key rotation |
 
 ### Upcoming
 
 | Month | Milestone |
 |---|---|
-| 15 | **Hybrid TLS + Command Wiring** — post-quantum–safe outbound HTTPS for bridge→cloud (reqwest + rustls, Hybrid TLS), wire `BridgeCommand::Rotate` to actual key rotation, cloud-side signature verification |
 | 16 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
 
 ## License

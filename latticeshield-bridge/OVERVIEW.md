@@ -10,20 +10,22 @@ This is the server-side gateway — like a security guard at the entrance of a b
 - Accepts connections from three types of clients: the LatticeShield agent, standard HTTPS web clients like browsers or curl, and QUIC (that means: a newer, faster connection protocol used by modern browsers) clients — all on separate ports.
 - Publishes live metrics (that means: a real-time count of connections, bytes, and errors) to a monitoring endpoint so you can watch what is happening.
 - Generates and manages its own signing keys so it can prove its identity to connecting clients.
-- Reports its status to a management server (that means: a central service that tracks all deployed gateways) periodically, and every report now carries a digital signature so the management server can confirm it came from the real bridge.
+- Reports its status to a management server (that means: a central service that tracks all deployed gateways) periodically, and every report carries a digital signature so the management server can confirm it came from the real bridge.
 - Issues one-time secure download links so new client operators can safely obtain the server's digital ID card without manual file transfers.
 - Accepts a one-time onboarding code (that means: a short secret issued by the management server) during first registration so only authorized bridges can join the fleet.
+- Communicates with the management server using quantum-resistant encryption (that means: even a future quantum computer cannot read the traffic between the bridge and the cloud).
+- Executes operational commands from the management server, such as rotating encryption keys across all active client sessions.
 
 ## How It Fits Together
 
-latticeshield-bridge is the server half of the system. It depends on latticeshield-crypto for all security math and exposes a library interface (that means: a set of functions other programs can call) used by latticeshield-cli to generate keys without starting the full server. latticeshield-client connects to it from the user's machine to establish an encrypted tunnel (that means: a private channel through which data flows safely). The backend service sits behind the bridge and never sees raw internet traffic. The bridge also phones home (that means: sends periodic status updates) to a cloud management server to report its health and receive operational instructions.
+latticeshield-bridge is the server half of the system. It depends on latticeshield-crypto for all security math and exposes a library interface (that means: a set of functions other programs can call) used by latticeshield-cli to generate keys without starting the full server. latticeshield-client connects to it from the user's machine to establish an encrypted tunnel (that means: a private channel through which data flows safely). The backend service sits behind the bridge and never sees raw internet traffic. The bridge also phones home (that means: sends periodic status updates) to a cloud management server to report its health and receive operational instructions — this connection is now protected with the same quantum-resistant math used between client and bridge.
 
 ## What Changed in This Release
 
-- Every status update sent to the management server now carries a digital seal (that means: a signature that only this bridge can produce, using the same key it uses to prove its identity to clients). The management server can verify the seal without storing any secret of its own.
-- The management server can now send instructions back to the bridge inside the status-update response. The first supported instruction is a key rotation request (that means: a command to generate a fresh encryption key, limiting how much data any single key ever protects).
-- Operators can now set a one-time onboarding code in the config file or as an environment variable. This code is sent once when the bridge registers with the management server. The management server uses it to confirm the bridge is legitimate before assigning it an identity. The code never appears in log files at any detail level — it is always hidden.
-- When no onboarding code is configured and the management server connection is enabled, the bridge logs a reminder so operators know the registration endpoint is open without extra protection.
+- The connection between the bridge and the cloud management server now uses quantum-resistant encryption. Previously it used standard encryption that a future quantum computer could break. Now even the management traffic is protected.
+- When the management server sends a "rotate keys" instruction, the bridge now performs the rotation across all active client sessions. Previously this instruction was received but not acted upon.
+- The bridge tracks how many key rotations were triggered by the management server, visible in the monitoring dashboard.
+- A dependency called "ring" (that means: an extra encryption library) was removed, leaving a single encryption provider for the entire program. This makes the program smaller and reduces the amount of code that needs security review.
 
 ---
-*Last updated: 2026-03-20 — latticeshield-mes14-cloud-integration*
+*Last updated: 2026-03-24 — latticeshield-mes15-hybrid-tls-commands*
