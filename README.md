@@ -313,7 +313,11 @@ cargo build --release
 
 | Month | Milestone |
 |---|---|
-| 16 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
+| 16 | **Pre-production Hardening** — Graceful shutdown in bridge (G3: copy client's SIGTERM drain pattern), replace `Mutex::unwrap()` panic in vk_share.rs (G6), fix flaky metrics-recorder test (G9) |
+| 17 | **Sequence Numbers + Framing v3** — Add monotonic counter to DATA frames (G1/D4): nonce = counter(8B) ‖ random(4B), receiver rejects counter ≤ last_seen. Wire protocol version bump. Closes theoretical replay gap |
+| 18 | **Security Enforcement** — Make client auth required by default with explicit opt-out (G2), encrypt KEY_ROTATE nonce inside a DATA frame instead of plaintext (G4), integrate AntiReplayFilter into bridge/admin handshake or remove dead code with justification (G5) |
+| 19 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin-x64/arm64, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
+| 20+ | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, bloom filter for AntiReplayFilter at scale, cloud-side heartbeat signature verification |
 
 ## License
 
