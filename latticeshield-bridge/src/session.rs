@@ -42,6 +42,7 @@ pub async fn handle(
     metrics_state: Arc<MetricsState>,
     rotate_tx: Arc<watch::Sender<u64>>,
     config: ValidConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     info!(%peer, "conexion entrante");
     metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
@@ -188,6 +189,12 @@ pub async fn handle(
                 // result.is_ok() = sender sigue activo → rotar.
                 // result.is_err() = sender caido (shutdown) → no rotar.
                 result.is_ok()
+            }
+
+            // ── Graceful shutdown signal ─────────────────────────────────────
+            _ = shutdown_rx.changed() => {
+                info!(%peer, "session: shutdown signal, stopping relay");
+                break;
             }
         };
 

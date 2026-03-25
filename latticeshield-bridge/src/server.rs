@@ -18,7 +18,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{config::ValidConfig, control_plane, control_plane::BridgeCommand, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls, vk_share};
 
@@ -36,6 +36,33 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     // ── Canal de rotacion de claves — broadcast a todas las sesiones ─────────
     let (rotate_tx, _rotate_rx_init) = watch::channel(0u64);
     let rotate_tx = Arc::new(rotate_tx);
+
+    // ── 5.1: Graceful shutdown channel + signal handler ─────────────────────
+    // _shutdown_tx is held alive until end of run() — dropping it would close the channel.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let _shutdown_tx = shutdown_tx;
+    {
+        let shutdown_tx_signal = _shutdown_tx.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let ctrl_c = tokio::signal::ctrl_c();
+                let mut sigterm = signal(SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => info!("shutdown: SIGINT received"),
+                    _ = sigterm.recv() => info!("shutdown: SIGTERM received"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+                info!("shutdown: SIGINT received");
+            }
+            let _ = shutdown_tx_signal.send(());
+        });
+    }
 
     // ── Cargar identidad del servidor (falla rapido si no existe o permisos incorrectos)
     let identity = Arc::new(
@@ -70,25 +97,30 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     let app_state = MetricsAppState {
         prometheus_handle: metrics_handle.clone(),
     };
-    spawn_metrics_server(config.metrics_addr, app_state);
+    // 5.3: metrics server with graceful shutdown
+    let metrics_handle_task = spawn_metrics_server(config.metrics_addr, app_state, shutdown_rx.clone());
 
     // ── QUIC listener (optional — only when quic.enabled = true) ────────────
-    if config.quic_enabled {
-        spawn_quic_listener(config.clone());
-    }
+    let quic_handle = if config.quic_enabled {
+        Some(spawn_quic_listener(config.clone(), shutdown_rx.clone()))
+    } else {
+        None
+    };
 
     // ── TLS listener (optional — only when tls.enabled = true) ──────────────
-    if config.tls_enabled {
+    let tls_handle = if config.tls_enabled {
         let acceptor = tls::build_acceptor(&config.tls_cert_path, &config.tls_key_path)
             .map_err(|e| anyhow::anyhow!(
                 "TLS setup failed: {e}\n\
                  Hint: use `latticeshield-bridge tls-keygen ./keys` to generate a self-signed cert."
             ))?;
-        spawn_tls_listener(config.clone(), Arc::new(acceptor), Arc::clone(&vk_store));
-    }
+        Some(spawn_tls_listener(config.clone(), Arc::new(acceptor), Arc::clone(&vk_store), shutdown_rx.clone()))
+    } else {
+        None
+    };
 
     // ── Admin PQC listener (:8445 — optional) ───────────────────────────────
-    if config.admin_enabled {
+    let admin_handle = if config.admin_enabled {
         let path = config.admin_control_plane_vk_path.as_ref()
             .expect("admin_enabled => admin_control_plane_vk_path is Some — validado en Config::validate()");
         let cp_vk = crate::identity::ControlPlaneVerifyingIdentity::load(path)
@@ -97,7 +129,7 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                  Hint: ejecuta `latticeshield-bridge admin-keygen ./keys` para generar las claves.",
                 path.display()
             ))?;
-        crate::admin::spawn_admin_listener(
+        let handle = crate::admin::spawn_admin_listener(
             config.admin_listen_addr,
             Arc::clone(&identity),
             Arc::new(cp_vk),
@@ -110,9 +142,13 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                 rate_limit_per_second: config.admin_rate_limit_per_second,
                 handshake_timeout_secs: config.admin_handshake_timeout_secs,
             },
+            shutdown_rx.clone(),
         );
         info!(addr = %config.admin_listen_addr, "admin PQC listener iniciado");
-    }
+        Some(handle)
+    } else {
+        None
+    };
 
     // ── TCP proxy listener ───────────────────────────────────────────────────
     let listener = TcpListener::bind(config.listen_addr).await?;
@@ -142,29 +178,87 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
             }
         });
     }
-    if config.control_plane_enabled && !config.control_plane_endpoint.is_empty() {
+    let cp_handle = if config.control_plane_enabled && !config.control_plane_endpoint.is_empty() {
         let cfg = config.clone();
         let ms = Arc::clone(&metrics_state);
         let id = Arc::clone(&identity);
-        tokio::spawn(async move {
-            control_plane::start(cfg, ms, id, cmd_tx).await;
-        });
-    }
+        let cp_shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            control_plane::start(cfg, ms, id, cmd_tx, cp_shutdown_rx).await;
+        }))
+    } else {
+        None
+    };
 
+    // ── 5.4: Main PQC accept loop with shutdown select ──────────────────────
+    let mut session_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut shutdown_rx_pqc = shutdown_rx.clone();
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let identity = Arc::clone(&identity);
-        let client_vk = client_vk.clone();
-        let ms = Arc::clone(&metrics_state);
-        let rtx = Arc::clone(&rotate_tx);
-        let cfg = config.clone();
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (socket, peer) = match accept_result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        error!("PQC accept error: {e}");
+                        continue;
+                    }
+                };
+                let identity = Arc::clone(&identity);
+                let client_vk = client_vk.clone();
+                let ms = Arc::clone(&metrics_state);
+                let rtx = Arc::clone(&rotate_tx);
+                let cfg = config.clone();
+                let session_shutdown_rx = shutdown_rx.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = session::handle(socket, peer, identity, client_vk, ms, rtx, cfg).await {
-                error!(%peer, "sesion error: {e:#}");
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = session::handle(socket, peer, identity, client_vk, ms, rtx, cfg, session_shutdown_rx).await {
+                        error!(%peer, "sesion error: {e:#}");
+                    }
+                });
+                session_handles.push(handle);
             }
-        });
+            _ = shutdown_rx_pqc.changed() => {
+                info!("shutdown: PQC listener stopping");
+                break;
+            }
+        }
     }
+
+    // ── Drain phase — wait for in-flight sessions ────────────────────────────
+    info!("shutdown: draining {} in-flight sessions", session_handles.len());
+    for handle in session_handles {
+        if tokio::time::timeout(config.shutdown_timeout, handle).await.is_err() {
+            warn!("shutdown: session drain timeout exceeded, forcing exit");
+        }
+    }
+
+    // Wait for listener tasks to finish
+    if let Some(h) = tls_handle {
+        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+            warn!("shutdown: TLS listener drain timeout exceeded, forcing exit");
+        }
+    }
+    if let Some(h) = quic_handle {
+        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+            warn!("shutdown: QUIC listener drain timeout exceeded, forcing exit");
+        }
+    }
+    if let Some(h) = admin_handle {
+        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+            warn!("shutdown: admin listener drain timeout exceeded, forcing exit");
+        }
+    }
+    if let Some(h) = cp_handle {
+        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+            warn!("shutdown: control_plane drain timeout exceeded, forcing exit");
+        }
+    }
+    if tokio::time::timeout(config.shutdown_timeout, metrics_handle_task).await.is_err() {
+        warn!("shutdown: metrics server drain timeout exceeded, forcing exit");
+    }
+
+    info!("shutdown: complete");
+    Ok(())
 }
 
 pub(crate) fn metrics_app(state: MetricsAppState) -> axum::Router {
@@ -256,7 +350,8 @@ fn spawn_tls_listener(
     config: ValidConfig,
     acceptor: Arc<tokio_rustls::TlsAcceptor>,
     vk_store: vk_share::VkShareStore,
-) {
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let listener = match TcpListener::bind(config.tls_listen_addr).await {
             Ok(l) => l,
@@ -268,11 +363,19 @@ fn spawn_tls_listener(
         info!(addr = %config.tls_listen_addr, "TLS (HTTPS) listener active");
 
         loop {
-            let (socket, peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!("TLS accept error: {e}");
-                    continue;
+            let (socket, peer) = tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::warn!("TLS accept error: {e}");
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("shutdown: TLS listener stopping");
+                    break;
                 }
             };
 
@@ -318,10 +421,13 @@ fn spawn_tls_listener(
                 }
             });
         }
-    });
+    })
 }
 
-fn spawn_quic_listener(config: ValidConfig) {
+fn spawn_quic_listener(
+    config: ValidConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let endpoint = match quic::build_endpoint(
             &config.quic_cert_path,
@@ -339,9 +445,18 @@ fn spawn_quic_listener(config: ValidConfig) {
         let relay = quic::QuicRelay::new(config.backend_addr);
 
         loop {
-            let connecting = match endpoint.accept().await {
-                Some(c) => c,
-                None => break, // endpoint closed cleanly
+            let connecting = tokio::select! {
+                accept_result = endpoint.accept() => {
+                    match accept_result {
+                        Some(c) => c,
+                        None => break, // endpoint closed cleanly
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("shutdown: QUIC listener stopping");
+                    endpoint.close(0u32.into(), b"shutdown");
+                    break;
+                }
             };
             let relay = relay.clone();
             tokio::spawn(async move {
@@ -357,17 +472,24 @@ fn spawn_quic_listener(config: ValidConfig) {
                 }
             });
         }
-    });
+    })
 }
 
-fn spawn_metrics_server(addr: SocketAddr, state: MetricsAppState) {
+fn spawn_metrics_server(
+    addr: SocketAddr,
+    state: MetricsAppState,
+    shutdown_rx: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let app = metrics_app(state);
 
         match TcpListener::bind(addr).await {
             Ok(listener) => {
                 info!(%addr, "metricas Prometheus disponibles en /metrics");
-                if let Err(e) = axum::serve(listener, app).await {
+                let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.clone().changed().await;
+                });
+                if let Err(e) = serve.await {
                     error!(%addr, "error en servidor de metricas: {e}");
                 }
             }
@@ -375,7 +497,7 @@ fn spawn_metrics_server(addr: SocketAddr, state: MetricsAppState) {
                 error!(%addr, "no se pudo iniciar servidor de metricas: {e}");
             }
         }
-    });
+    })
 }
 
 async fn metrics_handler(State(state): State<MetricsAppState>) -> impl IntoResponse {

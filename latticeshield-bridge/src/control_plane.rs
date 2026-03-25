@@ -86,6 +86,7 @@ pub async fn start(
     metrics: Arc<MetricsState>,
     identity: Arc<ServerIdentity>,
     cmd_tx: tokio::sync::mpsc::Sender<BridgeCommand>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) {
     let client = match Client::builder()
         .timeout(Duration::from_secs(10))
@@ -109,7 +110,13 @@ pub async fn start(
     let started_at = Instant::now();
     let mut rng = rand_core::OsRng;
     loop {
-        tokio::time::sleep(config.heartbeat_interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(config.heartbeat_interval) => { /* send heartbeat below */ }
+            _ = shutdown_rx.changed() => {
+                info!("control_plane: shutdown signal, stopping heartbeat");
+                break;
+            }
+        }
 
         let snapshot = metrics.snapshot();
         let signable = SignableHeartbeatPayload {
@@ -260,6 +267,13 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn init_crypto() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
     fn make_test_identity() -> (Arc<ServerIdentity>, TempDir) {
         let dir = TempDir::new().unwrap();
         ServerIdentity::generate_and_save(dir.path()).unwrap();
@@ -298,11 +312,13 @@ mod tests {
             admin_rate_limit_per_second: 5,
             admin_handshake_timeout_secs: 10,
             control_plane_install_token: None,
+            shutdown_timeout: Duration::from_secs(30),
         }
     }
 
     #[tokio::test]
     async fn registration_success_stores_agent_id() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/register"))
@@ -323,6 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_failure_returns_none() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/register"))
@@ -340,6 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_body_contains_correct_capabilities() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/register"))
@@ -367,6 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_body_contains_server_vk() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/register"))
@@ -413,6 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_url_includes_agent_id() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
@@ -433,6 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_body_contains_base64_signature() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
@@ -467,6 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_signature_verifies_with_verifying_key() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
@@ -505,6 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_response_empty_body_returns_default() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
@@ -531,6 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_response_rotate_command_returned() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
@@ -559,6 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_response_unknown_command_does_not_error() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
@@ -590,6 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_body_contains_install_token_when_set() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/register"))
@@ -621,6 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_body_omits_install_token_when_none() {
+        init_crypto();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/register"))
