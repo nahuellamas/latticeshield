@@ -18,7 +18,9 @@ latticeshield-crypto is the foundation that all other crates depend on. lattices
 
 ## What Changed in This Release
 
-No changes in this release.
+- The encrypted channel now keeps a counter. Every message sent through the channel gets a number, and the receiver checks that numbers always go up. If the same message arrives twice (whether by accident or because someone is trying to trick the system), the second copy is thrown away.
+- Tampering with the counter is also detected. The counter is protected by the same mathematical seal that protects the message content — changing even one digit of the counter makes the seal invalid and the message is discarded.
+- A new error type was introduced so that code calling the channel can tell the difference between a replayed message, a tampered message, a broken connection, and an invalid format — without having to guess from error text.
 
 ---
-*Last updated: 2026-03-12 — latticeshield-mes10-cli*
+*Last updated: 2026-03-25 — latticeshield-mes17-seq-numbers*

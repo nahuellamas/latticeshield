@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Replay-proof DATA frames — Framing v3 (2026-03-25)
+
+Every encrypted data frame now carries a sequence number that the receiver must see strictly increasing. If an attacker records a frame and replays it later, the bridge rejects it immediately — the sequence number would not be greater than the last accepted one. The sequence number is mathematically tied to the encrypted content (using the same authentication tag that protects the data), so tampering with it is also detectable. This closes the last theoretical replay gap in the encrypted channel.
+
 ### Pre-production Hardening (2026-03-25)
 
 The bridge now shuts down cleanly when the operating system asks it to stop. Before this release, a `systemctl restart` or a Kubernetes rolling update would cut all active connections mid-transfer. Now the bridge stops accepting new connections, waits for in-flight sessions to finish (up to 30 seconds by default, configurable via `SHUTDOWN_TIMEOUT_SECS`), and only then exits — so no connection is dropped abruptly. We also fixed a bug where a single internal error could cascade into a full crash of the key-distribution endpoint, and stabilized a test that was occasionally failing on slow machines.
@@ -245,7 +249,7 @@ cargo build --release
 
 ## Tests
 
-340 unit + integration tests across all four crates — all passing.
+309 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -253,7 +257,7 @@ cargo build --release
 |---|---|
 | `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection), mutual auth (signed ClientResponse roundtrip, wrong VK, tampered CR, wrong ServerHello) |
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
-| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
+| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained), seq monotonic increment, replay rejection, post-rotation seq reset, tampered-seq AEAD failure, sequential receive |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
 ### latticeshield-bridge (202 tests)
@@ -313,12 +317,12 @@ cargo build --release
 | 14 | Cloud Integration Foundation — signed heartbeats (ML-DSA-65), `HeartbeatResponse` + `BridgeCommand` parsing, `install_token` for automated onboarding, token redaction in logs |
 | 15 | Hybrid TLS + Command Wiring — post-quantum-safe outbound HTTPS for bridge→cloud (reqwest + rustls, X25519MLKEM768), `BridgeCommand::Rotate` wired to actual key rotation |
 | 16 | Pre-production Hardening — graceful shutdown (SIGTERM/SIGINT drain with configurable timeout), Mutex poison recovery in `vk_share.rs`, flaky test eliminated in `control_plane` and `session` |
+| 17 | Sequence Numbers + Framing v3 — monotonic `seq` (u64 BE) field in DATA frames authenticated as AEAD AAD; receiver rejects replays; `FrameError` enum; `rotate_key()` resets both counters; closes G1/D4 |
 
 ### Upcoming
 
 | Month | Milestone |
 |---|---|
-| 17 | **Sequence Numbers + Framing v3** — Add monotonic counter to DATA frames (G1/D4): nonce = counter(8B) ‖ random(4B), receiver rejects counter ≤ last_seen. Wire protocol version bump. Closes theoretical replay gap |
 | 18 | **Security Enforcement** — Make client auth required by default with explicit opt-out (G2), encrypt KEY_ROTATE nonce inside a DATA frame instead of plaintext (G4), integrate AntiReplayFilter into bridge/admin handshake or remove dead code with justification (G5) |
 | 19 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin-x64/arm64, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
 | 20+ | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, bloom filter for AntiReplayFilter at scale, cloud-side heartbeat signature verification |
