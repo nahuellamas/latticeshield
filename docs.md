@@ -2235,3 +2235,194 @@ Los 39 tests de `latticeshield-crypto` permanecen sin cambios. Los 202 tests de 
 | `shutdown_timeout_env_var_resolution` (x2) | `SHUTDOWN_TIMEOUT_SECS` ausente → 30s; presente con valor 60 → 60s |
 
 Los tests usan un helper `spawn_cmd_handler()` que replica exactamente el closure del handler de produccion. Cada test crea su propio `MetricsState` y `watch::channel` aislados — sin estado compartido entre tests.
+
+---
+
+---
+
+# Mes 17 — Numeros de secuencia y Framing v3
+
+---
+
+## El problema que existia
+
+El formato de framing v2 no tenia ningun contador en los DATA frames. Cada frame viajaba como una unidad independiente: tipo, longitud, nonce aleatorio, ciphertext. Eso significaba que si un atacante capturaba un frame cifrado y lo reenviaba mas tarde — quiza segundos despues, quiza horas — el receptor lo aceptaba sin ningun mecanismo de deteccion.
+
+El escenario de ataque concreto (gap D4 del audit de seguridad): un attacker-in-the-middle captura un DATA frame cifrado en la sesion entre el cliente y el bridge. El AEAD con nonce aleatorio garantiza que no puede leer el contenido. Pero no necesita leerlo: puede reenviar ese frame exacto mas tarde, y el receptor lo descifrara y lo procesara como si fuera un mensaje nuevo. Si ese frame contenia, por ejemplo, una instruccion de "ejecutar accion X", el replay ejecuta esa accion dos veces.
+
+La contramedida correcta no es cifrar el numero de secuencia dentro del ciphertext — eso seria circular: hay que descifrar para verificar, pero para descifrar hay que confiar en que el frame no es replay. La solucion es usar el numero de secuencia como AAD (Additional Authenticated Data): el GCM tag cubre el seq en claro, de modo que cualquier modificacion del campo seq invalida el tag. Y el receptor mantiene un contador monotono: si el seq del frame entrante no es estrictamente mayor que el ultimo seq aceptado, el frame es rechazado antes de intentar descifrar.
+
+---
+
+## latticeshield-crypto/src/channel.rs — Framing v3 y EncryptedChannel
+
+### El nuevo formato de wire: v3
+
+```
+// v2 (antes de Mes 17):
+// [0x01][4B u32 BE: ct_len][12B nonce][N bytes ciphertext + 16B GCM tag]
+// header: 17 bytes
+
+// v3 (Mes 17+):
+// [0x01][4B u32 BE: ct_len][8B u64 BE: seq][12B nonce][N bytes ciphertext + 16B GCM tag]
+// header: 25 bytes (+8 bytes)
+```
+
+El campo `seq` es un entero de 64 bits en big-endian, monotono, que empieza en 0 en cada epoca de clave. El rango maximo (2^64 - 1) es practicamente infinito: a un millon de frames por segundo, desbordaria en 584.000 anos.
+
+El cambio es incompatible con v2. No existen clientes de produccion que usen el formato viejo, asi que el break es limpio y correcto.
+
+### FrameError — error tipado en lugar de anyhow
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("replay detected: received seq {received} <= last accepted {last_seen}")]
+    Replay { received: u64, last_seen: u64 },
+    #[error("AEAD decrypt failed (tampered ciphertext or AAD)")]
+    AeadFailure,
+    #[error("invalid frame: {0}")]
+    Invalid(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+```
+
+Antes de Mes 17, los errores de `read_frame` y `write_frame` eran `anyhow::Error`. Eso obligaba a los callers a hacer pattern matching sobre strings para distinguir un replay de un error de red — fragil y propenso a regresiones silenciosas. El enum `FrameError` hace la distincion explicita en el tipo: el compilador obliga a tratar `Replay` de forma diferente a `Io`. La variant `Io(#[from] std::io::Error)` permite que el operador `?` propague automaticamente los errores de `read_exact` sin ningun `map_err` manual.
+
+### Los nuevos campos de EncryptedChannel
+
+```rust
+pub struct EncryptedChannel {
+    cipher: Aes256Gcm,
+    key_bytes: Zeroizing<[u8; 32]>,  // para el ratchet HKDF
+    max_frame_size: usize,
+    send_seq: u64,          // contador de frames enviados, arranca en 0
+    recv_seq: u64,          // ultimo seq aceptado, arranca en 0
+    recv_initialized: bool, // distingue "nunca recibido" de "recibio seq=0"
+}
+```
+
+El campo `recv_initialized` merece atencion especial. El problema del bootstrap: en el primer frame de una epoca de clave, `recv_seq == 0` y el frame tiene `seq == 0`. La condicion `wire_seq <= recv_seq` se evaluaria como `0 <= 0` → true → Replay. Eso es incorrecto: el primer frame siempre tiene seq=0 y debe ser aceptado.
+
+Una primera idea es eximir el caso `recv_seq == 0 && wire_seq == 0`. Pero eso abre una ventana: despues de aceptar el primer frame, `recv_seq` sigue siendo 0 (todavia no fue actualizado). Un replay del mismo frame pasaria la condicion de nuevo. La solucion correcta es el flag `recv_initialized`: la validacion monotona solo se activa despues de que se haya aceptado al menos un frame. El primer frame siempre pasa; todos los siguientes deben tener `seq > recv_seq`.
+
+### write_frame — AAD sobre el seq
+
+```rust
+pub async fn write_frame(
+    &mut self,
+    writer: &mut (impl AsyncWrite + Unpin),
+    data: &[u8],
+) -> Result<(), FrameError> {
+    let seq_be = self.send_seq.to_be_bytes();
+
+    let mut buf = data.to_vec();
+    // seq_be es el AAD — el GCM tag lo cubre sin cifrarlo
+    let tag = self
+        .cipher
+        .encrypt_in_place_detached(nonce, &seq_be, &mut buf)
+        .map_err(|_| FrameError::AeadFailure)?;
+
+    writer.write_all(&[FRAME_DATA]).await?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(&seq_be).await?;   // se escribe en claro
+    writer.write_all(&nonce_bytes).await?;
+    writer.write_all(&buf).await?;
+    writer.write_all(tag.as_slice()).await?;
+
+    self.send_seq += 1;
+    Ok(())
+}
+```
+
+El seq se escribe en claro en el wire (los 8 bytes despues del `len`), pero la llamada `encrypt_in_place_detached(nonce, &seq_be, &mut buf)` usa `seq_be` como AAD. El GCM tag que se produce cubre tanto el ciphertext como el AAD. Si un atacante modifica el byte del seq en el wire, el tag no coincide con la nueva combinacion (seq_modificado, ciphertext), y `decrypt_in_place_detached` falla con `AeadFailure`.
+
+### read_frame — validacion monotona y bootstrap
+
+```rust
+// Validacion monotonica:
+if self.recv_initialized && wire_seq <= self.recv_seq {
+    return Err(FrameError::Replay {
+        received: wire_seq,
+        last_seen: self.recv_seq,
+    });
+}
+
+// ... leer nonce, ciphertext+tag ...
+
+self.cipher
+    .decrypt_in_place_detached(nonce, &seq_be, &mut plaintext_buf, tag)
+    .map_err(|_| FrameError::AeadFailure)?;
+
+// Actualizar recv_seq solo despues del decrypt exitoso
+self.recv_seq = wire_seq;
+self.recv_initialized = true;
+```
+
+El orden importa: primero se verifica el seq, despues se descifra. Si el seq falla la validacion monotona, el frame se rechaza antes de gastar ciclos de CPU descifrando. Si el seq pasa pero el AEAD falla (tag incorrecto), el plaintext nunca se entrega al caller. El `recv_seq` solo se actualiza despues de que ambas validaciones tienen exito.
+
+### Por que AAD en lugar de cifrar el seq?
+
+Cifrar el seq dentro del ciphertext seria circular: para verificar el seq habria que descifrar primero, pero para decidir si descifrar habria que verificar el seq. AAD resuelve exactamente ese problema: el GCM mode autentica los bytes de AAD junto con el ciphertext, pero los bytes de AAD no forman parte del plaintext — viajan en claro y se verifican antes de que el plaintext sea accesible. El costo computacional es identico: AAD se procesa en el mismo paso de GHASH que el ciphertext, sin operacion extra.
+
+### Por que u64 y no u32?
+
+Un contador u32 desbordaria en 4.294 millones de frames. A 1 MB por frame y 1 Gbps de throughput, eso equivale a unos 34 segundos de trafico continuo antes de reutilizar seq=0. Un desbordamiento silencioso abriria la ventana de replay de nuevo. u64 hace el overflow practicamente imposible sin necesidad de codigo de mitigacion.
+
+### rotate_key() — reset de toda la epoca
+
+```rust
+pub fn rotate_key(&mut self, nonce: &[u8; 32]) {
+    // ... derivar nueva clave via HKDF-SHA256 ...
+
+    // Resetear contadores — nueva epoca de secuencia
+    self.send_seq = 0;
+    self.recv_seq = 0;
+    self.recv_initialized = false;
+}
+```
+
+Cuando se rota la clave, los contadores se resetean porque la nueva clave define una nueva epoca. Los seq de la epoca anterior no tienen significado bajo la nueva clave. Un replay de un frame de la epoca anterior bajo la nueva clave fallaria el AEAD (las claves son distintas), pero resetear los contadores es igualmente correcto y evita cualquier confusion sobre el orden relativo entre epocas.
+
+---
+
+## latticeshield-crypto/src/lib.rs — re-export de FrameError
+
+```rust
+pub use channel::{EncryptedChannel, FrameError, FrameResult};
+```
+
+`FrameError` se re-exporta desde el crate raiz para que los callers en `latticeshield-bridge` y `latticeshield-client` puedan hacer `use latticeshield_crypto::FrameError` sin conocer la estructura interna del modulo.
+
+---
+
+## Callers actualizados: admin.rs y tests.rs
+
+`write_frame` y `read_frame` son ahora `&mut self` (antes eran `&self`). Esto requirio un cambio mecanico en los callers: `let channel` → `let mut channel` en los puntos de binding. Los archivos afectados:
+
+- `latticeshield-bridge/src/admin.rs`: un binding en el handler de sesion admin
+- `latticeshield-bridge/src/tests.rs`: siete o mas bindings en los tests de integracion
+- `latticeshield-client/src/client_session.rs`: sin cambios (ya era `mut`)
+- `latticeshield-client/tests/integration.rs`: sin cambios (ya era `let mut channel`)
+- `latticeshield-crypto/src/channel.rs`: todos los tests actualizados a `mut`
+
+La propagacion de `&mut self` es consecuencia directa de que `send_seq` y `recv_seq` son estado mutable dentro del canal. No fue posible mantener la firma `&self` sin introducir un `Mutex` interno, lo que agregaria contention innecesaria — cada canal vive en una sola tarea async, no hay concurrencia dentro del canal.
+
+---
+
+## Cobertura de tests (+107 tests, 309 totales despues de Mes 17)
+
+Mes 17 agrego 6 tests unitarios nuevos en `channel.rs` y la expansion de tests de integracion llevo el total de 202 a 309.
+
+### Tests nuevos en channel.rs
+
+| Test | Que verifica |
+|------|-------------|
+| `seq_increments_monotonically` | El primer frame tiene seq=0 en wire (bytes 5..13); el segundo tiene seq=1; `send_seq` es 1 y 2 respectivamente |
+| `replay_frame_rejected` | Un frame con seq=0 leido dos veces retorna `FrameError::Replay { received: 0, last_seen: 0 }` en la segunda lectura |
+| `post_rotation_seq_resets` | Despues de `rotate_key()`, `send_seq==0`, `recv_seq==0`; el primer frame post-rotacion tiene seq=0 en wire |
+| `tampered_seq_returns_aead_failure` | Flipear un byte del campo seq en wire retorna `FrameError::AeadFailure` (el GCM tag cubre el seq como AAD) |
+| `normal_sequential_receive` | Canal A escribe 3 frames (seq 0, 1, 2), canal B los lee en orden; `recv_seq==2` al final |
+
+Los tests de rotacion existentes (`rotate_key_produces_different_ciphertext`, `rotate_key_is_deterministic_same_nonce`, `hkdf_ratchet_chain_two_rotations`) fueron actualizados para usar `let mut channel` y siguen pasando sin cambios de logica.

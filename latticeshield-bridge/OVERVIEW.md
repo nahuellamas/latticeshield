@@ -22,9 +22,7 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-- The bridge now shuts down cleanly when the operating system asks it to stop. Before this change, stopping the bridge (for example, during a server update) would cut all active connections mid-transfer. Now the bridge stops accepting new connections, lets the ones already in progress finish (waiting up to 30 seconds by default), and only then exits. This makes maintenance windows and automatic restarts invisible to end users.
-- The time the bridge waits before forcing a stop is now configurable. Set the `SHUTDOWN_TIMEOUT_SECS` environment variable to match your deployment's requirements (for example, the grace period your container platform allows before it forces a kill).
-- A rare crash bug was fixed in the key-distribution feature. If an internal error occurred at exactly the wrong moment, it could make the system for sharing digital ID cards (the verifying key) stop working entirely until the bridge was restarted. That cascade is now prevented.
+Every encrypted message sent between the bridge and a client agent now carries a sequence number (that means: a counter that goes up by one with every message). The bridge checks that each incoming message has a higher counter than the previous one. If an attacker copies a message and sends it again later, the bridge recognises that the counter is not new and discards the message immediately. The counter is protected by the same mathematical seal that protects the message content, so an attacker cannot change it without detection either.
 
 ---
-*Last updated: 2026-03-25 — latticeshield-mes16-hardening*
+*Last updated: 2026-03-25 — latticeshield-mes17-seq-numbers*
