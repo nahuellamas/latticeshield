@@ -328,6 +328,8 @@ pub struct ValidConfig {
     pub admin_rate_limit_per_second: u32,
     pub admin_handshake_timeout_secs: u64,
     pub control_plane_install_token: Option<String>,
+    /// Graceful shutdown drain timeout. Sessions still active after this duration are forced.
+    pub shutdown_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for ValidConfig {
@@ -365,6 +367,7 @@ impl std::fmt::Debug for ValidConfig {
                 "control_plane_install_token",
                 &self.control_plane_install_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
     }
 }
@@ -577,6 +580,13 @@ impl Config {
             }
         }
 
+        // ── Graceful shutdown timeout ────────────────────────────────────────
+        let shutdown_timeout_secs = std::env::var("SHUTDOWN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let shutdown_timeout = std::time::Duration::from_secs(shutdown_timeout_secs);
+
         Ok(ValidConfig {
             listen_addr,
             backend_addr,
@@ -607,6 +617,7 @@ impl Config {
             admin_rate_limit_per_second: self.admin.rate_limit_per_second,
             admin_handshake_timeout_secs: self.admin.handshake_timeout_secs,
             control_plane_install_token,
+            shutdown_timeout,
         })
     }
 }
@@ -1200,6 +1211,7 @@ handshake_timeout_secs = 30
             admin_rate_limit_per_second: 5,
             admin_handshake_timeout_secs: 10,
             control_plane_install_token: Some("super-secret-value".to_string()),
+            shutdown_timeout: std::time::Duration::from_secs(30),
         };
 
         let debug_str = format!("{cfg:?}");
@@ -1210,6 +1222,34 @@ handshake_timeout_secs = 30
         assert!(
             debug_str.contains("[REDACTED]"),
             "Debug output must contain '[REDACTED]', got: {debug_str}"
+        );
+    }
+
+    // ── shutdown_timeout env-var tests ────────────────────────────────────────
+    // Combined into one test to avoid parallel env-var race conditions.
+    // std::env is process-global; parallel tests that set/unset SHUTDOWN_TIMEOUT_SECS
+    // race even with a mutex in some test harness configurations.
+    #[test]
+    fn shutdown_timeout_env_var_resolution() {
+        // Case 1: default is 30s when env var absent
+        std::env::remove_var("SHUTDOWN_TIMEOUT_SECS");
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.shutdown_timeout,
+            std::time::Duration::from_secs(30),
+            "shutdown_timeout default must be 30s"
+        );
+
+        // Case 2: env var overrides default
+        std::env::set_var("SHUTDOWN_TIMEOUT_SECS", "60");
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        std::env::remove_var("SHUTDOWN_TIMEOUT_SECS");
+        assert_eq!(
+            cfg.shutdown_timeout,
+            std::time::Duration::from_secs(60),
+            "shutdown_timeout must be 60s when SHUTDOWN_TIMEOUT_SECS=60"
         );
     }
 

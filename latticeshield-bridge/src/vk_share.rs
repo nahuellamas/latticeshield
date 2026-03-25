@@ -60,7 +60,7 @@ pub fn create_token(store: &VkShareStore, vk_bytes: &[u8], ttl: Duration) -> (St
         expires_at: Instant::now() + ttl,
         used: false,
     };
-    store.lock().unwrap().insert(token.clone(), entry);
+    store.lock().unwrap_or_else(|e| e.into_inner()).insert(token.clone(), entry);
     (token, fingerprint)
 }
 
@@ -70,7 +70,7 @@ pub fn create_token(store: &VkShareStore, vk_bytes: &[u8], ttl: Duration) -> (St
 /// used on success, and returns the response bytes to write to the TLS stream.
 /// This function is synchronous — it only touches in-memory state.
 pub fn vk_response(token: &str, store: &VkShareStore, peer: std::net::SocketAddr) -> Vec<u8> {
-    let mut guard = store.lock().unwrap();
+    let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
     match guard.get_mut(token) {
         None => {
             tracing::debug!(%peer, token, "vk-share: token not found");
@@ -257,6 +257,55 @@ mod tests {
         // SHA-256 of empty byte slice — well-known constant
         let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert_eq!(sha256_hex(&[]), expected);
+    }
+
+    #[test]
+    fn create_token_recovers_from_poisoned_mutex() {
+        let store = new_store();
+        let store_clone = Arc::clone(&store);
+
+        // Poison the mutex by panicking while holding the lock
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store_clone.lock().unwrap();
+            panic!("intentional poison");
+        });
+
+        // Verify the mutex is poisoned
+        assert!(store.lock().is_err(), "mutex should be poisoned");
+
+        // create_token must not panic — should recover via unwrap_or_else and insert the token
+        let vk_bytes = dummy_vk_bytes();
+        let (token, _fingerprint) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+
+        // Token was actually inserted — recover from poison to inspect
+        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(guard.contains_key(&token), "token must be present after create_token on poisoned mutex");
+    }
+
+    #[test]
+    fn vk_response_recovers_from_poisoned_mutex() {
+        let store = new_store();
+        let vk_bytes = dummy_vk_bytes();
+
+        // Insert a token normally before poisoning
+        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+
+        // Poison the mutex
+        let store_clone = Arc::clone(&store);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store_clone.lock().unwrap();
+            panic!("intentional poison");
+        });
+
+        // vk_response must not panic — should recover via unwrap_or_else and return a valid response
+        let response = vk_response(&token, &store, dummy_peer());
+        let response_str = String::from_utf8(response).unwrap();
+
+        // Token was inserted before poison, so it must still be found — expect 200
+        assert!(
+            response_str.starts_with("HTTP/1.1 200 OK"),
+            "vk_response on poisoned mutex must not panic and must return 200, got: {response_str}"
+        );
     }
 
     /// REQ-7.4-A: `GET /vk/:token` response body MUST contain only `server_vk`

@@ -214,7 +214,8 @@ pub fn spawn_admin_listener(
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
     tls_base_url: String,
     config: AdminListenerConfig,
-) {
+    mut shutdown_rx: watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let listener = match TcpListener::bind(listen_addr).await {
             Ok(l) => l,
@@ -229,11 +230,19 @@ pub fn spawn_admin_listener(
         let mut rate_count: u32 = 0;
 
         loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!("admin: accept error: {e}");
-                    continue;
+            let (stream, peer) = tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!("admin: accept error: {e}");
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("shutdown: admin listener stopping");
+                    break;
                 }
             };
 
@@ -277,7 +286,7 @@ pub fn spawn_admin_listener(
                 }
             });
         }
-    });
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
