@@ -126,7 +126,7 @@ async fn handle_admin_connection(
         Ok(Ok(key)) => key,
     };
 
-    let channel = EncryptedChannel::new(session_key.as_bytes(), 64 * 1024);
+    let mut channel = EncryptedChannel::new(session_key.as_bytes(), 64 * 1024);
 
     // Read one command frame
     let frame_bytes = match channel.read_frame(&mut stream).await {

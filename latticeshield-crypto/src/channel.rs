@@ -1,23 +1,25 @@
 //! Canal cifrado con AES-256-GCM sobre TCP.
 //!
-//! Protocolo de framing v2:
+//! Protocolo de framing v3:
 //!   [1B frame type]  0x01 = DATA, 0x02 = KEY_ROTATE, 0x00 / 0x03+ = INVALID
 //!
 //! DATA frame:
-//!   [0x01][4B u32 BE: ciphertext len][12B nonce][N bytes ciphertext+GCM tag]
+//!   [0x01][4B u32 BE: ciphertext len][8B u64 BE: seq][12B nonce][N bytes ciphertext+GCM tag]
 //!
 //! KEY_ROTATE frame (33 bytes total, no encryption):
 //!   [0x02][32B rotation nonce]
 //!
 //! La clave de sesion (32B) viene del handshake hibrido PQC.
 //! Cada DATA frame tiene nonce unico — nunca se reutiliza bajo la misma clave.
+//! El campo seq (u64 BE) se autentica como AAD del GCM — no puede ser manipulado sin deteccion.
 //! rotate_key() deriva una nueva clave via HKDF-SHA256 y zeroiza la anterior.
+//! Ambos contadores (send_seq, recv_seq) se resetean a 0 en rotate_key().
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
+    aead::{AeadInPlace, KeyInit},
+    Aes256Gcm, Nonce, Tag,
 };
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
@@ -26,10 +28,24 @@ use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
+const SEQ_LEN: usize = 8;
 
 const FRAME_DATA: u8 = 0x01;
 const FRAME_KEY_ROTATE: u8 = 0x02;
 const ROTATION_HKDF_INFO: &[u8] = b"latticeshield-v1-key-rotation";
+
+/// Error de framing — distingue Replay de fallos I/O y AEAD.
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("replay detected: received seq {received} <= last accepted {last_seen}")]
+    Replay { received: u64, last_seen: u64 },
+    #[error("AEAD decrypt failed (tampered ciphertext or AAD)")]
+    AeadFailure,
+    #[error("invalid frame: {0}")]
+    Invalid(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
 
 /// Resultado de leer un frame del canal.
 #[derive(Debug)]
@@ -50,6 +66,13 @@ pub struct EncryptedChannel {
     /// Zeroizing garantiza que la clave vieja se borra de memoria al ser reemplazada.
     key_bytes: Zeroizing<[u8; 32]>,
     max_frame_size: usize,
+    /// Contador monotono de frames enviados. Se incrementa en cada write_frame exitoso.
+    send_seq: u64,
+    /// Ultimo seq aceptado en read_frame. Protege contra replay.
+    recv_seq: u64,
+    /// Indica si al menos un frame fue recibido en esta epoca de clave.
+    /// Necesario para distinguir "nunca recibido, seq=0 es bootstrap" de "ya recibio seq=0".
+    recv_initialized: bool,
 }
 
 impl EncryptedChannel {
@@ -59,75 +82,111 @@ impl EncryptedChannel {
             cipher,
             key_bytes: Zeroizing::new(*session_key),
             max_frame_size,
+            send_seq: 0,
+            recv_seq: 0,
+            recv_initialized: false,
         }
     }
 
-    /// Cifra `data` y escribe un DATA frame en `writer`.
-    /// Formato: [0x01][4B len][12B nonce][ciphertext+tag]
+    /// Cifra `data` y escribe un DATA frame v3 en `writer`.
+    /// Formato: [0x01][4B len][8B seq][12B nonce][ciphertext][16B GCM tag]
+    /// El seq se autentica como AAD — no se puede manipular sin deteccion.
     pub async fn write_frame(
-        &self,
+        &mut self,
         writer: &mut (impl AsyncWrite + Unpin),
         data: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), FrameError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self
+        let seq_be = self.send_seq.to_be_bytes();
+
+        let mut buf = data.to_vec();
+        let tag = self
             .cipher
-            .encrypt(nonce, data)
-            .map_err(|e| anyhow!("AES-GCM encrypt: {e}"))?;
+            .encrypt_in_place_detached(nonce, &seq_be, &mut buf)
+            .map_err(|_| FrameError::AeadFailure)?;
 
-        let len = ciphertext.len() as u32;
-        writer.write_all(&[FRAME_DATA]).await.context("write frame type")?;
-        writer.write_all(&len.to_be_bytes()).await.context("write frame len")?;
-        writer.write_all(&nonce_bytes).await.context("write frame nonce")?;
-        writer.write_all(&ciphertext).await.context("write frame ciphertext")?;
+        // len = ciphertext + TAG_LEN (semantica igual que v2)
+        let len = (buf.len() + TAG_LEN) as u32;
 
+        writer.write_all(&[FRAME_DATA]).await?;
+        writer.write_all(&len.to_be_bytes()).await?;
+        writer.write_all(&seq_be).await?;
+        writer.write_all(&nonce_bytes).await?;
+        writer.write_all(&buf).await?;
+        writer.write_all(tag.as_slice()).await?;
+
+        self.send_seq += 1;
         Ok(())
     }
 
     /// Lee un frame de `reader` y retorna el resultado.
     /// Dispatch basado en el tipo de frame (primer byte).
     pub async fn read_frame(
-        &self,
+        &mut self,
         reader: &mut (impl AsyncRead + Unpin),
-    ) -> anyhow::Result<FrameResult> {
+    ) -> Result<FrameResult, FrameError> {
         let mut type_buf = [0u8; 1];
-        reader.read_exact(&mut type_buf).await.context("read frame type")?;
+        reader.read_exact(&mut type_buf).await?;
 
         match type_buf[0] {
             FRAME_DATA => {
                 let mut len_buf = [0u8; 4];
-                reader.read_exact(&mut len_buf).await.context("read frame len")?;
+                reader.read_exact(&mut len_buf).await?;
                 let len = u32::from_be_bytes(len_buf) as usize;
 
                 if len < TAG_LEN || len > self.max_frame_size + TAG_LEN {
-                    return Err(anyhow!("frame invalido: len={len}"));
+                    return Err(FrameError::Invalid(format!("frame len invalido: {len}")));
+                }
+
+                // Read seq (8B) — parte del header v3
+                let mut seq_buf = [0u8; SEQ_LEN];
+                reader.read_exact(&mut seq_buf).await?;
+                let wire_seq = u64::from_be_bytes(seq_buf);
+
+                // Validacion monotonica:
+                // Bootstrap: primer frame de la epoca no ha sido recibido todavia.
+                // Si ya recibimos al menos uno, wire_seq debe ser estrictamente mayor que recv_seq.
+                if self.recv_initialized && wire_seq <= self.recv_seq {
+                    return Err(FrameError::Replay {
+                        received: wire_seq,
+                        last_seen: self.recv_seq,
+                    });
                 }
 
                 let mut nonce_bytes = [0u8; NONCE_LEN];
-                reader.read_exact(&mut nonce_bytes).await.context("read frame nonce")?;
+                reader.read_exact(&mut nonce_bytes).await?;
 
-                let mut ciphertext = vec![0u8; len];
-                reader.read_exact(&mut ciphertext).await.context("read frame ciphertext")?;
+                // len incluye el tag — leer todo como ciphertext+tag
+                let mut ct_and_tag = vec![0u8; len];
+                reader.read_exact(&mut ct_and_tag).await?;
+
+                let (ct, tag_bytes) = ct_and_tag.split_at(len - TAG_LEN);
+                let tag = Tag::from_slice(tag_bytes);
+                let mut plaintext_buf = ct.to_vec();
 
                 let nonce = Nonce::from_slice(&nonce_bytes);
-                let plaintext = self
-                    .cipher
-                    .decrypt(nonce, ciphertext.as_ref())
-                    .map_err(|_| anyhow!("AES-GCM decrypt failed — posible replay o tampering"))?;
+                let seq_be = wire_seq.to_be_bytes();
+                self.cipher
+                    .decrypt_in_place_detached(nonce, &seq_be, &mut plaintext_buf, tag)
+                    .map_err(|_| FrameError::AeadFailure)?;
 
-                Ok(FrameResult::Data(plaintext))
+                // Actualizar recv_seq solo despues del decrypt exitoso
+                self.recv_seq = wire_seq;
+                self.recv_initialized = true;
+
+                Ok(FrameResult::Data(plaintext_buf))
             }
 
             FRAME_KEY_ROTATE => {
                 let mut nonce = [0u8; 32];
-                reader.read_exact(&mut nonce).await.context("read rotation nonce")?;
+                reader.read_exact(&mut nonce).await?;
                 Ok(FrameResult::KeyRotate(nonce))
             }
 
-            other => Err(anyhow!("unknown frame type: {other:#04x}")),
+            other => Err(FrameError::Invalid(format!("unknown frame type: {other:#04x}"))),
         }
     }
 
@@ -145,6 +204,7 @@ impl EncryptedChannel {
 
     /// Deriva una nueva clave via HKDF-SHA256 y reemplaza el cipher.
     /// La clave anterior es zeroizada automaticamente cuando `key_bytes` es reemplazado.
+    /// Ambos contadores de secuencia se resetean a 0 (nueva epoca de claves).
     ///
     /// `new_key = HKDF-SHA256(ikm=current_key, salt=nonce, info="latticeshield-v1-key-rotation")`
     pub fn rotate_key(&mut self, nonce: &[u8; 32]) {
@@ -157,6 +217,11 @@ impl EncryptedChannel {
         self.cipher = Aes256Gcm::new((&*new_key).into());
         // Mover new_key a key_bytes — la clave vieja es zeroizada en el drop de key_bytes
         self.key_bytes = new_key;
+
+        // Resetear contadores — nueva epoca de secuencia
+        self.send_seq = 0;
+        self.recv_seq = 0;
+        self.recv_initialized = false;
     }
 }
 
@@ -173,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_frame_has_0x01_prefix() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let mut buf = Vec::new();
         channel.write_frame(&mut buf, b"hello").await.unwrap();
         assert_eq!(buf[0], 0x01, "DATA frame must start with 0x01");
@@ -192,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_data_roundtrip() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let payload = b"test payload for roundtrip";
         let mut buf = Vec::new();
         channel.write_frame(&mut buf, payload).await.unwrap();
@@ -206,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_key_rotate_roundtrip() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let nonce = [0x7Fu8; 32];
         let mut buf = Vec::new();
         channel.send_key_rotate(&mut buf, &nonce).await.unwrap();
@@ -220,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_unknown_type_0x00_returns_error() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let buf = vec![0x00u8]; // INVALID type
         let mut cursor = std::io::Cursor::new(buf);
         let err = channel.read_frame(&mut cursor).await.unwrap_err().to_string();
@@ -229,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_reserved_type_returns_error() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let buf = vec![0x99u8]; // RESERVED
         let mut cursor = std::io::Cursor::new(buf);
         let err = channel.read_frame(&mut cursor).await.unwrap_err().to_string();
@@ -325,5 +390,113 @@ mod tests {
             FrameResult::Data(d) => assert_eq!(d, msg2),
             _ => panic!("expected Data after second rotation"),
         }
+    }
+
+    // ── Seq number tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn seq_increments_monotonically() {
+        // Escribir 2 frames — primer frame seq=0, segundo seq=1 en wire.
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut buf = Vec::new();
+
+        channel.write_frame(&mut buf, b"frame-0").await.unwrap();
+        // seq esta en bytes 5..13 (despues de type[1] + len[4])
+        let seq0 = u64::from_be_bytes(buf[1 + 4..1 + 4 + 8].try_into().unwrap());
+        assert_eq!(seq0, 0, "first frame must have seq=0");
+        assert_eq!(channel.send_seq, 1, "send_seq must be 1 after first write");
+
+        channel.write_frame(&mut buf, b"frame-1").await.unwrap();
+        // El segundo frame empieza despues del primero
+        // Primero encontrar el offset del segundo frame:
+        // frame 0 = 1+4+8+12+len bytes; len = plaintext(7) + TAG_LEN(16) = 23
+        let frame0_len = 1 + 4 + 8 + 12 + (7 + TAG_LEN);
+        let seq1 = u64::from_be_bytes(buf[frame0_len + 1 + 4..frame0_len + 1 + 4 + 8].try_into().unwrap());
+        assert_eq!(seq1, 1, "second frame must have seq=1");
+        assert_eq!(channel.send_seq, 2, "send_seq must be 2 after second write");
+    }
+
+    #[tokio::test]
+    async fn replay_frame_rejected() {
+        // Escribir un frame (seq=0), leerlo una vez, releerlo → Replay.
+        let mut writer = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut reader = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+
+        let mut wire = Vec::new();
+        writer.write_frame(&mut wire, b"secret").await.unwrap();
+
+        // Primera lectura: debe ser Ok
+        let mut cursor = std::io::Cursor::new(wire.clone());
+        reader.read_frame(&mut cursor).await.unwrap();
+
+        // Segunda lectura del mismo frame: debe ser Replay
+        let mut cursor2 = std::io::Cursor::new(wire.clone());
+        let err = reader.read_frame(&mut cursor2).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::Replay { received: 0, last_seen: 0 }),
+            "expected Replay, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_rotation_seq_resets() {
+        let mut ch = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+
+        // Escribir 3 frames (seq 0, 1, 2)
+        let mut buf = Vec::new();
+        ch.write_frame(&mut buf, b"a").await.unwrap();
+        ch.write_frame(&mut buf, b"b").await.unwrap();
+        ch.write_frame(&mut buf, b"c").await.unwrap();
+        assert_eq!(ch.send_seq, 3);
+
+        // Rotar clave — debe resetear ambos contadores
+        ch.rotate_key(&[0xDEu8; 32]);
+        assert_eq!(ch.send_seq, 0, "send_seq must reset to 0 after rotate_key");
+        assert_eq!(ch.recv_seq, 0, "recv_seq must reset to 0 after rotate_key");
+
+        // El siguiente frame escrito debe tener seq=0
+        let mut buf2 = Vec::new();
+        ch.write_frame(&mut buf2, b"post-rotate").await.unwrap();
+        let seq = u64::from_be_bytes(buf2[1 + 4..1 + 4 + 8].try_into().unwrap());
+        assert_eq!(seq, 0, "first frame after rotation must have seq=0");
+    }
+
+    #[tokio::test]
+    async fn tampered_seq_returns_aead_failure() {
+        // Escribir un frame, flipear un byte del seq field → AeadFailure
+        let mut writer = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut reader = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+
+        let mut wire = Vec::new();
+        writer.write_frame(&mut wire, b"tamper-me").await.unwrap();
+
+        // Flipear el primer byte del seq (offset 5 = 1+4)
+        wire[5] ^= 0xFF;
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = reader.read_frame(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::AeadFailure),
+            "tampered seq must cause AeadFailure, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_sequential_receive() {
+        // Canal A escribe 3 frames, canal B los lee en orden — todo Ok, recv_seq == 2.
+        let mut chan_a = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut chan_b = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+
+        let mut wire = Vec::new();
+        chan_a.write_frame(&mut wire, b"msg-0").await.unwrap();
+        chan_a.write_frame(&mut wire, b"msg-1").await.unwrap();
+        chan_a.write_frame(&mut wire, b"msg-2").await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(wire);
+        chan_b.read_frame(&mut cursor).await.unwrap();
+        chan_b.read_frame(&mut cursor).await.unwrap();
+        chan_b.read_frame(&mut cursor).await.unwrap();
+
+        assert_eq!(chan_b.recv_seq, 2, "recv_seq must be 2 after reading 3 frames (seq 0,1,2)");
     }
 }
