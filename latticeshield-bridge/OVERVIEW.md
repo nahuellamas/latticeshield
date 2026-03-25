@@ -22,10 +22,9 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-- The connection between the bridge and the cloud management server now uses quantum-resistant encryption. Previously it used standard encryption that a future quantum computer could break. Now even the management traffic is protected.
-- When the management server sends a "rotate keys" instruction, the bridge now performs the rotation across all active client sessions. Previously this instruction was received but not acted upon.
-- The bridge tracks how many key rotations were triggered by the management server, visible in the monitoring dashboard.
-- A dependency called "ring" (that means: an extra encryption library) was removed, leaving a single encryption provider for the entire program. This makes the program smaller and reduces the amount of code that needs security review.
+- The bridge now shuts down cleanly when the operating system asks it to stop. Before this change, stopping the bridge (for example, during a server update) would cut all active connections mid-transfer. Now the bridge stops accepting new connections, lets the ones already in progress finish (waiting up to 30 seconds by default), and only then exits. This makes maintenance windows and automatic restarts invisible to end users.
+- The time the bridge waits before forcing a stop is now configurable. Set the `SHUTDOWN_TIMEOUT_SECS` environment variable to match your deployment's requirements (for example, the grace period your container platform allows before it forces a kill).
+- A rare crash bug was fixed in the key-distribution feature. If an internal error occurred at exactly the wrong moment, it could make the system for sharing digital ID cards (the verifying key) stop working entirely until the bridge was restarted. That cascade is now prevented.
 
 ---
-*Last updated: 2026-03-24 — latticeshield-mes15-hybrid-tls-commands*
+*Last updated: 2026-03-25 — latticeshield-mes16-hardening*

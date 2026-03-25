@@ -1949,4 +1949,289 @@ Los 4 tests nuevos estan en `server.rs` y cubren el dispatch de `BridgeCommand`:
 | `bridge_command_unknown_does_not_touch_rotate_tx_or_metrics` | `BridgeCommand::Unknown` no modifica rotate_tx ni metricas |
 | `bridge_command_multiple_rotates_increment_n_times` | 3 Rotates consecutivos → rotate_tx=3, key_rotations_total=3 |
 
+---
+
+---
+
+# Mes 16 — Hardening pre-produccion
+
+---
+
+## El problema que existia
+
+Tres problemas independientes habian quedado pendientes despues del audit de Mes 15. Ninguno era bloqueante para el desarrollo, pero los tres eran inaceptables para un deployment en produccion:
+
+**El bridge no se apagaba limpiamente.** Cuando el proceso recibia SIGTERM (el mecanismo estandar de apagado en Linux y macOS, usado por systemd, Docker, Kubernetes), el runtime de Tokio terminaba abruptamente. Toda sesion PQC activa en ese instante quedaba con su conexion cortada a mitad de transferencia: el cliente recibia un EOF inesperado, el backend nunca recibia el cierre limpio de TCP, y las metricas quedaban desactualizadas. Esto haria que cualquier rolling update en Kubernetes o `systemctl restart` en produccion tuviera una ventana de errores proporcional al numero de conexiones activas en ese momento.
+
+**El `Mutex` en `vk_share.rs` podia cascadear panics.** El store de tokens VK usa un `Arc<Mutex<HashMap>>`. Si un hilo panickea mientras sostiene ese lock — por ejemplo, una asercion que falla en algun codigo de respuesta — el `Mutex` queda en estado "envenenado". Con `.lock().unwrap()`, todos los llamados subsiguientes al store tambien panickean. Esto convierte un error puntual en un crash completo del servidor HTTP de metricas, inutilizando la capacidad de distribuir VKs hasta el proximo restart.
+
+**Un test de integracion era intermitentemente flaky.** `full_session_records_connections_and_bytes` usaba `sleep(150ms)` para esperar que la sesion terminara antes de verificar las metricas. En maquinas lentas o bajo carga, 150ms no era suficiente y el test fallaba con valores incorrectos. Los tests flaky degradan la confianza en el CI y enmascaran regresiones reales.
+
+---
+
+## latticeshield-bridge/src/config.rs — shutdown_timeout
+
+### El campo shutdown_timeout en ValidConfig
+
+```rust
+/// Graceful shutdown drain timeout. Sessions still active after this duration are forced.
+pub shutdown_timeout: std::time::Duration,
+```
+
+`shutdown_timeout` controla cuanto tiempo espera el proceso a que las sesiones activas terminen antes de forzar la salida. El valor se resuelve desde la variable de entorno `SHUTDOWN_TIMEOUT_SECS` en el momento de validacion del config, con default de 30 segundos:
+
+```rust
+// En Config::validate():
+let shutdown_timeout_secs = std::env::var("SHUTDOWN_TIMEOUT_SECS")
+    .ok()
+    .and_then(|v| v.parse::<u64>().ok())
+    .unwrap_or(30);  // default: 30 segundos
+let shutdown_timeout = std::time::Duration::from_secs(shutdown_timeout_secs);
+```
+
+### Por que una variable de entorno y no un campo TOML?
+
+El timeout de shutdown es tipicamente un parametro de infraestructura, no de la aplicacion. En Kubernetes, el `terminationGracePeriodSeconds` del pod define cuanto tiempo tiene el proceso antes de recibir SIGKILL. Si ese valor es 60s, el bridge necesita un `shutdown_timeout` menor (digamos 45s) para tener margen de drain antes del SIGKILL forzado. Este tipo de tuning lo maneja el operador de infra en el manifest del pod, no el desarrollador en el config.toml. Una variable de entorno es el mecanismo idiomatico para parametros que cambian entre entornos de deployment sin tocar el config de la aplicacion.
+
+---
+
+## latticeshield-bridge/src/server.rs — canal de shutdown y drain loop
+
+### El canal watch::channel<()>
+
+El patron de shutdown se construye sobre `tokio::sync::watch::channel`:
+
+```rust
+// Un sender (productor) y un receiver (consumidor inicial)
+let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+// _shutdown_tx se mantiene vivo hasta el final de run() — dropearlo cerraría el canal
+let _shutdown_tx = shutdown_tx;
+```
+
+Un `watch::channel` almacena el ultimo valor publicado. Cuando el sender llama a `.send(())`, todos los receivers activos detectan el cambio via `.changed().await`. Los receivers se clonan gratis: cada listener (TLS, QUIC, admin, control_plane, sesiones individuales) recibe su propio `shutdown_rx.clone()` al ser creado.
+
+### El handler de senales
+
+Una tarea separada escucha SIGINT y SIGTERM y notifica al canal:
+
+```rust
+tokio::spawn(async move {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c  => info!("shutdown: SIGINT received"),
+            _ = sigterm.recv() => info!("shutdown: SIGTERM received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutdown: SIGINT received");
+    }
+    // Notifica a todos los receivers via el canal watch
+    let _ = shutdown_tx_signal.send(());
+});
+```
+
+El guard `#[cfg(unix)]` existe porque `tokio::signal::unix` solo compila en Unix. En Windows (o al correr tests sin soporte de señales), el codigo cae al bloque `#[cfg(not(unix))]` que solo escucha Ctrl-C.
+
+### El loop de aceptacion PQC con select!
+
+El loop principal ya no es simplemente `listener.accept().await`:
+
+```rust
+loop {
+    tokio::select! {
+        accept_result = listener.accept() => {
+            // procesa nueva conexion, guarda el JoinHandle en session_handles
+        }
+        _ = shutdown_rx_pqc.changed() => {
+            info!("shutdown: PQC listener stopping");
+            break;
+        }
+    }
+}
+```
+
+Cuando llega la senal de shutdown, el loop sale sin aceptar nuevas conexiones. Las sesiones ya activas (sus `JoinHandle`) estan en el vector `session_handles`.
+
+### El drain loop con timeout
+
+Una vez que el loop de aceptacion sale, el proceso espera a cada tarea activa con un timeout:
+
+```rust
+info!("shutdown: draining {} in-flight sessions", session_handles.len());
+for handle in session_handles {
+    if tokio::time::timeout(config.shutdown_timeout, handle).await.is_err() {
+        warn!("shutdown: session drain timeout exceeded, forcing exit");
+    }
+}
+```
+
+El mismo patron se aplica a cada listener (TLS, QUIC, admin, control_plane, metrics):
+
+```rust
+if let Some(h) = tls_handle {
+    if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+        warn!("shutdown: TLS listener drain timeout exceeded, forcing exit");
+    }
+}
+// ... idem para quic_handle, admin_handle, cp_handle, metrics_handle_task
+```
+
+Si una tarea no termina dentro del `shutdown_timeout`, el `warn!` lo registra y el proceso continua hacia el siguiente handle. Esto garantiza que el proceso eventualmente termina incluso si una sesion esta colgada — y el log permite distinguir un shutdown limpio de uno forzado.
+
+### Por que watch::channel<()> y no CancellationToken o broadcast?
+
+Tres alternativas fueron consideradas:
+
+1. **`tokio_util::CancellationToken`**: semanticamente identico a `watch::channel<()>` para este caso de uso. La diferencia es que requiere una dependencia extra (`tokio-util`). Como el proyecto ya usa `watch` para la rotacion de claves, es consistente reusar el mismo primitivo.
+
+2. **`tokio::sync::broadcast::channel`**: diseñado para distribuir *valores* a multiples consumidores donde cada uno recibe *todos* los mensajes. Para shutdown solo necesitamos que cada listener sepa que *ocurrio* el evento — no necesitamos el historial ni multiple mensajes. `watch` es mas simple: almacena el ultimo valor y notifica el cambio.
+
+3. **`tokio::sync::oneshot`**: solo permite un receiver. Hay que clonarlo explicitamente antes de enviarlo, lo cual es menos ergonomico que `watch_rx.clone()`.
+
+`watch::channel<()>` es la opcion idiomatica en el ecosistema Tokio para shutdown broadcast de un-a-muchos cuando el "valor" no importa, solo el evento de cambio.
+
+---
+
+## latticeshield-bridge/src/session.rs — shutdown_rx en handle()
+
+`session::handle()` gana un nuevo parametro:
+
+```rust
+pub async fn handle(
+    mut client: TcpStream,
+    peer: SocketAddr,
+    identity: Arc<ServerIdentity>,
+    client_auth: Option<Arc<ClientVerifyingIdentity>>,
+    metrics_state: Arc<MetricsState>,
+    rotate_tx: Arc<watch::Sender<u64>>,
+    config: ValidConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,  // nuevo en Mes 16
+) -> anyhow::Result<()> {
+```
+
+El relay loop ya tenia multiples brazos en un `select!` (datos del cliente, datos del backend, rotacion periodica, rotacion manual). Mes 16 agrega un brazo mas:
+
+```rust
+// ── Graceful shutdown signal ─────────────────────────────────────────────
+_ = shutdown_rx.changed() => {
+    info!(%peer, "session: shutdown signal, stopping relay");
+    break;
+}
+```
+
+Cuando el proceso recibe SIGTERM, el canal de shutdown notifica a todas las sesiones activas. El `select!` en cada sesion detecta el cambio y sale del loop de relay limpiamente: el TCP se cierra por drop, el backend recibe un FIN bien formado, y las metricas de sesion activa se decrementan correctamente via los `Drop` guards.
+
+### Por que las sesiones necesitan una salida explicita?
+
+Sin el brazo de shutdown, una sesion de larga duracion (por ejemplo, un cliente con una conexion persistente) bloquearia el drain loop en `server.rs` hasta que el cliente cerrara la conexion por su cuenta. Si ese cliente tiene un timeout de minutos, el proceso esperaria esos minutos antes de terminar. Con el brazo de shutdown, el servidor puede cerrar la sesion activamente en cuanto recibe la senal, sin esperar al cliente.
+
+---
+
+## latticeshield-bridge/src/admin.rs — shutdown_rx en spawn_admin_listener()
+
+`spawn_admin_listener()` gana un parametro `shutdown_rx: watch::Receiver<()>` y el loop de aceptacion del listener admin sigue el mismo patron `select!` que el listener PQC:
+
+```rust
+loop {
+    let (stream, peer) = tokio::select! {
+        accept_result = listener.accept() => { /* ... */ }
+        _ = shutdown_rx.changed() => {
+            info!("shutdown: admin listener stopping");
+            break;
+        }
+    };
+    // ... procesamiento de la conexion
+}
+```
+
+La funcion ahora retorna `tokio::task::JoinHandle<()>` en lugar de `()`. `server.rs` guarda ese handle y lo drena en el shutdown loop.
+
+---
+
+## latticeshield-bridge/src/control_plane.rs — shutdown_rx en start()
+
+`control_plane::start()` gana un parametro `shutdown_rx: tokio::sync::watch::Receiver<()>`. El sleep entre heartbeats se reemplaza con un `select!`:
+
+```rust
+loop {
+    tokio::select! {
+        _ = tokio::time::sleep(config.heartbeat_interval) => { /* enviar heartbeat */ }
+        _ = shutdown_rx.changed() => {
+            info!("control_plane: shutdown signal, stopping heartbeat");
+            break;
+        }
+    }
+    // ... construir y enviar heartbeat
+}
+```
+
+Antes de Mes 16, un heartbeat programado para dentro de 30 segundos bloqueaba el shutdown durante hasta 30 segundos. Con el `select!`, la tarea termina en cuanto llega la senal, sin esperar al proximo intervalo.
+
+---
+
+## latticeshield-bridge/src/vk_share.rs — recuperacion de Mutex envenenado
+
+### El problema del Mutex poison
+
+Cuando un hilo de Rust panickea mientras sostiene un `MutexGuard`, el `Mutex` queda marcado como "envenenado". La logica es conservadora: un panic puede haber dejado los datos en un estado inconsistente, y Rust quiere que el codigo que intente acceder esos datos lo sepa. La forma de saberlo es que `.lock()` retorna `Err(PoisonError)` en lugar de `Ok(guard)`.
+
+Con `.lock().unwrap()`, ese `Err` se convierte en un segundo panic, que envenena el mutex de nuevo, que causa un tercer panic en la proxima llamada, y asi sucesivamente. Un unico panic en cualquier codigo que toque el store convierte todas las operaciones subsiguientes de VK share en crashes.
+
+### La solucion: unwrap_or_else(|e| e.into_inner())
+
+```rust
+// Antes (vulnerable al cascade):
+store.lock().unwrap().insert(token.clone(), entry);
+
+// Ahora (recuperacion segura):
+store.lock().unwrap_or_else(|e| e.into_inner()).insert(token.clone(), entry);
+```
+
+`PoisonError::into_inner()` retorna el `MutexGuard` que estaba activo cuando ocurrio el panic. La invariante del `HashMap` interno se mantiene: un `HashMap` no tiene invariantes de seguridad que puedan quedar violadas por un panic en codigo externo — el panic ocurrio despues de que el `HashMap` fue modificado (o sin tocarlo). Recuperar el guard y continuar es seguro porque el HashMap en si es un tipo seguro que no tiene estado corrupto observable.
+
+El mismo patron se aplica en ambas funciones que acceden al store:
+
+```rust
+// create_token():
+store.lock().unwrap_or_else(|e| e.into_inner()).insert(token.clone(), entry);
+
+// vk_response():
+let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+```
+
+### Por que es seguro aqui pero no siempre?
+
+`unwrap_or_else(|e| e.into_inner())` es seguro cuando la invariante del dato protegido no puede quedar violada por un panic en codigo externo. Para un `HashMap<String, VkShareEntry>`, no hay invariante que se pueda romper: insertar o leer del mapa son operaciones atomicas desde la perspectiva del mutex — o ocurrieron completamente antes del panic, o no ocurrieron. No hay estado intermedio observable.
+
+Si el dato protegido fuera, por ejemplo, un `struct` con dos campos que deben estar sincronizados entre si, un panic a mitad de la actualizacion podria dejar un campo actualizado y el otro no. En ese caso, recuperar el guard podria exponer datos inconsistentes, y seria mas correcto dejar el mutex envenenado o reinicializar el estado.
+
+---
+
+## Confiabilidad de tests (G9)
+
+Los cambios en la infraestructura de tests son internos y no afectan la API ni el protocolo. En resumen:
+
+- `full_session_records_connections_and_bytes` ahora espera el `JoinHandle` de la sesion directamente en lugar de un `sleep(150ms)`, eliminando la condicion de carrera.
+- Los 12 tests de `control_plane` que fallaban con "No provider set" ahora inicializan `rustls::crypto::aws_lc_rs::default_provider()` una sola vez via `std::sync::OnceLock` antes de ejecutar cualquier test que requiera TLS.
+- Las aserciones de metricas usan snapshots antes/despues del evento en lugar de asumir valores absolutos, lo que hace los tests reproducibles independientemente del orden de ejecucion.
+
+---
+
+## Cobertura de tests (241 tests totales despues de Mes 16)
+
+Los 39 tests de `latticeshield-crypto` permanecen sin cambios. Los 202 tests de `latticeshield-bridge` incluyen:
+
+| Tests nuevos | Que verifican |
+|-------------|--------------|
+| `create_token_recovers_from_poisoned_mutex` | `create_token` no panickea con un mutex envenenado y el token queda insertado |
+| `vk_response_recovers_from_poisoned_mutex` | `vk_response` no panickea con un mutex envenenado y retorna 200 para un token valido |
+| `shutdown_timeout_env_var_resolution` (x2) | `SHUTDOWN_TIMEOUT_SECS` ausente → 30s; presente con valor 60 → 60s |
+
 Los tests usan un helper `spawn_cmd_handler()` que replica exactamente el closure del handler de produccion. Cada test crea su propio `MetricsState` y `watch::channel` aislados — sin estado compartido entre tests.

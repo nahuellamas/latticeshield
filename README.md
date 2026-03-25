@@ -4,6 +4,10 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Pre-production Hardening (2026-03-25)
+
+The bridge now shuts down cleanly when the operating system asks it to stop. Before this release, a `systemctl restart` or a Kubernetes rolling update would cut all active connections mid-transfer. Now the bridge stops accepting new connections, waits for in-flight sessions to finish (up to 30 seconds by default, configurable via `SHUTDOWN_TIMEOUT_SECS`), and only then exits — so no connection is dropped abruptly. We also fixed a bug where a single internal error could cascade into a full crash of the key-distribution endpoint, and stabilized a test that was occasionally failing on slow machines.
+
 ### Hybrid Post-Quantum TLS and Cloud Command Wiring (2026-03-24)
 
 The bridge now uses post-quantum-safe encryption when talking to the cloud management server. Before this release, status updates and registration requests traveled over standard TLS, which a future quantum computer could break. Now the bridge negotiates a hybrid key exchange (that means: two independent mathematical locks — one classical, one quantum-resistant — must both be broken to read the data). Additionally, when the cloud sends a "rotate keys" instruction inside a status-update response, the bridge now actually performs the rotation across all active client sessions instead of just logging it. Operators can see rotation events in their monitoring dashboards.
@@ -241,7 +245,7 @@ cargo build --release
 
 ## Tests
 
-299 unit + integration tests across all four crates — all passing.
+340 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -252,7 +256,7 @@ cargo build --release
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained) |
 | `anti_replay` | Accept once, reject duplicate, window expiry |
 
-### latticeshield-bridge (211 tests)
+### latticeshield-bridge (202 tests)
 
 | Module | Tests |
 |---|---|
@@ -308,12 +312,12 @@ cargo build --release
 | 13 | Admin PQC channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand |
 | 14 | Cloud Integration Foundation — signed heartbeats (ML-DSA-65), `HeartbeatResponse` + `BridgeCommand` parsing, `install_token` for automated onboarding, token redaction in logs |
 | 15 | Hybrid TLS + Command Wiring — post-quantum-safe outbound HTTPS for bridge→cloud (reqwest + rustls, X25519MLKEM768), `BridgeCommand::Rotate` wired to actual key rotation |
+| 16 | Pre-production Hardening — graceful shutdown (SIGTERM/SIGINT drain with configurable timeout), Mutex poison recovery in `vk_share.rs`, flaky test eliminated in `control_plane` and `session` |
 
 ### Upcoming
 
 | Month | Milestone |
 |---|---|
-| 16 | **Pre-production Hardening** — Graceful shutdown in bridge (G3: copy client's SIGTERM drain pattern), replace `Mutex::unwrap()` panic in vk_share.rs (G6), fix flaky metrics-recorder test (G9) |
 | 17 | **Sequence Numbers + Framing v3** — Add monotonic counter to DATA frames (G1/D4): nonce = counter(8B) ‖ random(4B), receiver rejects counter ≤ last_seen. Wire protocol version bump. Closes theoretical replay gap |
 | 18 | **Security Enforcement** — Make client auth required by default with explicit opt-out (G2), encrypt KEY_ROTATE nonce inside a DATA frame instead of plaintext (G4), integrate AntiReplayFilter into bridge/admin handshake or remove dead code with justification (G5) |
 | 19 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin-x64/arm64, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
