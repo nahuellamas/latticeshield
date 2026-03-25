@@ -11,7 +11,7 @@ pub use handshake::{
     SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 pub use anti_replay::AntiReplayFilter;
-pub use channel::{EncryptedChannel, FrameResult};
+pub use channel::{EncryptedChannel, FrameError, FrameResult};
 pub use signing::{
     generate_keypair, sign, verify,
     SigningKey, SigningError, VerifyingKey, Signature,

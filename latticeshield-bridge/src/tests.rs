@@ -150,7 +150,7 @@ async fn full_pqc_handshake_and_relay() {
     client.write_all(&serialize_client_response(&response)).await.unwrap();
 
     // 4. Canal cifrado activo — enviar request
-    let channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let mut channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
     let payload = b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
     channel.write_frame(&mut client, payload).await.unwrap();
 
@@ -433,7 +433,7 @@ async fn full_session_records_connections_and_bytes() {
     let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
     client.write_all(&serialize_client_response(&response)).await.unwrap();
 
-    let channel = latticeshield_crypto::channel::EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let mut channel = latticeshield_crypto::channel::EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
     let payload = b"GET / HTTP/1.0\r\n\r\n";
     channel.write_frame(&mut client, payload).await.unwrap();
     let _ = channel.read_frame(&mut client).await.unwrap();
@@ -708,7 +708,7 @@ async fn test_session_with_client_auth() {
     client.write_all(&signed_cr).await.unwrap();
 
     // Canal cifrado activo — enviar y recibir
-    let channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let mut channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
     let payload = b"mutual auth test payload";
     channel.write_frame(&mut client, payload).await.unwrap();
 
@@ -758,7 +758,7 @@ async fn test_session_without_client_auth() {
     let (response, client_key) = client_respond(&hello, &mut OsRng).unwrap();
     client.write_all(&serialize_client_response(&response)).await.unwrap();
 
-    let channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
+    let mut channel = EncryptedChannel::new(client_key.as_bytes(), MAX_FRAME);
     let payload = b"unauthenticated path still works";
     channel.write_frame(&mut client, payload).await.unwrap();
 
@@ -915,7 +915,7 @@ async fn admin_channel_get_metrics_full_handshake() {
     client.write_all(&signed_cr).await.unwrap();
 
     // 4. Canal cifrado activo — enviar GetMetrics
-    let channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
+    let mut channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
     let cmd = CommandFrame { seq: 1, cmd: AdminCommand::GetMetrics };
     let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
     channel.write_frame(&mut client, &cmd_bytes).await.unwrap();
@@ -1072,7 +1072,7 @@ async fn admin_channel_rotate_full_handshake() {
     client.write_all(&signed_cr).await.unwrap();
 
     // 3. Enviar Rotate
-    let channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
+    let mut channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
     let cmd = CommandFrame { seq: 2, cmd: AdminCommand::Rotate };
     let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
     channel.write_frame(&mut client, &cmd_bytes).await.unwrap();
@@ -1148,7 +1148,7 @@ async fn admin_channel_get_vk_token_full_handshake() {
     client.write_all(&signed_cr).await.unwrap();
 
     // 3. Enviar GetVkToken
-    let channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
+    let mut channel = EncCh::new(client_key.as_bytes(), 64 * 1024);
     let cmd = CommandFrame { seq: 3, cmd: AdminCommand::GetVkToken };
     let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
     channel.write_frame(&mut client, &cmd_bytes).await.unwrap();
