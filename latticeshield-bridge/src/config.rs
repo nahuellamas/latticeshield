@@ -122,6 +122,8 @@ fn default_admin_listen_addr() -> String { "0.0.0.0:8445".to_string() }
 fn default_admin_rate_limit() -> u32 { 5 }
 fn default_admin_handshake_timeout() -> u64 { 10 }
 
+fn default_require_client_auth() -> bool { true }
+
 // ── AdminConfig ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,12 +156,25 @@ impl Default for AdminConfig {
 
 // ── AuthConfig ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
     /// Ruta a la clave de verificacion publica del cliente (material publico).
-    /// Si se configura, el bridge exige autenticacion mutua ML-DSA-65 del cliente.
+    /// Requerida cuando require_client_auth = true.
     pub client_vk_path: Option<PathBuf>,
+    /// Si true (default), el bridge falla al arrancar si no hay client_vk_path configurado.
+    /// Set to false para permitir conexiones sin autenticacion del cliente.
+    #[serde(default = "default_require_client_auth")]
+    pub require_client_auth: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            client_vk_path: None,
+            require_client_auth: default_require_client_auth(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -528,7 +543,15 @@ impl Config {
             }
         }
 
-        let client_auth_enabled = self.auth.client_vk_path.is_some();
+        // ── Auth validation ──────────────────────────────────────────────────
+        let require_client_auth = self.auth.require_client_auth;
+        if require_client_auth && self.auth.client_vk_path.is_none() {
+            anyhow::bail!(
+                "[auth] require_client_auth = true but client_vk_path is not set. \
+                 Configure [auth].client_vk_path or set require_client_auth = false to opt out."
+            );
+        }
+        let client_auth_enabled = require_client_auth && self.auth.client_vk_path.is_some();
         let client_vk_path = self.auth.client_vk_path;
 
         // ── Admin PQC listener validation ────────────────────────────────────
@@ -632,6 +655,11 @@ mod tests {
 
     fn write_toml(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
+        // Tests that don't set [auth] get require_client_auth = false automatically
+        // so non-auth tests don't break due to the secure-by-default requirement.
+        if !content.contains("[auth]") {
+            f.write_all(b"[auth]\nrequire_client_auth = false\n\n").unwrap();
+        }
         f.write_all(content.as_bytes()).unwrap();
         f
     }
@@ -1027,11 +1055,14 @@ listen_addr = "not_an_addr"
     // ── AuthConfig tests ──────────────────────────────────────────────────────
 
     #[test]
-    fn auth_section_absent_gives_client_auth_disabled() {
-        let f = write_toml("");
-        let cfg = Config::load(f.path()).unwrap();
-        assert!(!cfg.client_auth_enabled);
-        assert!(cfg.client_vk_path.is_none());
+    fn auth_section_absent_errors_by_default() {
+        // Bypass the write_toml helper (which disables auth) — write raw TOML to test
+        // that a real deployment without any [auth] section errors on startup.
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"").unwrap();
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("require_client_auth"), "got: {err}");
+        assert!(err.contains("client_vk_path"), "got: {err}");
     }
 
     #[test]
@@ -1043,11 +1074,31 @@ listen_addr = "not_an_addr"
     }
 
     #[test]
-    fn auth_section_without_client_vk_path_gives_client_auth_disabled() {
-        let f = write_toml("[auth]\n");
+    fn auth_opt_out_without_vk_path_gives_client_auth_disabled() {
+        // Explicit require_client_auth = false → no error, auth disabled
+        let f = write_toml("[auth]\nrequire_client_auth = false\n");
         let cfg = Config::load(f.path()).unwrap();
         assert!(!cfg.client_auth_enabled);
         assert!(cfg.client_vk_path.is_none());
+    }
+
+    #[test]
+    fn auth_required_true_without_vk_path_errors() {
+        let f = write_toml("[auth]\nrequire_client_auth = true\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("require_client_auth"), "got: {err}");
+        assert!(err.contains("client_vk_path"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_required_false_with_vk_path_enables_auth() {
+        // require_client_auth = false but VK provided — VK is ignored, auth disabled
+        // (require_client_auth drives the outcome)
+        let f = write_toml(
+            "[auth]\nrequire_client_auth = false\nclient_vk_path = \"./keys/client.vk\"\n",
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.client_auth_enabled);
     }
 
     // ── AdminConfig tests ─────────────────────────────────────────────────────
@@ -1174,6 +1225,15 @@ handshake_timeout_secs = 30
             "control_plane_install_token should be None when neither TOML nor env var is set"
         );
 
+        // Case 5: control_plane.enabled = true with no install_token is non-fatal (warn only)
+        std::env::remove_var("INSTALL_TOKEN");
+        let f = write_toml(
+            "[control_plane]\nenabled = true\nendpoint = \"http://localhost:9000\"\n",
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.control_plane_enabled);
+        assert_eq!(cfg.control_plane_install_token, None);
+
         // Cleanup
         std::env::remove_var("INSTALL_TOKEN");
     }
@@ -1253,17 +1313,4 @@ handshake_timeout_secs = 30
         );
     }
 
-    #[test]
-    fn control_plane_enabled_no_install_token_does_not_error() {
-        // Ensure no INSTALL_TOKEN env var from a parallel test contaminates this assertion.
-        std::env::remove_var("INSTALL_TOKEN");
-        // control_plane.enabled = true with valid endpoint but no install_token is non-fatal
-        let f = write_toml(
-            "[control_plane]\nenabled = true\nendpoint = \"http://localhost:9000\"\n",
-        );
-        // Must succeed — missing install_token is a warn, not an error
-        let cfg = Config::load(f.path()).unwrap();
-        assert!(cfg.control_plane_enabled);
-        assert_eq!(cfg.control_plane_install_token, None);
-    }
 }
