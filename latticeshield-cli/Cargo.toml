@@ -17,7 +17,7 @@ latticeshield-client = { path = "../latticeshield-client" }
 anyhow     = { workspace = true }
 clap       = { version = "4", features = ["derive", "env"] }
 colored    = "2"
-reqwest    = { version = "0.12", features = ["json", "blocking"] }
+reqwest    = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots-no-provider"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -40,7 +40,7 @@ sqlx  = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls"] }
 tracing                     = "0.1"
 tracing-subscriber          = { version = "0.3", features = ["env-filter"] }
 metrics                     = "0.22"
-metrics-exporter-prometheus = "0.13"
+metrics-exporter-prometheus = { version = "0.13", default-features = false, features = ["http-listener"] }
 
 # Utilidades
 anyhow  = "1"
