@@ -272,15 +272,17 @@ async fn key_rotate_survives_relay() {
         total_expected.extend_from_slice(p);
     }
 
-    user_client_side.shutdown().await.unwrap();
+    // Block until ALL echo bytes arrive BEFORE signaling EOF.
+    // read_to_end after shutdown() races frames still in-flight; read_exact avoids that.
+    // KEY_ROTATE is transparent to the user side — client_session handles it.
+    let mut response = vec![0u8; total_expected.len()];
+    user_client_side.read_exact(&mut response).await.unwrap();
 
-    let mut response = Vec::new();
-    user_client_side.read_to_end(&mut response).await.unwrap();
+    user_client_side.shutdown().await.unwrap();
+    handle_task.await.unwrap();
 
     assert_eq!(
         response, total_expected,
         "all 3 payloads must echo back correctly after KEY_ROTATE"
     );
-
-    handle_task.await.unwrap();
 }
