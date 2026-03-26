@@ -109,14 +109,22 @@ impl ClientIdentity {
         let vk_path = vk_path_from(sk_path);
         let mut vk_buf = [0u8; VERIFYING_KEY_LEN];
         std::fs::File::open(&vk_path)
-            .with_context(|| format!("abriendo {} — existe client.vk junto a client.sk?", vk_path.display()))?
+            .with_context(|| {
+                format!(
+                    "abriendo {} — existe client.vk junto a client.sk?",
+                    vk_path.display()
+                )
+            })?
             .read_exact(&mut vk_buf)
             .context("leyendo verifying key — archivo truncado?")?;
 
         let verifying_key = VerifyingKey::from_bytes(&vk_buf)
             .map_err(|e| anyhow::anyhow!("verifying key invalida en {}: {e}", vk_path.display()))?;
 
-        Ok(Self { signing_key, verifying_key })
+        Ok(Self {
+            signing_key,
+            verifying_key,
+        })
     }
 
     /// Genera un par de claves nuevo y los guarda en `dir/client.sk` y `dir/client.vk`.
@@ -159,8 +167,14 @@ impl ClientIdentity {
             .context("escribiendo verifying key")?;
 
         println!("Keypair de cliente generado exitosamente:");
-        println!("  Signing key:    {} (0600 — mantener SECRETO)", sk_path.display());
-        println!("  Verifying key:  {} (0644 — distribuir al bridge out-of-band)", vk_path.display());
+        println!(
+            "  Signing key:    {} (0600 — mantener SECRETO)",
+            sk_path.display()
+        );
+        println!(
+            "  Verifying key:  {} (0644 — distribuir al bridge out-of-band)",
+            vk_path.display()
+        );
 
         Ok(())
     }
@@ -178,11 +192,11 @@ impl Drop for ClientIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use latticeshield_crypto::generate_keypair;
     use rand_core::OsRng;
-    use tempfile::NamedTempFile;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn load_roundtrip_ok() {
@@ -224,7 +238,12 @@ mod tests {
         let mut rng = OsRng;
         let (_sk, vk) = generate_keypair(&mut rng);
         let fp = fingerprint(&vk);
-        assert_eq!(fp.len(), 64, "fingerprint must be 64 hex chars, got len {}", fp.len());
+        assert_eq!(
+            fp.len(),
+            64,
+            "fingerprint must be 64 hex chars, got len {}",
+            fp.len()
+        );
     }
 
     #[test]

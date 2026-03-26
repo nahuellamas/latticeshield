@@ -110,9 +110,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn admin_keygen(dir: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    use anyhow::Context;
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creando directorio {}", dir.display()))?;
@@ -122,21 +122,33 @@ fn admin_keygen(dir: &Path) -> anyhow::Result<()> {
     let vk_path = dir.join("admin.vk");
 
     std::fs::OpenOptions::new()
-        .write(true).create(true).truncate(true).mode(0o600)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
         .open(&sk_path)
         .with_context(|| format!("creando {}", sk_path.display()))?
         .write_all(sk.to_bytes())
         .context("escribiendo admin signing key")?;
 
     std::fs::OpenOptions::new()
-        .write(true).create(true).truncate(true).mode(0o644)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
         .open(&vk_path)
         .with_context(|| format!("creando {}", vk_path.display()))?
         .write_all(vk.to_bytes())
         .context("escribiendo admin verifying key")?;
 
     println!("Admin keypair generado exitosamente:");
-    println!("  Signing key:    {} (0600 — para el control plane, mantener SECRETO)", sk_path.display());
-    println!("  Verifying key:  {} (0644 — copiar al bridge en admin.control_plane_vk_path)", vk_path.display());
+    println!(
+        "  Signing key:    {} (0600 — para el control plane, mantener SECRETO)",
+        sk_path.display()
+    );
+    println!(
+        "  Verifying key:  {} (0644 — copiar al bridge en admin.control_plane_vk_path)",
+        vk_path.display()
+    );
     Ok(())
 }

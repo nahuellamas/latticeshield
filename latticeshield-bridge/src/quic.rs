@@ -81,7 +81,9 @@ impl QuicRelay {
     ) -> anyhow::Result<()> {
         let backend = TcpStream::connect(self.backend_addr)
             .await
-            .with_context(|| format!("QUIC relay: backend connect failed: {}", self.backend_addr))?;
+            .with_context(|| {
+                format!("QUIC relay: backend connect failed: {}", self.backend_addr)
+            })?;
 
         let (mut backend_r, mut backend_w) = tokio::io::split(backend);
         let mut recv = recv; // quinn RecvStream implements AsyncRead directly in quinn 0.11
@@ -116,7 +118,9 @@ mod tests {
         let mut cert_f = NamedTempFile::new().unwrap();
         let mut key_f = NamedTempFile::new().unwrap();
         cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
-        key_f.write_all(certified.key_pair.serialize_pem().as_bytes()).unwrap();
+        key_f
+            .write_all(certified.key_pair.serialize_pem().as_bytes())
+            .unwrap();
         (cert_f, key_f)
     }
 
@@ -242,11 +246,17 @@ mod tests {
 
         // Wait for relay to finish processing (backend echoed, send.finish() called)
         let relay_result = relay_done_rx.await.unwrap();
-        assert!(relay_result.is_ok(), "relay_stream should succeed: {:?}", relay_result);
+        assert!(
+            relay_result.is_ok(),
+            "relay_stream should succeed: {:?}",
+            relay_result
+        );
 
         // Read the echo response from backend via relay.
         let mut resp_buf = Vec::new();
-        tokio::io::copy(&mut client_recv, &mut resp_buf).await.unwrap();
+        tokio::io::copy(&mut client_recv, &mut resp_buf)
+            .await
+            .unwrap();
 
         let _ = accept_task.await;
         let received = backend_task.await.unwrap();
@@ -282,7 +292,11 @@ mod tests {
         client_conn.close(0u32.into(), b"done");
 
         let result = server_task.await.unwrap();
-        assert!(result.is_ok(), "expected Ok on normal close, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected Ok on normal close, got: {:?}",
+            result.err()
+        );
     }
 
     /// Build a (client_endpoint, server_endpoint) pair using rcgen self-signed cert.
@@ -306,11 +320,8 @@ mod tests {
             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(server_rustls_config))
                 .unwrap();
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(quinn_server_crypto));
-        let server_endpoint = quinn::Endpoint::server(
-            server_config,
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
 
         // ── Client endpoint — trust-any verifier (test only) ─────────────────
         #[derive(Debug)]
@@ -333,7 +344,8 @@ mod tests {
                 _message: &[u8],
                 _cert: &CertificateDer<'_>,
                 _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
 
@@ -342,7 +354,8 @@ mod tests {
                 _message: &[u8],
                 _cert: &CertificateDer<'_>,
                 _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
 
@@ -368,8 +381,7 @@ mod tests {
                 .unwrap();
         let client_config = quinn::ClientConfig::new(Arc::new(quinn_client_crypto));
 
-        let mut client_endpoint =
-            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client_endpoint.set_default_client_config(client_config);
 
         (client_endpoint, server_endpoint)

@@ -10,10 +10,7 @@ use std::time::{Duration, Instant};
 
 use latticeshield_crypto::{
     channel::{EncryptedChannel, FrameResult},
-    handshake::{
-        HandshakeError, ServerHandshake, SessionKey,
-        CLIENT_RESPONSE_SIGNED_LEN,
-    },
+    handshake::{HandshakeError, ServerHandshake, SessionKey, CLIENT_RESPONSE_SIGNED_LEN},
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -179,10 +176,7 @@ fn handle_get_metrics(
     }
 }
 
-fn handle_rotate(
-    rotate_tx: &watch::Sender<u64>,
-    metrics_state: &MetricsState,
-) -> AdminResponse {
+fn handle_rotate(rotate_tx: &watch::Sender<u64>, metrics_state: &MetricsState) -> AdminResponse {
     rotate_tx.send_modify(|c| *c += 1);
     let count = metrics_state
         .connections_active
@@ -297,7 +291,10 @@ mod tests {
 
     #[test]
     fn command_frame_get_metrics_roundtrip() {
-        let frame = CommandFrame { seq: 1, cmd: AdminCommand::GetMetrics };
+        let frame = CommandFrame {
+            seq: 1,
+            cmd: AdminCommand::GetMetrics,
+        };
         let json = serde_json::to_string(&frame).unwrap();
         let decoded: CommandFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.seq, 1);
@@ -306,7 +303,10 @@ mod tests {
 
     #[test]
     fn command_frame_rotate_roundtrip() {
-        let frame = CommandFrame { seq: 2, cmd: AdminCommand::Rotate };
+        let frame = CommandFrame {
+            seq: 2,
+            cmd: AdminCommand::Rotate,
+        };
         let json = serde_json::to_string(&frame).unwrap();
         let decoded: CommandFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.seq, 2);
@@ -315,7 +315,10 @@ mod tests {
 
     #[test]
     fn command_frame_get_vk_token_roundtrip() {
-        let frame = CommandFrame { seq: 3, cmd: AdminCommand::GetVkToken };
+        let frame = CommandFrame {
+            seq: 3,
+            cmd: AdminCommand::GetVkToken,
+        };
         let json = serde_json::to_string(&frame).unwrap();
         let decoded: CommandFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.seq, 3);
@@ -326,7 +329,10 @@ mod tests {
     fn command_frame_unknown_cmd_fails() {
         let json = r#"{"seq":1,"cmd":"DeleteAll"}"#;
         let result = serde_json::from_str::<CommandFrame>(json);
-        assert!(result.is_err(), "unknown cmd variant must fail deserialization");
+        assert!(
+            result.is_err(),
+            "unknown cmd variant must fail deserialization"
+        );
     }
 
     #[test]
@@ -336,16 +342,25 @@ mod tests {
 
     #[test]
     fn seq_one_accepted_after_zero() {
-        assert!(is_seq_valid(1, 0), "seq=1 should be accepted after last_seen=0");
+        assert!(
+            is_seq_valid(1, 0),
+            "seq=1 should be accepted after last_seen=0"
+        );
     }
 
     #[test]
     fn seq_replay_same_rejected() {
-        assert!(!is_seq_valid(5, 5), "same seq as last_seen should be rejected");
+        assert!(
+            !is_seq_valid(5, 5),
+            "same seq as last_seen should be rejected"
+        );
     }
 
     #[test]
     fn seq_old_rejected() {
-        assert!(!is_seq_valid(3, 5), "seq older than last_seen should be rejected");
+        assert!(
+            !is_seq_valid(3, 5),
+            "seq older than last_seen should be rejected"
+        );
     }
 }

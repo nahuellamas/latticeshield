@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use latticeshield_crypto::{ServerHandshake, CLIENT_RESPONSE_LEN, CLIENT_RESPONSE_SIGNED_LEN, SERVER_HELLO_SIGNED_LEN};
+use latticeshield_crypto::{
+    ServerHandshake, CLIENT_RESPONSE_LEN, CLIENT_RESPONSE_SIGNED_LEN, SERVER_HELLO_SIGNED_LEN,
+};
 use rand_core::{OsRng, RngCore};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -29,10 +31,10 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 use crate::config::ValidConfig;
 use crate::identity::{ClientVerifyingIdentity, ServerIdentity};
 use crate::metrics::{ActiveGuard, MetricsActiveGuard, MetricsState};
+use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 
 pub async fn handle(
     mut client: TcpStream,
@@ -46,7 +48,9 @@ pub async fn handle(
 ) -> anyhow::Result<()> {
     info!(%peer, "conexion entrante");
     metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
-    metrics_state.connections_total.fetch_add(1, Ordering::Relaxed);
+    metrics_state
+        .connections_total
+        .fetch_add(1, Ordering::Relaxed);
 
     // ── 1. Handshake PQC autenticado ────────────────────────────────────────
 
@@ -91,7 +95,8 @@ pub async fn handle(
                 .context("handshake PQC fallido")?
         }
     };
-    metrics::histogram!(crate::metrics::HANDSHAKE_DURATION).record(t_handshake.elapsed().as_secs_f64());
+    metrics::histogram!(crate::metrics::HANDSHAKE_DURATION)
+        .record(t_handshake.elapsed().as_secs_f64());
     info!(%peer, "handshake PQC completado — canal cifrado activo");
 
     // ── 2. Canal cifrado ─────────────────────────────────────────────────────
@@ -226,7 +231,9 @@ async fn do_rotate(
         .context("send KEY_ROTATE frame")?;
     channel.rotate_key(&nonce);
     metrics::counter!(crate::metrics::KEY_ROTATIONS_TOTAL).increment(1);
-    metrics_state.key_rotations_total.fetch_add(1, Ordering::Relaxed);
+    metrics_state
+        .key_rotations_total
+        .fetch_add(1, Ordering::Relaxed);
     info!(%peer, "clave de sesion rotada");
     Ok(())
 }

@@ -60,7 +60,10 @@ pub fn create_token(store: &VkShareStore, vk_bytes: &[u8], ttl: Duration) -> (St
         expires_at: Instant::now() + ttl,
         used: false,
     };
-    store.lock().unwrap_or_else(|e| e.into_inner()).insert(token.clone(), entry);
+    store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(token.clone(), entry);
     (token, fingerprint)
 }
 
@@ -146,7 +149,9 @@ mod tests {
         let (_, fingerprint) = create_token(&store, &vk_bytes, Duration::from_secs(300));
         assert_eq!(fingerprint.len(), 64, "fingerprint must be 64 hex chars");
         assert!(
-            fingerprint.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            fingerprint
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "fingerprint must be lowercase hex"
         );
     }
@@ -182,7 +187,9 @@ mod tests {
         let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
         let _ = vk_response(&token, &store, dummy_peer());
         let guard = store.lock().unwrap();
-        let entry = guard.get(&token).expect("entry should still exist after use");
+        let entry = guard
+            .get(&token)
+            .expect("entry should still exist after use");
         assert!(entry.used, "entry.used must be true after first call");
     }
 
@@ -234,17 +241,27 @@ mod tests {
         let response = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response).unwrap();
         // Extract body (after the blank line between headers and body)
-        let body_start = response_str.find("\r\n\r\n").expect("response must have header separator") + 4;
+        let body_start = response_str
+            .find("\r\n\r\n")
+            .expect("response must have header separator")
+            + 4;
         let body: serde_json::Value =
             serde_json::from_str(&response_str[body_start..]).expect("body must be valid JSON");
-        let server_vk = body["server_vk"].as_str().expect("server_vk must be present");
-        let fingerprint = body["fingerprint"].as_str().expect("fingerprint must be present");
+        let server_vk = body["server_vk"]
+            .as_str()
+            .expect("server_vk must be present");
+        let fingerprint = body["fingerprint"]
+            .as_str()
+            .expect("fingerprint must be present");
         assert_eq!(
             server_vk,
             hex_encode(&vk_bytes),
             "server_vk must match hex-encoded VK bytes"
         );
-        assert_eq!(fingerprint, expected_fp, "fingerprint must match create_token output");
+        assert_eq!(
+            fingerprint, expected_fp,
+            "fingerprint must match create_token output"
+        );
     }
 
     #[test]
@@ -279,7 +296,10 @@ mod tests {
 
         // Token was actually inserted — recover from poison to inspect
         let guard = store.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(guard.contains_key(&token), "token must be present after create_token on poisoned mutex");
+        assert!(
+            guard.contains_key(&token),
+            "token must be present after create_token on poisoned mutex"
+        );
     }
 
     #[test]
@@ -317,13 +337,19 @@ mod tests {
         let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
         let response = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response).unwrap();
-        let body_start = response_str.find("\r\n\r\n").expect("response must have header separator") + 4;
+        let body_start = response_str
+            .find("\r\n\r\n")
+            .expect("response must have header separator")
+            + 4;
         let body: serde_json::Value =
             serde_json::from_str(&response_str[body_start..]).expect("body must be valid JSON");
         let obj = body.as_object().expect("body must be a JSON object");
         // Only the two allowed fields must be present
         assert!(obj.contains_key("server_vk"), "server_vk must be present");
-        assert!(obj.contains_key("fingerprint"), "fingerprint must be present");
+        assert!(
+            obj.contains_key("fingerprint"),
+            "fingerprint must be present"
+        );
         assert_eq!(
             obj.len(),
             2,

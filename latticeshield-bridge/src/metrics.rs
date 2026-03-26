@@ -33,15 +33,27 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("error inicializando Prometheus recorder: {e}"))?;
 
-    describe_counter!(CONNECTIONS_TOTAL, "Total de conexiones TCP recibidas por el proxy");
-    describe_gauge!(CONNECTIONS_ACTIVE, "Conexiones activas (post-handshake) en este momento");
+    describe_counter!(
+        CONNECTIONS_TOTAL,
+        "Total de conexiones TCP recibidas por el proxy"
+    );
+    describe_gauge!(
+        CONNECTIONS_ACTIVE,
+        "Conexiones activas (post-handshake) en este momento"
+    );
     describe_histogram!(
         HANDSHAKE_DURATION,
         "Duracion del handshake PQC hibrido en segundos"
     );
-    describe_counter!(BYTES_TRANSMITTED, "Bytes de payload transmitidos desde el backend al cliente");
+    describe_counter!(
+        BYTES_TRANSMITTED,
+        "Bytes de payload transmitidos desde el backend al cliente"
+    );
     describe_counter!(CHANNEL_ERRORS, "Errores en el canal cifrado AES-256-GCM");
-    describe_counter!(KEY_ROTATIONS_TOTAL, "Total number of session key rotations performed");
+    describe_counter!(
+        KEY_ROTATIONS_TOTAL,
+        "Total number of session key rotations performed"
+    );
 
     Ok(handle)
 }
@@ -145,7 +157,9 @@ mod metrics_state_tests {
     fn metrics_state_increments_correctly() {
         let state = MetricsState::new();
         state.connections_total.fetch_add(1, Ordering::Relaxed);
-        state.bytes_transmitted_total.fetch_add(1024, Ordering::Relaxed);
+        state
+            .bytes_transmitted_total
+            .fetch_add(1024, Ordering::Relaxed);
         assert_eq!(state.connections_total.load(Ordering::Relaxed), 1);
         assert_eq!(state.bytes_transmitted_total.load(Ordering::Relaxed), 1024);
         assert_eq!(state.connections_active.load(Ordering::Relaxed), 0);
@@ -170,7 +184,9 @@ mod metrics_state_tests {
         let state = MetricsState::new();
         state.connections_total.fetch_add(7, Ordering::Relaxed);
         state.connections_active.fetch_add(2, Ordering::Relaxed);
-        state.bytes_transmitted_total.fetch_add(4096, Ordering::Relaxed);
+        state
+            .bytes_transmitted_total
+            .fetch_add(4096, Ordering::Relaxed);
         state.channel_errors_total.fetch_add(3, Ordering::Relaxed);
         let snap = state.snapshot();
         assert_eq!(snap.connections_total, 7);

@@ -15,8 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use latticeshield_crypto::{
-    generate_keypair, EncryptedChannel, FrameResult, ServerHandshake,
-    CLIENT_RESPONSE_LEN,
+    generate_keypair, EncryptedChannel, FrameResult, ServerHandshake, CLIENT_RESPONSE_LEN,
 };
 
 use latticeshield_client::client_session;
@@ -58,7 +57,12 @@ fn make_client_config(bridge_addr: SocketAddr) -> ValidClientConfig {
 fn make_pool(bridge_addr: SocketAddr) -> Arc<ConnectionPool> {
     Arc::new(ConnectionPool::new(
         bridge_addr,
-        PoolConfig { max_size: 1, idle_timeout_secs: 30, warm_size: 0, warm_interval_secs: 5 },
+        PoolConfig {
+            max_size: 1,
+            idle_timeout_secs: 30,
+            warm_size: 0,
+            warm_interval_secs: 5,
+        },
     ))
 }
 
@@ -77,7 +81,10 @@ async fn server_handshake(
     let hello_bytes = server_hs
         .server_hello_signed_bytes(sk, &mut rng)
         .expect("server_hello_signed_bytes");
-    stream.write_all(&hello_bytes).await.expect("write server hello");
+    stream
+        .write_all(&hello_bytes)
+        .await
+        .expect("write server hello");
 
     let mut client_resp_buf = [0u8; CLIENT_RESPONSE_LEN];
     stream
@@ -138,9 +145,7 @@ async fn full_bridge_client_relay() {
     let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let user_addr = user_listener.local_addr().unwrap();
 
-    let user_connect = tokio::spawn(async move {
-        TcpStream::connect(user_addr).await.unwrap()
-    });
+    let user_connect = tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
     let (user_server_side, _) = user_listener.accept().await.unwrap();
     let mut user_client_side = user_connect.await.unwrap();
 
@@ -161,7 +166,8 @@ async fn full_bridge_client_relay() {
     user_client_side.read_exact(&mut response).await.unwrap();
 
     assert_eq!(
-        response.as_slice(), payload as &[u8],
+        response.as_slice(),
+        payload as &[u8],
         "echo response should match sent payload"
     );
 
@@ -243,9 +249,7 @@ async fn key_rotate_survives_relay() {
     let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let user_addr = user_listener.local_addr().unwrap();
 
-    let user_connect = tokio::spawn(async move {
-        TcpStream::connect(user_addr).await.unwrap()
-    });
+    let user_connect = tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
     let (user_server_side, _) = user_listener.accept().await.unwrap();
     let mut user_client_side = user_connect.await.unwrap();
 
