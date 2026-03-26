@@ -119,14 +119,22 @@ pub async fn handle(
     let mut channel = EncryptedChannel::new(session_key.as_bytes(), config.max_frame_size);
 
     // ── Relay bidireccional ──────────────────────────────────────────────────
+    // user_eof: el usuario cerro su lado de escritura (half-close).
+    // Cuando ocurre, dejamos de leer del usuario y enviamos FIN al bridge,
+    // pero seguimos drenando frames pendientes bridge→user hasta que el bridge
+    // tambien cierre. Sin esto, read_to_end() del usuario devuelve vacio.
     let mut user_buf = vec![0u8; config.max_frame_size];
+    let mut user_eof = false;
 
     loop {
         tokio::select! {
             // user → bridge: leer datos del usuario y cifrar hacia el bridge
-            result = user_r.read(&mut user_buf) => {
+            result = user_r.read(&mut user_buf), if !user_eof => {
                 match result {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        user_eof = true;
+                        let _ = bridge_w.shutdown().await; // FIN al bridge
+                    }
                     Ok(n) => {
                         if let Err(e) = channel.write_frame(&mut bridge_w, &user_buf[..n]).await {
                             warn!(peer = %peer, "write frame to bridge failed: {e}");
