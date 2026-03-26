@@ -817,7 +817,7 @@ mod tests {
         let ms = MetricsState::new();
         let (rotate_tx, _) = watch::channel(0u64);
         let rotate_tx = Arc::new(rotate_tx);
-        let (cmd_tx, mut rotate_rx) = spawn_cmd_handler(Arc::clone(&ms), Arc::clone(&rotate_tx));
+        let (cmd_tx, rotate_rx) = spawn_cmd_handler(Arc::clone(&ms), Arc::clone(&rotate_tx));
 
         cmd_tx.send(BridgeCommand::Unknown).await.unwrap();
         // Give the handler time to process
