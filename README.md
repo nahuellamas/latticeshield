@@ -12,6 +12,16 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### CI/Release Pipeline and One-Command Install (2026-03-26)
+
+LatticeShield now ships pre-built binaries for Linux (x86_64 and arm64) and macOS (Intel and Apple Silicon). Install with a single command — no Rust, no compiler, no manual file copying required:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nahuellamas/latticeshield/main/install.sh | bash
+```
+
+The script detects your platform, downloads the right binary, verifies its SHA-256 checksum against the release manifest, and installs it to `/usr/local/bin`. Every pull request and push to main now runs an automated check — formatting, linting, dependency audit, and all 308 tests — before code can be merged. Ready-to-use service files for systemd (Linux) and launchd (macOS) are included under `contrib/` so you can run the bridge as a hardened system service in two commands.
+
 ### Security Enforcement — Client Auth, Encrypted Key Rotation, and Dead Code Removal (2026-03-26)
 
 The bridge now requires that every connecting client prove its identity before the session is accepted. Before this release, client verification was optional and off by default, meaning the bridge would accept connections from anyone who knew the server's address. Now the bridge refuses to start unless it is either given a key to check clients against, or explicitly told that open access is intentional — via `require_client_auth = false` in the config file. We also closed a gap where the secret used to agree on a new encryption key mid-session traveled in the clear inside the channel; that secret is now itself encrypted with the same lock that protects all other traffic. Finally, we removed an unused internal component (an anti-replay filter for one-time entry tickets that were never implemented) that added complexity without providing any real security benefit.
@@ -330,12 +340,12 @@ cargo build --release
 | 16 | Pre-production Hardening — graceful shutdown (SIGTERM/SIGINT drain with configurable timeout), Mutex poison recovery in `vk_share.rs`, flaky test eliminated in `control_plane` and `session` |
 | 17 | Sequence Numbers + Framing v3 — monotonic `seq` (u64 BE) field in DATA frames authenticated as AEAD AAD; receiver rejects replays; `FrameError` enum; `rotate_key()` resets both counters; closes G1/D4 |
 | 18 | Security Enforcement — `require_client_auth = true` by default with explicit opt-out via `[auth]` section (G2); KEY_ROTATE nonce encrypted with AES-256-GCM (61-byte wire format) instead of plaintext (G4); `AntiReplayFilter` dead code removed — 0-RTT tickets never implemented (G5); env-var race in `control_plane` tests eliminated |
+| 19 | CI/Release Pipeline — GitHub Actions CI gate (fmt + clippy + deny + test on every push/PR); release workflow cross-compiles 3 binaries × 4 targets (linux-x64/arm64, darwin-x64/arm64), merges per-target SHA-256 checksums into a single manifest, publishes to GitHub Releases on tag push; `install.sh` one-command install with platform detection + checksum verification + privilege-aware install; `contrib/systemd/` and `contrib/launchd/` service files with hardened configuration; `metrics-exporter-prometheus` and `latticeshield-cli reqwest` dep fixes to remove transitive native-tls/OpenSSL |
 
 ### Upcoming
 
 | Month | Milestone |
 |---|---|
-| 19 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin-x64/arm64, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
 | 20+ | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, cloud-side heartbeat signature verification |
 
 ## License

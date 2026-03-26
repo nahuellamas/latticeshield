@@ -19,7 +19,8 @@ latticeshield-cli is a thin front-door for the whole system. It does not run any
 
 ## What Changed in This Release
 
-- New `latticeshield vk-share` command added. It contacts a running bridge management server (default: `http://127.0.0.1:8444`), requests a one-time download link for the server's digital ID card, and prints the link and a fingerprint. The client operator then visits that link once to receive the ID card file. Use `--bridge <url>` to point to a bridge at a non-default address.
+- The CLI is now available as a pre-built binary for Linux (x86_64 and arm64) and macOS (Intel and Apple Silicon). Install with `install.sh` — no Rust compiler needed.
+- The CLI binary no longer pulls in OpenSSL indirectly when making web requests. It now uses the same security library (rustls) as the rest of the project, keeping the dependency tree consistent and the binary free of C-library dependencies.
 
 ---
-*Last updated: 2026-03-19 — latticeshield-mes12-vk-share*
+*Last updated: 2026-03-26 — latticeshield-mes19-ci-release*

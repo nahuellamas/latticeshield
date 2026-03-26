@@ -2632,3 +2632,426 @@ El conteo total baja de 309 a 308: los 3 tests del modulo `anti_replay` eliminad
 El test `key_rotate_frame_is_33_bytes_starting_0x02` fue renombrado a `key_rotate_frame_is_61_bytes_starting_0x02` y actualizado para verificar el nuevo tamano fijo. El test de roundtrip `read_frame_key_rotate_roundtrip` fue actualizado para usar dos instancias separadas (sender/receiver) con la misma clave, verificando que el descifrado del nonce es correcto en el lado receptor.
 
 ---
+
+---
+
+# Mes 19 — Pipeline de CI/Release e Install Script
+
+---
+
+## El problema que existia
+
+Hasta este punto del proyecto, distribuir LatticeShield a un nuevo operador requeria pasos manuales que eran propensos a errores y difíciles de reproducir: clonar el repositorio, tener el toolchain de Rust instalado, ejecutar `cargo build --release`, copiar los binarios a cada servidor. Para un operador que no conoce Rust, ese proceso era una barrera infranqueable. Para un equipo que mantiene multiples maquinas, era una fuente garantizada de desincronizacion — versiones diferentes en distintos hosts, sin forma automatizada de verificar que todos corrían el mismo binario.
+
+Ademas, el proyecto no tenia ningun gate de calidad automatizado. Un pull request que rompiera la compilacion o hiciera fallar tests podia integrarse al repositorio sin que nadie lo detectara hasta el proximo `cargo build` manual. Sin CI, la confianza en el estado del codigo dependia exclusivamente de la disciplina individual de cada colaborador.
+
+Por otro lado, el workspace tenia dos dependencias que traian transitivamente OpenSSL o native-tls: `metrics-exporter-prometheus` (con la feature `push-gateway` activada por defecto, que requiere `native-tls`) y `reqwest` en `latticeshield-cli` (con default-features activados). Esas dependencias violaban la restriccion del proyecto de no usar OpenSSL, y en el contexto de un pipeline de release que compila para cuatro targets, cualquier dependencia de C nativa complica el cross-compile.
+
+Mes 19 cierra los tres gaps:
+1. Un workflow de CI que actua como gate obligatorio en cada push y pull request.
+2. Un workflow de Release que compila los tres binarios para cuatro plataformas y los publica en GitHub Releases con checksums verificados.
+3. Un script `install.sh` que permite a cualquier operador instalar LatticeShield con un solo comando, sin Rust, sin clonar el repositorio.
+4. Archivos de servicio para systemd (Linux) y launchd (macOS) listos para produccion.
+5. Correccion de las dos dependencias que traian transitivamente native-tls/OpenSSL.
+
+---
+
+## .github/workflows/ci.yml — Gate de calidad continua
+
+### Estructura del workflow
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+```
+
+El workflow tiene tres jobs. `lint` corre en paralelo con `deny` (no existe un `needs:` entre ellos). `test` espera a que `lint` pase antes de ejecutarse — evita gastar minutos de compute en tests cuando el codigo ni siquiera compila o tiene errores de clippy.
+
+### Por que `dtolnay/rust-toolchain@stable` y no `actions/setup-rust`?
+
+`dtolnay/rust-toolchain` es la accion estandar de facto en el ecosistema Rust. Acepta un campo `components:` que instala rustfmt y clippy en el mismo paso que el toolchain, sin pasos adicionales. `Swatinem/rust-cache` es su compañero natural: cachea `~/.cargo` y `target/` entre runs, reduciendo el tiempo de compilacion de minutos a segundos en el caso tipico donde el codigo no cambio sus dependencias.
+
+### Por que `cargo deny` como job separado y no integrado en `lint`?
+
+`cargo deny` requiere instalar la herramienta primero (`cargo install cargo-deny --locked`). Ese paso tarda entre 30 segundos y 2 minutos dependiendo del cache. Separarlo en su propio job permite que `deny` y `lint` corran en paralelo: mientras `deny` instala y ejecuta, `lint` ya esta corriendo `fmt` y `clippy`. Si `deny` falla (por ejemplo, una nueva vulnerabilidad en una dependencia), el resultado aparece sin esperar a que `lint` termine.
+
+### Por que `cargo clippy -- -D warnings` y no `cargo clippy`?
+
+Sin `-D warnings`, clippy emite advertencias pero el paso del workflow siempre devuelve exit code 0. La advertencia aparece en los logs pero no bloquea el merge. Con `-D warnings`, cualquier advertencia de clippy se convierte en un error de compilacion: el job falla, el PR no puede mergearse. Es la unica forma de que clippy sea un gate real en lugar de una sugerencia ignorable.
+
+### Por que `cargo fmt --check` y no `cargo fmt`?
+
+`cargo fmt` reformatea el codigo en-lugar y siempre sale con exit code 0. `cargo fmt --check` verifica que el codigo ya esta formateado correctamente y falla si hay diferencias. En un entorno CI (donde no hay sentido de "aplicar" formato), `--check` es la variante correcta.
+
+---
+
+## .github/workflows/release.yml — Pipeline de release de cuatro targets
+
+### La matriz de build
+
+```yaml
+strategy:
+  fail-fast: false
+  matrix:
+    include:
+      - target: x86_64-unknown-linux-gnu
+        runner: ubuntu-22.04
+        cross: false
+      - target: aarch64-unknown-linux-gnu
+        runner: ubuntu-22.04
+        cross: true
+      - target: x86_64-apple-darwin
+        runner: macos-13
+        cross: false
+      - target: aarch64-apple-darwin
+        runner: macos-14
+        cross: false
+```
+
+Cuatro targets, tres de los cuales compilan nativo y uno requiere cross-compile. La seleccion de runners es deliberada:
+
+- `ubuntu-22.04` para ambos targets Linux — LTS estable, con glibc 2.35 que es compatible hacia adelante con casi cualquier distribucion Linux moderna. Usar `ubuntu-latest` (que apunta a 24.04) generaria binarios con glibc 2.39, incompatibles con sistemas mas viejos.
+- `macos-13` para `x86_64-apple-darwin` — GitHub todavia mantiene runners x86 con macOS 13. `macos-latest` ya apunta a arm64.
+- `macos-14` para `aarch64-apple-darwin` — el hardware arm64 nativo de GitHub Actions (M1). Compilar nativo en macOS arm64 evita el cross-compile y produce binarios optimizados para el hardware real.
+
+`fail-fast: false` significa que si un target falla, los otros tres continuan su build. Sin esto, un error en el target Linux aarch64 (el mas complejo por el cross-compile) cancelaria los tres restantes, perdiendo los binarios de los targets exitosos.
+
+### El cross-compile para aarch64-unknown-linux-gnu
+
+```yaml
+- name: Install aarch64 cross toolchain
+  if: matrix.cross
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
+
+- name: Set cross-compile env
+  if: matrix.cross
+  run: |
+    echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+    echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+    echo "AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+```
+
+El cross-compile de Rust para Linux aarch64 requiere un linker y compilador de C que puedan producir codigo aarch64 corriendo en x86_64. Los paquetes `gcc-aarch64-linux-gnu` y `g++-aarch64-linux-gnu` proveen exactamente eso. Las variables de entorno `CC_*`, `CXX_*`, y `*_LINKER` son la forma que tiene Cargo de saber que herramienta usar para el target no-nativo — Cargo las lee automaticamente cuando detecta que el target es distinto al host.
+
+`cmake` es necesario porque `aws-lc-rs` (el proveedor criptografico que usa rustls) tiene una dependencia de build que usa CMake para configurar la compilacion de las rutinas de bajo nivel.
+
+### Por que no usar `cross` (la herramienta de Docker)?
+
+`cross` ejecuta la compilacion dentro de un contenedor Docker preconfigurado para cada target. Funciona bien para la mayoria de los casos, pero agrega una capa de complejidad (Docker-in-Docker en GitHub Actions) y no es necesario aqui. El workspace no tiene dependencias C complejas mas alla de `aws-lc-rs`, y el toolchain de cross-compile de Debian es exactamente lo que `aws-lc-rs` necesita. El approach de instalar el toolchain directamente es mas transparente y mas facil de depurar.
+
+### El proceso de checksums: per-target y merge
+
+```yaml
+# En cada job de build:
+- name: Generate per-target checksums
+  run: |
+    sha256sum \
+      "latticeshield-bridge-${{ matrix.target }}" \
+      "latticeshield-client-${{ matrix.target }}" \
+      "latticeshield-${{ matrix.target }}" \
+      > "checksums-${{ matrix.target }}.txt"
+```
+
+```yaml
+# En el job merge-checksums:
+- name: Merge into single checksums.txt
+  run: cat checksums-*.txt | sort > checksums.txt
+```
+
+Cada job de build genera un archivo de checksums para sus tres binarios (`checksums-{target}.txt`). El job `merge-checksums` descarga todos los archivos de checksums (via `actions/download-artifact@v4` con `merge-multiple: true`) y los concatena y ordena en un unico `checksums.txt`. El resultado final tiene una linea por binario, ordenada alfabeticamente por nombre de archivo:
+
+```
+<sha256>  latticeshield-aarch64-apple-darwin
+<sha256>  latticeshield-aarch64-unknown-linux-gnu
+<sha256>  latticeshield-bridge-aarch64-apple-darwin
+...
+<sha256>  latticeshield-x86_64-unknown-linux-gnu
+```
+
+### Por que merge-multiple y sort?
+
+`merge-multiple: true` en `actions/download-artifact@v4` descarga todos los artifacts que coinciden con el patron `checksums-*` al mismo directorio, en lugar de crear un subdirectorio por artifact. Sin esta opcion, el script `cat checksums-*.txt` no encontraria los archivos en el lugar esperado. `sort` garantiza que el `checksums.txt` final es deterministico independientemente del orden en que los jobs de build terminaron — importante para reproducibilidad y para que los diffs entre releases sean legibles.
+
+### El job upload-release
+
+```yaml
+upload-release:
+  needs: [build, merge-checksums]
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: bins-*
+        merge-multiple: true
+    - uses: actions/download-artifact@v4
+      with:
+        name: checksums-final
+    - uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          latticeshield-bridge-*
+          latticeshield-client-*
+          latticeshield-x86_64-*
+          latticeshield-aarch64-*
+          checksums.txt
+```
+
+`softprops/action-gh-release@v2` detecta automaticamente el tag del push que disparo el workflow y adjunta los archivos especificados al GitHub Release correspondiente. Los patrones glob cubren los doce binarios (3 binarios × 4 targets) mas el archivo de checksums consolidado.
+
+El workflow se dispara con `on: push: tags: ['v*']`. Esto significa que un push de cualquier tag que empiece con `v` (por ejemplo, `v0.1.0`, `v1.2.3-rc1`) dispara el pipeline de release. El tag se convierte automaticamente en el nombre de la release en GitHub.
+
+### Por que `permissions: contents: write`?
+
+GitHub Actions tiene permisos de solo lectura por defecto en repositorios privados cuando el workflow no especifica permisos. `softprops/action-gh-release@v2` necesita permiso de escritura sobre `contents` para crear o actualizar el GitHub Release y adjuntar archivos. Declarar el permiso explicitamente en el nivel del workflow (en lugar de modificar los settings del repositorio) es la practica recomendada: el scope es minimo y esta documentado en el codigo.
+
+---
+
+## install.sh — Instalacion con un solo comando
+
+### Deteccion de plataforma
+
+```bash
+detect_target() {
+    local os arch
+    os=$(uname -s)
+    arch=$(uname -m)
+    case "${os}-${arch}" in
+        Linux-x86_64)   echo "x86_64-unknown-linux-gnu" ;;
+        Linux-aarch64)  echo "aarch64-unknown-linux-gnu" ;;
+        Darwin-x86_64)  echo "x86_64-apple-darwin" ;;
+        Darwin-arm64)   echo "aarch64-apple-darwin" ;;
+        *)
+            error "Unsupported platform: ${os}-${arch}"
+            exit 1
+            ;;
+    esac
+}
+```
+
+La funcion combina la salida de `uname -s` (sistema operativo) y `uname -m` (arquitectura) para determinar el Rust target triple. El mapeo es directo excepto por un detalle: en macOS arm64, `uname -m` retorna `arm64` (convencion Apple), mientras que el target triple de Rust es `aarch64-apple-darwin`. El case statement maneja esta diferencia transparentemente.
+
+Los cuatro targets coinciden exactamente con los cuatro targets del workflow de release. Si se añade un nuevo target al release, el script falla con "Unsupported platform" en ese target hasta que se actualice el case statement — un fallo explicito es mejor que descargar el binario equivocado silenciosamente.
+
+### Verificacion de checksums
+
+```bash
+sha256_of() {
+    local file="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "${file}" | awk '{print $1}'
+    else
+        shasum -a 256 "${file}" | awk '{print $1}'
+    fi
+}
+
+verify_checksum() {
+    local file="$1"
+    local expected actual
+    expected=$(grep "  ${file}$" checksums.txt | awk '{print $1}')
+    if [[ -z "${expected}" ]]; then
+        error "No checksum entry found for ${file} in checksums.txt"
+        exit 1
+    fi
+    actual=$(sha256_of "${file}")
+    if [[ "${expected}" != "${actual}" ]]; then
+        error "Checksum mismatch for ${file}"
+        exit 1
+    fi
+}
+```
+
+El script descarga `checksums.txt` antes de descargar ningun binario. Para cada binario, verifica el SHA-256 contra la entrada correspondiente en `checksums.txt`. Si el checksum no coincide, el script termina con error antes de instalar el binario comprometido.
+
+`sha256_of` usa `sha256sum` en Linux y `shasum -a 256` en macOS (que no tiene `sha256sum` por defecto). El `command -v sha256sum` es un test de disponibilidad portale que no depende de `which` (que no siempre esta disponible en todos los sistemas).
+
+### Por que verificar el checksum del archivo descargado y no el del HTTPS?
+
+HTTPS garantiza que el archivo llego intacto desde el servidor de GitHub. La verificacion de checksum añade una garantia diferente: que el archivo en el servidor de GitHub es el mismo que fue producido por el pipeline de CI en el momento del release. Si la cuenta de GitHub fue comprometida y un atacante reemplaza los binarios en la release, el checksum en `checksums.txt` no coincidira con el binario modificado (asumiendo que `checksums.txt` no fue tambien reemplazado — lo cual requeriria comprometer el artifact del workflow). La combinacion de HTTPS + checksum-del-artifact cierra la mayoria de vectores de ataque de supply chain sin requerir firma de codigo.
+
+### Instalacion con y sin privilegios
+
+```bash
+install_bin() {
+    local src="$1" dst="$2"
+    if install -m 755 "${src}" "${dst}" 2>/dev/null; then
+        return 0
+    fi
+    sudo install -m 755 "${src}" "${dst}"
+}
+```
+
+El script intenta primero instalar sin `sudo`. Si el usuario tiene permisos de escritura en `/usr/local/bin` (por ejemplo, en macOS con Homebrew), la instalacion ocurre sin pedir contrasena. Si el intento falla (exit code != 0), se reintenta con `sudo`. Esta logica evita pedir `sudo` innecesariamente en entornos donde no hace falta.
+
+### Gatekeeper en macOS
+
+```bash
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    info "macOS: If Gatekeeper blocks the binaries, run:"
+    for bin in "${BINS[@]}"; do
+        echo "    xattr -d com.apple.quarantine ${INSTALL_DIR}/${bin}"
+    done
+fi
+```
+
+macOS marca con el atributo de cuarentena (`com.apple.quarantine`) a cualquier archivo descargado de internet. Cuando el usuario intenta ejecutar el binario, Gatekeeper bloquea la ejecucion porque el binario no esta firmado con un Developer ID de Apple. El script no puede remover ese atributo automaticamente (requeriria `sudo xattr` o permisos especiales). En cambio, imprime el comando exacto que el operador debe ejecutar si Gatekeeper bloquea los binarios. Esto hace la situacion autodocumentada sin necesitar consultar documentacion externa.
+
+---
+
+## contrib/systemd/latticeshield-bridge.service — Servicio de sistema en Linux
+
+```ini
+[Unit]
+Description=LatticeShield Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=latticeshield
+ExecStart=/usr/local/bin/latticeshield-bridge run --config /etc/latticeshield/config.toml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/etc/latticeshield /var/log/latticeshield
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Hardening de systemd
+
+Las directivas de seguridad de systemd merecen explicacion:
+
+`NoNewPrivileges=true` — impide que el proceso (o cualquier hijo que cree) adquiera nuevos privilegios via `setuid`, `setgid`, o capabilities de Linux. Si el binario tuviera un bug de escalada de privilegios, esta directiva lo bloquea a nivel del kernel antes de que pueda ejecutarse.
+
+`ProtectSystem=strict` — monta el sistema de archivos raiz como solo lectura, excepto `/proc`, `/sys`, y los paths explicitamente listados en `ReadWritePaths`. El proceso no puede escribir en `/usr`, `/etc` (excepto `/etc/latticeshield`), ni en ningun otro path del sistema. Un bug de path traversal o una vulnerabilidad que intentara modificar archivos del sistema encontraria las rutas montadas como `ro`.
+
+`PrivateTmp=true` — el proceso ve su propio directorio `/tmp` aislado, no el `/tmp` compartido del sistema. Esto previene ataques de symlink y race conditions en `/tmp` donde otros procesos podrian manipular archivos temporales creados por el bridge.
+
+`ReadWritePaths=/etc/latticeshield /var/log/latticeshield` — los unicos dos paths donde el proceso puede escribir: el directorio de configuracion y el directorio de logs. El bridge necesita leer las claves en `/etc/latticeshield` y escribir logs en `/var/log/latticeshield`. Ningun otro path del sistema de archivos es accesible en escritura.
+
+`User=latticeshield` — el proceso corre como un usuario sin privilegios dedicado. Si el proceso es comprometido, el atacante solo tiene acceso a los recursos accesibles por ese usuario. En ninguna circunstancia el proceso corre como `root`.
+
+`Restart=on-failure` con `RestartSec=5s` — si el proceso termina con un exit code distinto de 0 (es decir, un crash), systemd lo reinicia despues de 5 segundos. Un exit code 0 (salida limpia, por ejemplo via SIGTERM en un shutdown graceful que completo correctamente) no dispara el restart.
+
+### Por que `After=network.target` y no `After=network-online.target`?
+
+`network.target` significa que las interfaces de red estan configuradas — el kernel ha procesado la configuracion de red. `network-online.target` significa que la red esta operativa y hay conectividad real (lo que implica DHCP resuelto, DNS funcionando, etc.). Para un servidor TCP que solo necesita tener las interfaces activas para hacer `bind()`, `network.target` es suficiente y mas rapido. Si el bridge intentara conectarse a un endpoint externo en el startup (por ejemplo, el registro al control plane), `network-online.target` seria la dependencia correcta. Como el registro ocurre asincronicamente despues del arranque, `network.target` es adecuado.
+
+---
+
+## contrib/launchd/com.latticeshield.bridge.plist — Servicio en macOS
+
+```xml
+<dict>
+  <key>Label</key>
+  <string>com.latticeshield.bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/latticeshield-bridge</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>/etc/latticeshield/config.toml</string>
+  </array>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/latticeshield/bridge.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/var/log/latticeshield/bridge.err</string>
+</dict>
+```
+
+launchd es el equivalente de systemd en macOS. El plist sigue las convenciones estandar:
+
+`Label` — el identificador unico del servicio. La convencion de Apple es dominio inverso (reverse-DNS notation): `com.latticeshield.bridge`.
+
+`KeepAlive: true` — launchd reinicia el proceso si termina por cualquier razon, equivalente a `Restart=always` de systemd. A diferencia de systemd, launchd no distingue entre exit code 0 y != 0 cuando `KeepAlive` es `true`.
+
+`RunAtLoad: true` — el servicio arranca automaticamente cuando el plist se carga (tipicamente en el boot o cuando el usuario hace `launchctl load`).
+
+`StandardOutPath` / `StandardErrorPath` — launchd no integra un journal como systemd. Los logs van a archivos. `bridge.log` recibe stdout (los logs de tracing del bridge, que van a stdout por defecto) y `bridge.err` recibe stderr (errores fatales o panic output).
+
+### Por que no incluir hardening equivalente a systemd?
+
+launchd tiene soporte limitado para sandboxing comparable a `ProtectSystem=strict` de systemd. Las directivas de sandbox de launchd (`SandboxProfile`) usan un DSL propio (Scheme-based) que es significativamente mas complejo de configurar correctamente y no esta documentado publicamente por Apple. Para un archivo de ejemplo listo para produccion, incluir un perfil de sandbox incompleto o incorrecto seria mas perjudicial que no incluirlo — podria dar una falsa sensacion de seguridad o romper funcionalidad de formas sutiles. El sandboxing avanzado en macOS queda como tarea del operador que conoce el entorno especifico de deployment.
+
+---
+
+## Cargo.toml — Correcciones de dependencias
+
+### metrics-exporter-prometheus — push-gateway feature desactivada
+
+```toml
+# Antes (workspace Cargo.toml):
+metrics-exporter-prometheus = { version = "0.13" }
+
+# Despues:
+metrics-exporter-prometheus = { version = "0.13", default-features = false, features = ["http-listener"] }
+```
+
+`metrics-exporter-prometheus 0.13` activa por defecto la feature `push-gateway`, que implementa el modo de envio de metricas al Prometheus Pushgateway en lugar del modelo de scraping. Esa feature trae `native-tls` como dependencia transitiva, lo que viola la restriccion del proyecto de no usar OpenSSL.
+
+LatticeShield usa exclusivamente el modelo de scraping — el listener HTTP en `:8444` que Prometheus consulta periodicamente. La feature `http-listener` es la que implementa ese modelo. Desactivar `default-features` y activar solo `http-listener` elimina la dependencia de `native-tls` y reduce el tamano del binario al no compilar codigo que nunca se usa.
+
+### latticeshield-cli reqwest — default-features desactivados
+
+```toml
+# Antes (latticeshield-cli/Cargo.toml):
+reqwest = { version = "0.12" }
+
+# Despues:
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots-no-provider"] }
+```
+
+`reqwest` con default-features activa `default-tls`, que trae `native-tls` — OpenSSL en Linux. El CLI usa `reqwest` para el subcomando `vk-share`, que hace una solicitud HTTP al bridge. La feature `rustls-tls-native-roots-no-provider` usa rustls (ya presente en el workspace) en lugar de OpenSSL, consistente con el resto del proyecto. La logica de `-no-provider` es la misma explicada en Mes 15: el workspace ya tiene `aws-lc-rs` instalado como CryptoProvider global; usar la variante sin provider delegation causaria un panic por doble instalacion.
+
+`blocking` es necesaria porque el CLI no usa `tokio` — es un binario sincrono. La feature `blocking` de reqwest expone la API sincrona que no requiere un runtime async.
+
+### Por que estas correcciones en Mes 19 y no antes?
+
+Las features erroneas no causaban fallos de compilacion ni de tests — la build simplemente incluia codigo extra y dependencias no deseadas. El pipeline de release fue el momento natural para detectarlas: al compilar para el target `aarch64-unknown-linux-gnu` con cross-compile, las dependencias de C nativas (OpenSSL) son mucho mas problematicas que en un build nativo. El proceso de preparar el cross-compile para el release hizo estas dependencias inaceptables en la practica.
+
+---
