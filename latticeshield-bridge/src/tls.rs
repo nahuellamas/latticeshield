@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 /// Load a PEM-encoded certificate chain from `path`.
@@ -42,12 +42,14 @@ pub fn build_server_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .with_context(|| format!(
-            "invalid cert/key pair — cert: {}, key: {}\n\
+        .with_context(|| {
+            format!(
+                "invalid cert/key pair — cert: {}, key: {}\n\
              Hint: run `latticeshield-bridge tls-keygen ./keys` to generate a self-signed cert",
-            cert_path.display(),
-            key_path.display()
-        ))?;
+                cert_path.display(),
+                key_path.display()
+            )
+        })?;
     Ok(Arc::new(config))
 }
 
@@ -118,9 +120,7 @@ mod tests {
             .expect("rcgen failed");
         let mut cert_f = NamedTempFile::new().unwrap();
         let mut key_f = NamedTempFile::new().unwrap();
-        cert_f
-            .write_all(certified.cert.pem().as_bytes())
-            .unwrap();
+        cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
         key_f
             .write_all(certified.key_pair.serialize_pem().as_bytes())
             .unwrap();
@@ -145,12 +145,9 @@ mod tests {
 
     #[test]
     fn build_acceptor_missing_key_file_err() {
-        let certified =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let mut cert_f = NamedTempFile::new().unwrap();
-        cert_f
-            .write_all(certified.cert.pem().as_bytes())
-            .unwrap();
+        cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
         let err = build_acceptor(cert_f.path(), Path::new("/nonexistent/tls.key"))
             .err()
             .expect("should be Err")

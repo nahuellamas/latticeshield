@@ -14,7 +14,11 @@ use std::sync::Arc;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "latticeshield-client", version, about = "LatticeShield PQC Client Proxy")]
+#[command(
+    name = "latticeshield-client",
+    version,
+    about = "LatticeShield PQC Client Proxy"
+)]
 struct Cli {
     #[arg(long, default_value = "./latticeshield-client.toml")]
     config: PathBuf,
@@ -29,9 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Inicializar tracing
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| config.log_level.clone()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| config.log_level.clone()))
         .init();
 
     // Cargar VerifyingKey del servidor
@@ -39,13 +41,13 @@ async fn main() -> anyhow::Result<()> {
     let vk = Arc::new(vk);
 
     // Cargar ClientIdentity si se configuro client_sk_path
-    let client_identity: Option<Arc<ClientIdentity>> =
-        if let Some(sk_path) = &config.client_sk_path {
-            let identity = ClientIdentity::load(sk_path)?;
-            Some(Arc::new(identity))
-        } else {
-            None
-        };
+    let client_identity: Option<Arc<ClientIdentity>> = if let Some(sk_path) = &config.client_sk_path
+    {
+        let identity = ClientIdentity::load(sk_path)?;
+        Some(Arc::new(identity))
+    } else {
+        None
+    };
 
     // Arrancar servidor
     server::run(config, vk, client_identity).await?;

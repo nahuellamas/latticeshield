@@ -11,8 +11,7 @@ use tracing::{info, warn};
 
 use latticeshield_crypto::{
     client_respond, parse_server_hello_signed, serialize_client_response,
-    serialize_client_response_signed,
-    EncryptedChannel, FrameResult, VerifyingKey,
+    serialize_client_response_signed, EncryptedChannel, FrameResult, VerifyingKey,
     SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 
@@ -90,8 +89,8 @@ pub async fn handle(
     };
 
     // ── Respuesta del cliente: encapsular + derivar session key ──────────────
-    let (response, session_key) = client_respond(&hello, &mut OsRng)
-        .context("client_respond failed")?;
+    let (response, session_key) =
+        client_respond(&hello, &mut OsRng).context("client_respond failed")?;
 
     // ── Enviar respuesta al bridge (con o sin firma del cliente) ─────────────
     match &client_identity {
@@ -195,7 +194,12 @@ mod tests {
     fn make_pool(bridge_addr: SocketAddr) -> Arc<ConnectionPool> {
         Arc::new(ConnectionPool::new(
             bridge_addr,
-            PoolConfig { max_size: 1, idle_timeout_secs: 30, warm_size: 0, warm_interval_secs: 5 },
+            PoolConfig {
+                max_size: 1,
+                idle_timeout_secs: 30,
+                warm_size: 0,
+                warm_interval_secs: 5,
+            },
         ))
     }
 
@@ -213,9 +217,8 @@ mod tests {
         let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let user_addr = user_listener.local_addr().unwrap();
 
-        let connect_task = tokio::spawn(async move {
-            TcpStream::connect(user_addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
         let (user_server_side, _) = user_listener.accept().await.unwrap();
         let mut user_client_side = connect_task.await.unwrap();
 
@@ -225,12 +228,18 @@ mod tests {
 
         // handle debe retornar Ok(()) — error de sesion, no fatal.
         let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
-        assert!(result.is_ok(), "handle should return Ok(()) on bridge refused, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "handle should return Ok(()) on bridge refused, got: {result:?}"
+        );
 
         // El usuario debe recibir EOF (handle hace shutdown del user write side).
         let mut buf = [0u8; 1];
         let n = user_client_side.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "user side should receive EOF after bridge connect failure");
+        assert_eq!(
+            n, 0,
+            "user side should receive EOF after bridge connect failure"
+        );
     }
 
     #[tokio::test]
@@ -255,9 +264,8 @@ mod tests {
         let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let user_addr = user_listener.local_addr().unwrap();
 
-        let connect_task = tokio::spawn(async move {
-            TcpStream::connect(user_addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
 
         let (user_server_side, _) = user_listener.accept().await.unwrap();
         let _user_client_side = connect_task.await.unwrap();
@@ -268,7 +276,10 @@ mod tests {
 
         // handle debe retornar Ok(()) — error de sesion, no fatal
         let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
-        assert!(result.is_ok(), "handle should return Ok(()) for auth failure, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "handle should return Ok(()) for auth failure, got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -290,9 +301,8 @@ mod tests {
         // User side.
         let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let user_addr = user_listener.local_addr().unwrap();
-        let connect_task = tokio::spawn(async move {
-            TcpStream::connect(user_addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
         let (user_server_side, _) = user_listener.accept().await.unwrap();
         let _user_client_side = connect_task.await.unwrap();
 
@@ -310,7 +320,10 @@ mod tests {
 
         // El bridge cierra sin enviar datos → read_exact del hello falla → stale retry → falla también → handle Ok(())
         let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
-        assert!(result.is_ok(), "handle should return Ok(()) when bridge closes early, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "handle should return Ok(()) when bridge closes early, got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -325,9 +338,8 @@ mod tests {
 
         let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let user_addr = user_listener.local_addr().unwrap();
-        let connect_task = tokio::spawn(async move {
-            TcpStream::connect(user_addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
         let (user_server_side, _) = user_listener.accept().await.unwrap();
         let mut user_client_side = connect_task.await.unwrap();
 
@@ -345,7 +357,10 @@ mod tests {
 
         // acquire falla → Ok(()) con user recibiendo EOF.
         let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
-        assert!(result.is_ok(), "handle should return Ok(()) after acquire fails, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "handle should return Ok(()) after acquire fails, got: {result:?}"
+        );
 
         let mut buf = [0u8; 1];
         let n = user_client_side.read(&mut buf).await.unwrap();
@@ -375,9 +390,8 @@ mod tests {
 
         let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let user_addr = user_listener.local_addr().unwrap();
-        let connect_task = tokio::spawn(async move {
-            TcpStream::connect(user_addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { TcpStream::connect(user_addr).await.unwrap() });
         let (user_server_side, _) = user_listener.accept().await.unwrap();
         let _user_client_side = connect_task.await.unwrap();
 
@@ -394,11 +408,17 @@ mod tests {
         let pool = make_pool(bridge_addr);
 
         let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
-        assert!(result.is_ok(), "handle should return Ok(()) on auth failure, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "handle should return Ok(()) on auth failure, got: {result:?}"
+        );
 
         // Solo debe haber 1 conexion al bridge — no reintentos por auth failure.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let count = accept_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(count, 1, "bridge should only be connected once (no retry on auth failure), got: {count}");
+        assert_eq!(
+            count, 1,
+            "bridge should only be connected once (no retry on auth failure), got: {count}"
+        );
     }
 }

@@ -31,9 +31,7 @@ pub async fn run(
     info!(bridge = %config.bridge_addr, "targeting bridge");
 
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    )?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         #[cfg(unix)]
@@ -109,7 +107,10 @@ mod tests {
 
         // Connect to the server
         let result = TcpStream::connect(listen_addr).await;
-        assert!(result.is_ok(), "should be able to connect to running server");
+        assert!(
+            result.is_ok(),
+            "should be able to connect to running server"
+        );
 
         task.abort();
     }

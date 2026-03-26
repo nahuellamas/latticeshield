@@ -1,7 +1,7 @@
 [advisories]
 vulnerability = "deny"
-unmaintained  = "warn"
-unsound       = "deny"
+unmaintained  = "all"
+unsound       = "all"
 ignore = [
     # RUSTSEC-2025-0144: ml-dsa timing side-channel.
     # Usado solo para OTA signing (no implementado aun). Migrar a libcrux-ml-dsa en Mes 3.

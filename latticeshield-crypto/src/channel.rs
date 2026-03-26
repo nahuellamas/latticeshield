@@ -206,7 +206,9 @@ impl EncryptedChannel {
                 Ok(FrameResult::KeyRotate(rotation_nonce))
             }
 
-            other => Err(FrameError::Invalid(format!("unknown frame type: {other:#04x}"))),
+            other => Err(FrameError::Invalid(format!(
+                "unknown frame type: {other:#04x}"
+            ))),
         }
     }
 
@@ -228,10 +230,22 @@ impl EncryptedChannel {
             .encrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce)
             .map_err(|_| anyhow::anyhow!("KEY_ROTATE encrypt failed"))?;
 
-        writer.write_all(&[FRAME_KEY_ROTATE]).await.context("write KEY_ROTATE type")?;
-        writer.write_all(&gcm_nonce_bytes).await.context("write KEY_ROTATE gcm_nonce")?;
-        writer.write_all(&rotation_nonce).await.context("write KEY_ROTATE encrypted nonce")?;
-        writer.write_all(tag.as_slice()).await.context("write KEY_ROTATE tag")?;
+        writer
+            .write_all(&[FRAME_KEY_ROTATE])
+            .await
+            .context("write KEY_ROTATE type")?;
+        writer
+            .write_all(&gcm_nonce_bytes)
+            .await
+            .context("write KEY_ROTATE gcm_nonce")?;
+        writer
+            .write_all(&rotation_nonce)
+            .await
+            .context("write KEY_ROTATE encrypted nonce")?;
+        writer
+            .write_all(tag.as_slice())
+            .await
+            .context("write KEY_ROTATE tag")?;
         Ok(())
     }
 
@@ -243,7 +257,8 @@ impl EncryptedChannel {
     pub fn rotate_key(&mut self, nonce: &[u8; 32]) {
         let hkdf = Hkdf::<Sha256>::new(Some(nonce), self.key_bytes.as_ref());
         let mut new_key = Zeroizing::new([0u8; 32]);
-        hkdf.expand(ROTATION_HKDF_INFO, new_key.as_mut()).expect("HKDF expand");
+        hkdf.expand(ROTATION_HKDF_INFO, new_key.as_mut())
+            .expect("HKDF expand");
 
         // Reemplazar cipher con la nueva clave.
         // Zeroizing<T> implementa Deref<Target=T>, por eso &*new_key da &[u8; 32].
@@ -282,8 +297,15 @@ mod tests {
         let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let rotation_nonce = [0xABu8; 32];
         let mut buf = Vec::new();
-        channel.send_key_rotate(&mut buf, &rotation_nonce).await.unwrap();
-        assert_eq!(buf.len(), KEY_ROTATE_FRAME_LEN, "KEY_ROTATE frame must be exactly 61 bytes");
+        channel
+            .send_key_rotate(&mut buf, &rotation_nonce)
+            .await
+            .unwrap();
+        assert_eq!(
+            buf.len(),
+            KEY_ROTATE_FRAME_LEN,
+            "KEY_ROTATE frame must be exactly 61 bytes"
+        );
         assert_eq!(buf[0], 0x02, "KEY_ROTATE frame must start with 0x02");
     }
 
@@ -292,7 +314,10 @@ mod tests {
         let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let rotation_nonce = [0xABu8; 32];
         let mut buf = Vec::new();
-        channel.send_key_rotate(&mut buf, &rotation_nonce).await.unwrap();
+        channel
+            .send_key_rotate(&mut buf, &rotation_nonce)
+            .await
+            .unwrap();
 
         // Flip a byte in the encrypted payload (after [type=1B][gcm_nonce=12B])
         buf[14] ^= 0xFF;
@@ -327,7 +352,10 @@ mod tests {
         let mut receiver = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let rotation_nonce = [0x7Fu8; 32];
         let mut buf = Vec::new();
-        sender.send_key_rotate(&mut buf, &rotation_nonce).await.unwrap();
+        sender
+            .send_key_rotate(&mut buf, &rotation_nonce)
+            .await
+            .unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
         match receiver.read_frame(&mut cursor).await.unwrap() {
@@ -341,7 +369,11 @@ mod tests {
         let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let buf = vec![0x00u8]; // INVALID type
         let mut cursor = std::io::Cursor::new(buf);
-        let err = channel.read_frame(&mut cursor).await.unwrap_err().to_string();
+        let err = channel
+            .read_frame(&mut cursor)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown frame type"), "got: {err}");
     }
 
@@ -350,7 +382,11 @@ mod tests {
         let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let buf = vec![0x99u8]; // RESERVED
         let mut cursor = std::io::Cursor::new(buf);
-        let err = channel.read_frame(&mut cursor).await.unwrap_err().to_string();
+        let err = channel
+            .read_frame(&mut cursor)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown frame type"), "got: {err}");
     }
 
@@ -363,7 +399,10 @@ mod tests {
 
         // Cifrar antes de rotar
         let mut buf_before = Vec::new();
-        channel.write_frame(&mut buf_before, plaintext).await.unwrap();
+        channel
+            .write_frame(&mut buf_before, plaintext)
+            .await
+            .unwrap();
 
         // Rotar la clave
         let nonce = [0x11u8; 32];
@@ -371,7 +410,10 @@ mod tests {
 
         // Cifrar el mismo plaintext con la nueva clave
         let mut buf_after = Vec::new();
-        channel.write_frame(&mut buf_after, plaintext).await.unwrap();
+        channel
+            .write_frame(&mut buf_after, plaintext)
+            .await
+            .unwrap();
 
         // Los ciphertexts deben ser distintos (claves distintas)
         // (Nota: nonces aleatorios ya los hacen distintos; este test verifica que rotate_key cambia el cipher)
@@ -464,7 +506,11 @@ mod tests {
         // Primero encontrar el offset del segundo frame:
         // frame 0 = 1+4+8+12+len bytes; len = plaintext(7) + TAG_LEN(16) = 23
         let frame0_len = 1 + 4 + 8 + 12 + (7 + TAG_LEN);
-        let seq1 = u64::from_be_bytes(buf[frame0_len + 1 + 4..frame0_len + 1 + 4 + 8].try_into().unwrap());
+        let seq1 = u64::from_be_bytes(
+            buf[frame0_len + 1 + 4..frame0_len + 1 + 4 + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(seq1, 1, "second frame must have seq=1");
         assert_eq!(channel.send_seq, 2, "send_seq must be 2 after second write");
     }
@@ -486,7 +532,13 @@ mod tests {
         let mut cursor2 = std::io::Cursor::new(wire.clone());
         let err = reader.read_frame(&mut cursor2).await.unwrap_err();
         assert!(
-            matches!(err, FrameError::Replay { received: 0, last_seen: 0 }),
+            matches!(
+                err,
+                FrameError::Replay {
+                    received: 0,
+                    last_seen: 0
+                }
+            ),
             "expected Replay, got: {err:?}"
         );
     }
@@ -550,6 +602,9 @@ mod tests {
         chan_b.read_frame(&mut cursor).await.unwrap();
         chan_b.read_frame(&mut cursor).await.unwrap();
 
-        assert_eq!(chan_b.recv_seq, 2, "recv_seq must be 2 after reading 3 frames (seq 0,1,2)");
+        assert_eq!(
+            chan_b.recv_seq, 2,
+            "recv_seq must be 2 after reading 3 frames (seq 0,1,2)"
+        );
     }
 }

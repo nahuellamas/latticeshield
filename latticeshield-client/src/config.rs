@@ -28,10 +28,18 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_pool_max_size() -> usize { 4 }
-fn default_pool_idle_timeout_secs() -> u64 { 30 }
-fn default_pool_warm_size() -> usize { 2 }
-fn default_pool_warm_interval_secs() -> u64 { 5 }
+fn default_pool_max_size() -> usize {
+    4
+}
+fn default_pool_idle_timeout_secs() -> u64 {
+    30
+}
+fn default_pool_warm_size() -> usize {
+    2
+}
+fn default_pool_warm_interval_secs() -> u64 {
+    5
+}
 
 // ── Sub-structs ────────────────────────────────────────────────────────────────
 

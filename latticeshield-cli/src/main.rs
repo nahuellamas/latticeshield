@@ -72,21 +72,48 @@ enum KeygenTarget {
 
 fn print_banner() {
     // Inner width: 58 visible chars between ║ and ║ (total line = 60)
-    let top    = "╔══════════════════════════════════════════════════════════╗";
+    let top = "╔══════════════════════════════════════════════════════════╗";
     let bottom = "╚══════════════════════════════════════════════════════════╝";
-    let empty  = "║                                                          ║";
+    let empty = "║                                                          ║";
 
     println!("{}", top.cyan());
     println!("{}", empty.cyan());
-    println!("{}", "║                        ╔══╦══╦══╗                        ║".cyan());
-    println!("{}", "║                        ║  ║██║  ║                        ║".cyan());
-    println!("{}", "║                        ╠══╬══╬══╣                        ║".cyan());
-    println!("{}", "║                        ║██║  ║██║                        ║".cyan());
-    println!("{}", "║                        ╠══╩══╩══╣                        ║".cyan());
-    println!("{}", "║                         ╲  LS  ╱                         ║".cyan());
-    println!("{}", "║                          ╲    ╱                          ║".cyan());
-    println!("{}", "║                           ╲  ╱                           ║".cyan());
-    println!("{}", "║                            ╲╱                            ║".cyan());
+    println!(
+        "{}",
+        "║                        ╔══╦══╦══╗                        ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                        ║  ║██║  ║                        ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                        ╠══╬══╬══╣                        ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                        ║██║  ║██║                        ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                        ╠══╩══╩══╣                        ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                         ╲  LS  ╱                         ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                          ╲    ╱                          ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                           ╲  ╱                           ║".cyan()
+    );
+    println!(
+        "{}",
+        "║                            ╲╱                            ║".cyan()
+    );
     println!("{}", empty.cyan());
 
     // Title — border cyan, text white bold
@@ -138,15 +165,16 @@ fn main() -> anyhow::Result<()> {
             KeygenTarget::Client { dir } => {
                 latticeshield_client::identity::ClientIdentity::generate_and_save(&dir)
             }
-            KeygenTarget::Tls { dir } => {
-                latticeshield_bridge::tls::generate_self_signed(&dir)
-            }
+            KeygenTarget::Tls { dir } => latticeshield_bridge::tls::generate_self_signed(&dir),
         },
         Some(Commands::VkInfo { path }) => {
             let vk = latticeshield_client::identity::load_verifying_key(&path)?;
             let fp = latticeshield_client::identity::fingerprint(&vk);
             println!("File:    {}", path.display());
-            println!("Size:    {} bytes (ML-DSA-65 VerifyingKey)", vk.to_bytes().len());
+            println!(
+                "Size:    {} bytes (ML-DSA-65 VerifyingKey)",
+                vk.to_bytes().len()
+            );
             println!("SHA-256: {fp}");
             Ok(())
         }

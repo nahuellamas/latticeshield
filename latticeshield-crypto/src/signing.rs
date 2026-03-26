@@ -54,9 +54,8 @@ impl SigningKey {
     /// Retorna `SigningError::InvalidLength` si `bytes` no tiene exactamente
     /// `SIGNING_KEY_LEN` bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SigningError> {
-        let arr: [u8; SIGNING_KEY_LEN] = bytes
-            .try_into()
-            .map_err(|_| SigningError::InvalidLength)?;
+        let arr: [u8; SIGNING_KEY_LEN] =
+            bytes.try_into().map_err(|_| SigningError::InvalidLength)?;
         Ok(Self::new(arr))
     }
 
@@ -106,9 +105,8 @@ impl VerifyingKey {
     /// Retorna `SigningError::InvalidLength` si `bytes` no tiene exactamente
     /// `VERIFYING_KEY_LEN` bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SigningError> {
-        let arr: [u8; VERIFYING_KEY_LEN] = bytes
-            .try_into()
-            .map_err(|_| SigningError::InvalidLength)?;
+        let arr: [u8; VERIFYING_KEY_LEN] =
+            bytes.try_into().map_err(|_| SigningError::InvalidLength)?;
         Ok(Self(arr))
     }
 
@@ -138,9 +136,7 @@ impl Signature {
     /// Retorna `SigningError::InvalidLength` si `bytes` no tiene exactamente
     /// `SIGNATURE_LEN` bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SigningError> {
-        let arr: [u8; SIGNATURE_LEN] = bytes
-            .try_into()
-            .map_err(|_| SigningError::InvalidLength)?;
+        let arr: [u8; SIGNATURE_LEN] = bytes.try_into().map_err(|_| SigningError::InvalidLength)?;
         Ok(Self(arr))
     }
 
@@ -165,9 +161,7 @@ impl std::fmt::Debug for Signature {
 /// Genera un par de claves ML-DSA-65 usando la fuente de aleatoriedad dada.
 ///
 /// La clave de firma se zeroiza automaticamente al salir del scope.
-pub fn generate_keypair(
-    rng: &mut impl CryptoRngCore,
-) -> (SigningKey, VerifyingKey) {
+pub fn generate_keypair(rng: &mut impl CryptoRngCore) -> (SigningKey, VerifyingKey) {
     let mut seed = [0u8; libcrux_ml_dsa::KEY_GENERATION_RANDOMNESS_SIZE];
     rng.fill_bytes(&mut seed);
 
@@ -206,8 +200,7 @@ pub fn verify(key: &VerifyingKey, msg: &[u8], sig: &Signature) -> Result<(), Sig
     let vk = ml_dsa_65::MLDSA65VerificationKey::new(key.0);
     let s = ml_dsa_65::MLDSA65Signature::new(sig.0);
 
-    ml_dsa_65::portable::verify(&vk, msg, EMPTY_CONTEXT, &s)
-        .map_err(|_| SigningError::Verification)
+    ml_dsa_65::portable::verify(&vk, msg, EMPTY_CONTEXT, &s).map_err(|_| SigningError::Verification)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

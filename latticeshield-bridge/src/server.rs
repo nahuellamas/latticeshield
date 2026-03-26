@@ -7,12 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::header::CONTENT_TYPE,
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{extract::State, http::header::CONTENT_TYPE, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -20,7 +15,16 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::{config::ValidConfig, control_plane, control_plane::BridgeCommand, http_relay::HttpRelay, identity::{ClientVerifyingIdentity, ServerIdentity}, metrics, metrics::MetricsState, quic, session, tls, vk_share};
+use crate::{
+    config::ValidConfig,
+    control_plane,
+    control_plane::BridgeCommand,
+    http_relay::HttpRelay,
+    identity::{ClientVerifyingIdentity, ServerIdentity},
+    metrics,
+    metrics::MetricsState,
+    quic, session, tls, vk_share,
+};
 
 /// Estado compartido del servidor HTTP de metricas.
 /// Se pasa a los handlers axum via State extractor.
@@ -48,8 +52,8 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
             {
                 use tokio::signal::unix::{signal, SignalKind};
                 let ctrl_c = tokio::signal::ctrl_c();
-                let mut sigterm = signal(SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
                 tokio::select! {
                     _ = ctrl_c => info!("shutdown: SIGINT received"),
                     _ = sigterm.recv() => info!("shutdown: SIGTERM received"),
@@ -65,18 +69,20 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     }
 
     // ── Cargar identidad del servidor (falla rapido si no existe o permisos incorrectos)
-    let identity = Arc::new(
-        ServerIdentity::load(&config.signing_key_path)
-            .map_err(|e| anyhow::anyhow!(
-                "no se pudo cargar el keypair del servidor: {e}\n\
+    let identity = Arc::new(ServerIdentity::load(&config.signing_key_path).map_err(|e| {
+        anyhow::anyhow!(
+            "no se pudo cargar el keypair del servidor: {e}\n\
                  Hint: ejecuta `latticeshield-bridge --keygen ./keys` para generar las claves."
-            ))?,
-    );
+        )
+    })?);
     info!(path = %config.signing_key_path.display(), "identidad del servidor cargada");
 
     // ── Cargar VK del cliente para autenticacion mutua (opcional) ───────────
     let client_vk: Option<Arc<ClientVerifyingIdentity>> = if config.client_auth_enabled {
-        let path = config.client_vk_path.as_ref().expect("client_auth_enabled => client_vk_path is Some");
+        let path = config
+            .client_vk_path
+            .as_ref()
+            .expect("client_auth_enabled => client_vk_path is Some");
         let vk = ClientVerifyingIdentity::load(path)
             .map_err(|e| anyhow::anyhow!(
                 "no se pudo cargar la VK del cliente desde {}: {e}\n\
@@ -98,7 +104,8 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
         prometheus_handle: metrics_handle.clone(),
     };
     // 5.3: metrics server with graceful shutdown
-    let metrics_handle_task = spawn_metrics_server(config.metrics_addr, app_state, shutdown_rx.clone());
+    let metrics_handle_task =
+        spawn_metrics_server(config.metrics_addr, app_state, shutdown_rx.clone());
 
     // ── QUIC listener (optional — only when quic.enabled = true) ────────────
     let quic_handle = if config.quic_enabled {
@@ -109,26 +116,35 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
 
     // ── TLS listener (optional — only when tls.enabled = true) ──────────────
     let tls_handle = if config.tls_enabled {
-        let acceptor = tls::build_acceptor(&config.tls_cert_path, &config.tls_key_path)
-            .map_err(|e| anyhow::anyhow!(
+        let acceptor =
+            tls::build_acceptor(&config.tls_cert_path, &config.tls_key_path).map_err(|e| {
+                anyhow::anyhow!(
                 "TLS setup failed: {e}\n\
                  Hint: use `latticeshield-bridge tls-keygen ./keys` to generate a self-signed cert."
-            ))?;
-        Some(spawn_tls_listener(config.clone(), Arc::new(acceptor), Arc::clone(&vk_store), shutdown_rx.clone()))
+            )
+            })?;
+        Some(spawn_tls_listener(
+            config.clone(),
+            Arc::new(acceptor),
+            Arc::clone(&vk_store),
+            shutdown_rx.clone(),
+        ))
     } else {
         None
     };
 
     // ── Admin PQC listener (:8445 — optional) ───────────────────────────────
     let admin_handle = if config.admin_enabled {
-        let path = config.admin_control_plane_vk_path.as_ref()
-            .expect("admin_enabled => admin_control_plane_vk_path is Some — validado en Config::validate()");
-        let cp_vk = crate::identity::ControlPlaneVerifyingIdentity::load(path)
-            .map_err(|e| anyhow::anyhow!(
+        let path = config.admin_control_plane_vk_path.as_ref().expect(
+            "admin_enabled => admin_control_plane_vk_path is Some — validado en Config::validate()",
+        );
+        let cp_vk = crate::identity::ControlPlaneVerifyingIdentity::load(path).map_err(|e| {
+            anyhow::anyhow!(
                 "no se pudo cargar la VK del control plane desde {}: {e}\n\
                  Hint: ejecuta `latticeshield-bridge admin-keygen ./keys` para generar las claves.",
                 path.display()
-            ))?;
+            )
+        })?;
         let handle = crate::admin::spawn_admin_listener(
             config.admin_listen_addr,
             Arc::clone(&identity),
@@ -165,11 +181,16 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                 match cmd {
                     BridgeCommand::Rotate => {
                         rotate_tx.send_modify(|c| *c += 1);
-                        let active = metrics_state.connections_active
+                        let active = metrics_state
+                            .connections_active
                             .load(std::sync::atomic::Ordering::Relaxed);
-                        metrics_state.key_rotations_total
+                        metrics_state
+                            .key_rotations_total
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(active_sessions = active, "BridgeCommand::Rotate executed — key rotation triggered");
+                        tracing::info!(
+                            active_sessions = active,
+                            "BridgeCommand::Rotate executed — key rotation triggered"
+                        );
                     }
                     BridgeCommand::Unknown => {
                         tracing::warn!("unknown BridgeCommand received, skipping");
@@ -225,35 +246,56 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     }
 
     // ── Drain phase — wait for in-flight sessions ────────────────────────────
-    info!("shutdown: draining {} in-flight sessions", session_handles.len());
+    info!(
+        "shutdown: draining {} in-flight sessions",
+        session_handles.len()
+    );
     for handle in session_handles {
-        if tokio::time::timeout(config.shutdown_timeout, handle).await.is_err() {
+        if tokio::time::timeout(config.shutdown_timeout, handle)
+            .await
+            .is_err()
+        {
             warn!("shutdown: session drain timeout exceeded, forcing exit");
         }
     }
 
     // Wait for listener tasks to finish
     if let Some(h) = tls_handle {
-        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+        if tokio::time::timeout(config.shutdown_timeout, h)
+            .await
+            .is_err()
+        {
             warn!("shutdown: TLS listener drain timeout exceeded, forcing exit");
         }
     }
     if let Some(h) = quic_handle {
-        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+        if tokio::time::timeout(config.shutdown_timeout, h)
+            .await
+            .is_err()
+        {
             warn!("shutdown: QUIC listener drain timeout exceeded, forcing exit");
         }
     }
     if let Some(h) = admin_handle {
-        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+        if tokio::time::timeout(config.shutdown_timeout, h)
+            .await
+            .is_err()
+        {
             warn!("shutdown: admin listener drain timeout exceeded, forcing exit");
         }
     }
     if let Some(h) = cp_handle {
-        if tokio::time::timeout(config.shutdown_timeout, h).await.is_err() {
+        if tokio::time::timeout(config.shutdown_timeout, h)
+            .await
+            .is_err()
+        {
             warn!("shutdown: control_plane drain timeout exceeded, forcing exit");
         }
     }
-    if tokio::time::timeout(config.shutdown_timeout, metrics_handle_task).await.is_err() {
+    if tokio::time::timeout(config.shutdown_timeout, metrics_handle_task)
+        .await
+        .is_err()
+    {
         warn!("shutdown: metrics server drain timeout exceeded, forcing exit");
     }
 
@@ -408,7 +450,10 @@ fn spawn_tls_listener(
                                     let _ = w.write_all(&response).await;
                                 } else {
                                     // ── All other paths — relay to backend ──
-                                    if let Err(e) = relay.handle_with_preread(tls_stream, peer, head_bytes).await {
+                                    if let Err(e) = relay
+                                        .handle_with_preread(tls_stream, peer, head_bytes)
+                                        .await
+                                    {
                                         tracing::warn!(%peer, "TLS relay error: {e:#}");
                                     }
                                 }
@@ -507,19 +552,20 @@ async fn metrics_handler(State(state): State<MetricsAppState>) -> impl IntoRespo
     )
 }
 
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{Request, StatusCode};
     use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     fn make_test_state() -> MetricsAppState {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        MetricsAppState { prometheus_handle: recorder.handle() }
+        MetricsAppState {
+            prometheus_handle: recorder.handle(),
+        }
     }
 
     #[tokio::test]
@@ -625,8 +671,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_http_head_returns_complete_on_valid_request() {
-        use tokio::io::AsyncWriteExt as _;
         use crate::http_relay::tests_pub::make_tls_pair;
+        use tokio::io::AsyncWriteExt as _;
 
         let (mut client_tls, mut server_tls, _peer) = make_tls_pair().await;
         let req = b"GET /vk/token123 HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -640,13 +686,16 @@ mod tests {
             matches!(result, HeadResult::Complete(_)),
             "expected Complete, got something else"
         );
-        assert!(buf.windows(4).any(|w| w == b"\r\n\r\n"), "buf must contain \\r\\n\\r\\n");
+        assert!(
+            buf.windows(4).any(|w| w == b"\r\n\r\n"),
+            "buf must contain \\r\\n\\r\\n"
+        );
     }
 
     #[tokio::test]
     async fn read_http_head_returns_too_large_on_oversized_head() {
-        use tokio::io::AsyncWriteExt as _;
         use crate::http_relay::tests_pub::make_tls_pair;
+        use tokio::io::AsyncWriteExt as _;
 
         let (mut client_tls, mut server_tls, _peer) = make_tls_pair().await;
         // 9 KiB of garbage with no \r\n\r\n
@@ -685,7 +734,10 @@ mod tests {
     fn spawn_cmd_handler(
         metrics_state: Arc<MetricsState>,
         rotate_tx: Arc<watch::Sender<u64>>,
-    ) -> (tokio::sync::mpsc::Sender<BridgeCommand>, watch::Receiver<u64>) {
+    ) -> (
+        tokio::sync::mpsc::Sender<BridgeCommand>,
+        watch::Receiver<u64>,
+    ) {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<BridgeCommand>(32);
         let rotate_rx = rotate_tx.subscribe();
         {
@@ -696,11 +748,16 @@ mod tests {
                     match cmd {
                         BridgeCommand::Rotate => {
                             rotate_tx.send_modify(|c| *c += 1);
-                            let active = metrics_state.connections_active
+                            let active = metrics_state
+                                .connections_active
                                 .load(std::sync::atomic::Ordering::Relaxed);
-                            metrics_state.key_rotations_total
+                            metrics_state
+                                .key_rotations_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::info!(active_sessions = active, "BridgeCommand::Rotate executed — key rotation triggered");
+                            tracing::info!(
+                                active_sessions = active,
+                                "BridgeCommand::Rotate executed — key rotation triggered"
+                            );
                         }
                         BridgeCommand::Unknown => {
                             tracing::warn!("unknown BridgeCommand received, skipping");
@@ -724,7 +781,11 @@ mod tests {
             .await
             .expect("timeout waiting for rotate_rx")
             .expect("rotate_rx changed failed");
-        assert_eq!(*rotate_rx.borrow(), 1, "rotate_tx should have been incremented to 1");
+        assert_eq!(
+            *rotate_rx.borrow(),
+            1,
+            "rotate_tx should have been incremented to 1"
+        );
     }
 
     #[tokio::test]
@@ -736,9 +797,12 @@ mod tests {
 
         cmd_tx.send(BridgeCommand::Rotate).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), rotate_rx.changed())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            ms.key_rotations_total.load(std::sync::atomic::Ordering::Relaxed),
+            ms.key_rotations_total
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "key_rotations_total should be 1 after one Rotate"
         );
@@ -760,7 +824,8 @@ mod tests {
             "rotate_tx should NOT change on Unknown command"
         );
         assert_eq!(
-            ms.key_rotations_total.load(std::sync::atomic::Ordering::Relaxed),
+            ms.key_rotations_total
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "key_rotations_total should remain 0 on Unknown command"
         );
@@ -782,13 +847,23 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while *rotate_rx.borrow() < 3 {
             if tokio::time::Instant::now() > deadline {
-                panic!("timeout: rotate_tx value is {} (expected 3)", *rotate_rx.borrow());
+                panic!(
+                    "timeout: rotate_tx value is {} (expected 3)",
+                    *rotate_rx.borrow()
+                );
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), rotate_rx.changed()).await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(100), rotate_rx.changed())
+                    .await;
         }
-        assert_eq!(*rotate_rx.borrow(), 3, "rotate_tx value should be 3 after 3 Rotates");
         assert_eq!(
-            ms.key_rotations_total.load(std::sync::atomic::Ordering::Relaxed),
+            *rotate_rx.borrow(),
+            3,
+            "rotate_tx value should be 3 after 3 Rotates"
+        );
+        assert_eq!(
+            ms.key_rotations_total
+                .load(std::sync::atomic::Ordering::Relaxed),
             3,
             "key_rotations_total should be 3 after 3 Rotates"
         );

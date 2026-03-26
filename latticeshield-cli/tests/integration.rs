@@ -38,8 +38,16 @@ fn keygen_server_creates_files() {
         use std::os::unix::fs::PermissionsExt;
         let sk_mode = std::fs::metadata(&sk).unwrap().permissions().mode() & 0o777;
         let vk_mode = std::fs::metadata(&vk).unwrap().permissions().mode() & 0o777;
-        assert_eq!(sk_mode, 0o600, "server.sk must have mode 0o600, got {:o}", sk_mode);
-        assert_eq!(vk_mode, 0o644, "server.vk must have mode 0o644, got {:o}", vk_mode);
+        assert_eq!(
+            sk_mode, 0o600,
+            "server.sk must have mode 0o600, got {:o}",
+            sk_mode
+        );
+        assert_eq!(
+            vk_mode, 0o644,
+            "server.vk must have mode 0o644, got {:o}",
+            vk_mode
+        );
     }
 }
 
@@ -66,8 +74,16 @@ fn keygen_client_creates_files() {
         use std::os::unix::fs::PermissionsExt;
         let sk_mode = std::fs::metadata(&sk).unwrap().permissions().mode() & 0o777;
         let vk_mode = std::fs::metadata(&vk).unwrap().permissions().mode() & 0o777;
-        assert_eq!(sk_mode, 0o600, "client.sk must have mode 0o600, got {:o}", sk_mode);
-        assert_eq!(vk_mode, 0o644, "client.vk must have mode 0o644, got {:o}", vk_mode);
+        assert_eq!(
+            sk_mode, 0o600,
+            "client.sk must have mode 0o600, got {:o}",
+            sk_mode
+        );
+        assert_eq!(
+            vk_mode, 0o644,
+            "client.vk must have mode 0o644, got {:o}",
+            vk_mode
+        );
     }
 }
 
@@ -121,8 +137,14 @@ fn vk_info_server_vk() {
 
     let stdout = String::from_utf8(output).unwrap();
 
-    assert!(stdout.contains("SHA-256:"), "stdout must contain 'SHA-256:':\n{stdout}");
-    assert!(stdout.contains("1952"), "stdout must contain '1952' (key size):\n{stdout}");
+    assert!(
+        stdout.contains("SHA-256:"),
+        "stdout must contain 'SHA-256:':\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1952"),
+        "stdout must contain '1952' (key size):\n{stdout}"
+    );
 
     // Verify a 64-char hex value follows SHA-256:
     let sha_line = stdout
@@ -153,7 +175,10 @@ fn vk_info_server_vk() {
 fn vk_info_missing_file() {
     Command::cargo_bin("latticeshield")
         .unwrap()
-        .args(["vk-info", "/tmp/absolutely-does-not-exist-latticeshield-12345.vk"])
+        .args([
+            "vk-info",
+            "/tmp/absolutely-does-not-exist-latticeshield-12345.vk",
+        ])
         .assert()
         .failure()
         .stdout(predicate::str::is_empty());
@@ -170,5 +195,10 @@ fn banner_not_shown_on_subcommand() {
         .args(["keygen", "server", dir.path().to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\u{2554}\u{2550}\u{2550}\u{2566}\u{2550}\u{2550}\u{2566}\u{2550}\u{2550}\u{2557}").not());
+        .stdout(
+            predicate::str::contains(
+                "\u{2554}\u{2550}\u{2550}\u{2566}\u{2550}\u{2550}\u{2566}\u{2550}\u{2550}\u{2557}",
+            )
+            .not(),
+        );
 }

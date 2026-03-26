@@ -121,7 +121,8 @@ impl HttpRelay {
             Ok(s) => s,
             Err(e) => {
                 warn!(%peer, "backend connect failed: {e}");
-                let resp = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let resp =
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 let _ = client_w.write_all(resp).await;
                 return Ok(());
             }
@@ -187,9 +188,9 @@ mod tests {
         SocketAddr,
     ) {
         use std::sync::Arc;
+        use tokio_rustls::rustls;
         use tokio_rustls::rustls::pki_types::ServerName;
         use tokio_rustls::{TlsAcceptor, TlsConnector};
-        use tokio_rustls::rustls;
 
         // Generate self-signed cert
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -270,7 +271,10 @@ mod tests {
         let mut resp_buf = vec![0u8; 256];
         let n = client_tls.read(&mut resp_buf).await.unwrap();
         let resp = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp.contains("200"), "expected 200 in response, got: {resp}");
+        assert!(
+            resp.contains("200"),
+            "expected 200 in response, got: {resp}"
+        );
 
         // Verify backend received the full raw request bytes
         let received = backend_task.await.unwrap();
@@ -349,7 +353,10 @@ mod tests {
 
         let relay = HttpRelay::new(backend_addr);
         tokio::spawn(async move {
-            relay.handle_with_preread(server_tls, peer, preread).await.unwrap();
+            relay
+                .handle_with_preread(server_tls, peer, preread)
+                .await
+                .unwrap();
         });
 
         // Client sends nothing extra after the head (head is already in preread)
@@ -357,11 +364,17 @@ mod tests {
         let mut resp_buf = vec![0u8; 256];
         let n = client_tls.read(&mut resp_buf).await.unwrap();
         let resp = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp.contains("200"), "expected 200 in response, got: {resp}");
+        assert!(
+            resp.contains("200"),
+            "expected 200 in response, got: {resp}"
+        );
 
         // Backend must have received exactly the preread bytes
         let received = backend_task.await.unwrap();
-        assert_eq!(received, expected_bytes, "backend must receive the preread head bytes verbatim");
+        assert_eq!(
+            received, expected_bytes,
+            "backend must receive the preread head bytes verbatim"
+        );
     }
 
     #[tokio::test]
@@ -371,7 +384,10 @@ mod tests {
         let relay = HttpRelay::new(backend_addr);
         let preread = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
         tokio::spawn(async move {
-            relay.handle_with_preread(server_tls, peer, preread).await.ok();
+            relay
+                .handle_with_preread(server_tls, peer, preread)
+                .await
+                .ok();
         });
 
         let mut buf = vec![0u8; 256];
@@ -417,7 +433,10 @@ mod tests {
 
         let received = backend_task.await.unwrap();
         let received_str = std::str::from_utf8(&received).unwrap();
-        assert!(received_str.contains("POST /submit"), "missing request line");
+        assert!(
+            received_str.contains("POST /submit"),
+            "missing request line"
+        );
         assert!(received_str.contains("hello=world"), "body not forwarded");
     }
 }
@@ -431,10 +450,12 @@ pub mod tests_pub {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio_rustls::{client::TlsStream as ClientTlsStream, server::TlsStream as ServerTlsStream};
-    use tokio_rustls::{TlsAcceptor, TlsConnector};
     use tokio_rustls::rustls;
     use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::{
+        client::TlsStream as ClientTlsStream, server::TlsStream as ServerTlsStream,
+    };
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     /// Spin up a real TLS server+client pair using an rcgen self-signed cert.
     /// Returns `(client_tls, server_tls, server_peer_addr)`.

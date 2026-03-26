@@ -70,14 +70,22 @@ impl ServerIdentity {
         let vk_path = vk_path_from(sk_path);
         let mut vk_buf = [0u8; VERIFYING_KEY_LEN];
         std::fs::File::open(&vk_path)
-            .with_context(|| format!("abriendo {} — existe server.vk junto a server.sk?", vk_path.display()))?
+            .with_context(|| {
+                format!(
+                    "abriendo {} — existe server.vk junto a server.sk?",
+                    vk_path.display()
+                )
+            })?
             .read_exact(&mut vk_buf)
             .context("leyendo verifying key — archivo truncado?")?;
 
         let verifying_key = VerifyingKey::from_bytes(&vk_buf)
             .map_err(|e| anyhow::anyhow!("verifying key invalida en {}: {e}", vk_path.display()))?;
 
-        Ok(Self { signing_key, verifying_key })
+        Ok(Self {
+            signing_key,
+            verifying_key,
+        })
     }
 
     /// Genera un par de claves nuevo y los guarda en `dir/server.sk` y `dir/server.vk`.
@@ -120,8 +128,14 @@ impl ServerIdentity {
             .context("escribiendo verifying key")?;
 
         println!("Keypair generado exitosamente:");
-        println!("  Signing key:    {} (0600 — mantener SECRETO)", sk_path.display());
-        println!("  Verifying key:  {} (0644 — distribuir a clientes out-of-band)", vk_path.display());
+        println!(
+            "  Signing key:    {} (0600 — mantener SECRETO)",
+            sk_path.display()
+        );
+        println!(
+            "  Verifying key:  {} (0644 — distribuir a clientes out-of-band)",
+            vk_path.display()
+        );
 
         Ok(())
     }
@@ -144,7 +158,10 @@ impl std::fmt::Display for IdentityError {
         match self {
             IdentityError::Io(e) => write!(f, "archivo no encontrado o no legible: {e}"),
             IdentityError::InvalidSize { expected, found } => {
-                write!(f, "tamano de archivo invalido: esperado {expected} bytes, encontrado {found}")
+                write!(
+                    f,
+                    "tamano de archivo invalido: esperado {expected} bytes, encontrado {found}"
+                )
             }
             IdentityError::InvalidKey(msg) => write!(f, "clave de verificacion invalida: {msg}"),
         }
@@ -195,8 +212,8 @@ impl ClientVerifyingIdentity {
         }
 
         let buf: &[u8; VERIFYING_KEY_LEN] = data.as_slice().try_into().expect("len ya validado");
-        let verifying_key = VerifyingKey::from_bytes(buf)
-            .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+        let verifying_key =
+            VerifyingKey::from_bytes(buf).map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
 
         Ok(Self { verifying_key })
     }
@@ -227,8 +244,8 @@ impl ControlPlaneVerifyingIdentity {
         }
 
         let buf: &[u8; VERIFYING_KEY_LEN] = data.as_slice().try_into().expect("len ya validado");
-        let verifying_key = VerifyingKey::from_bytes(buf)
-            .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+        let verifying_key =
+            VerifyingKey::from_bytes(buf).map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
 
         Ok(Self { verifying_key })
     }
@@ -280,11 +297,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         ServerIdentity::generate_and_save(dir.path()).unwrap();
         assert_eq!(
-            std::fs::metadata(dir.path().join("server.sk")).unwrap().len(),
+            std::fs::metadata(dir.path().join("server.sk"))
+                .unwrap()
+                .len(),
             SIGNING_KEY_LEN as u64
         );
         assert_eq!(
-            std::fs::metadata(dir.path().join("server.vk")).unwrap().len(),
+            std::fs::metadata(dir.path().join("server.vk"))
+                .unwrap()
+                .len(),
             VERIFYING_KEY_LEN as u64
         );
     }
@@ -381,7 +402,13 @@ mod tests {
         std::fs::write(&vk_path, &[0u8; 16]).unwrap();
         let err = ClientVerifyingIdentity::load(&vk_path).unwrap_err();
         assert!(
-            matches!(err, IdentityError::InvalidSize { expected: VERIFYING_KEY_LEN, .. }),
+            matches!(
+                err,
+                IdentityError::InvalidSize {
+                    expected: VERIFYING_KEY_LEN,
+                    ..
+                }
+            ),
             "error inesperado: {err}"
         );
     }
@@ -391,7 +418,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vk_path = dir.path().join("nonexistent.vk");
         let err = ClientVerifyingIdentity::load(&vk_path).unwrap_err();
-        assert!(matches!(err, IdentityError::Io(_)), "error inesperado: {err}");
+        assert!(
+            matches!(err, IdentityError::Io(_)),
+            "error inesperado: {err}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -413,7 +443,13 @@ mod tests {
         std::fs::write(&vk_path, &[0u8; 16]).unwrap();
         let err = ControlPlaneVerifyingIdentity::load(&vk_path).unwrap_err();
         assert!(
-            matches!(err, IdentityError::InvalidSize { expected: VERIFYING_KEY_LEN, .. }),
+            matches!(
+                err,
+                IdentityError::InvalidSize {
+                    expected: VERIFYING_KEY_LEN,
+                    ..
+                }
+            ),
             "error inesperado: {err}"
         );
     }
@@ -423,30 +459,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vk_path = dir.path().join("nonexistent_cp.vk");
         let err = ControlPlaneVerifyingIdentity::load(&vk_path).unwrap_err();
-        assert!(matches!(err, IdentityError::Io(_)), "error inesperado: {err}");
+        assert!(
+            matches!(err, IdentityError::Io(_)),
+            "error inesperado: {err}"
+        );
     }
 
     #[test]
     fn cp_vk_generated_by_admin_keygen_is_loadable() {
         let dir = tempfile::tempdir().unwrap();
-        use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let (sk, vk) = latticeshield_crypto::generate_keypair(&mut rand_core::OsRng);
         std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true).mode(0o600)
-            .open(dir.path().join("admin.sk")).unwrap()
-            .write_all(sk.to_bytes()).unwrap();
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dir.path().join("admin.sk"))
+            .unwrap()
+            .write_all(sk.to_bytes())
+            .unwrap();
         std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true).mode(0o644)
-            .open(dir.path().join("admin.vk")).unwrap()
-            .write_all(vk.to_bytes()).unwrap();
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(dir.path().join("admin.vk"))
+            .unwrap()
+            .write_all(vk.to_bytes())
+            .unwrap();
         ControlPlaneVerifyingIdentity::load(&dir.path().join("admin.vk")).unwrap();
         assert_eq!(
-            std::fs::metadata(dir.path().join("admin.sk")).unwrap().len(),
+            std::fs::metadata(dir.path().join("admin.sk"))
+                .unwrap()
+                .len(),
             latticeshield_crypto::SIGNING_KEY_LEN as u64
         );
         assert_eq!(
-            std::fs::metadata(dir.path().join("admin.vk")).unwrap().len(),
+            std::fs::metadata(dir.path().join("admin.vk"))
+                .unwrap()
+                .len(),
             latticeshield_crypto::VERIFYING_KEY_LEN as u64
         );
         // Verificar permisos de los archivos generados

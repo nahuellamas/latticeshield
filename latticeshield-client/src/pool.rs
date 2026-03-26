@@ -52,7 +52,11 @@ impl ConnectionPool {
 
         {
             let mut inner = self.inner.lock().await;
-            while inner.idle.front().map_or(false, |c| c.created_at.elapsed() >= timeout) {
+            while inner
+                .idle
+                .front()
+                .map_or(false, |c| c.created_at.elapsed() >= timeout)
+            {
                 let evicted = inner.idle.pop_front().unwrap();
                 debug!(bridge = %self.bridge_addr, "evicted stale idle connection");
                 drop(evicted);
@@ -63,7 +67,8 @@ impl ConnectionPool {
             }
         }
 
-        let stream = TcpStream::connect(self.bridge_addr).await
+        let stream = TcpStream::connect(self.bridge_addr)
+            .await
             .map_err(|e| anyhow::anyhow!("bridge connect failed: {e}"))?;
 
         if let Err(e) = stream.set_nodelay(true) {
@@ -97,7 +102,9 @@ impl ConnectionPool {
                 inner.idle.len()
             };
 
-            let to_add = self.config.warm_size
+            let to_add = self
+                .config
+                .warm_size
                 .saturating_sub(current_count)
                 .min(self.config.max_size.saturating_sub(current_count));
 
@@ -108,9 +115,7 @@ impl ConnectionPool {
             let mut join_set = tokio::task::JoinSet::new();
             for _ in 0..to_add {
                 let addr = self.bridge_addr;
-                join_set.spawn(async move {
-                    TcpStream::connect(addr).await
-                });
+                join_set.spawn(async move { TcpStream::connect(addr).await });
             }
 
             let mut new_conns: Vec<IdleConn> = Vec::with_capacity(to_add);
@@ -152,7 +157,10 @@ impl ConnectionPool {
         let _ = self.shutdown_tx.send(true);
 
         let mut inner = self.inner.lock().await;
-        info!(count = inner.idle.len(), "ConnectionPool: draining idle connections on shutdown");
+        info!(
+            count = inner.idle.len(),
+            "ConnectionPool: draining idle connections on shutdown"
+        );
 
         while let Some(mut conn) = inner.idle.pop_front() {
             use tokio::io::AsyncWriteExt;
@@ -212,7 +220,10 @@ mod tests {
         let pool = pool_with_config(addr, default_config());
         {
             let mut inner = pool.inner.lock().await;
-            inner.idle.push_back(IdleConn { stream, created_at: Instant::now() });
+            inner.idle.push_back(IdleConn {
+                stream,
+                created_at: Instant::now(),
+            });
         }
 
         // Acquire should return the pooled stream, leaving pool empty.
@@ -251,7 +262,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
         let inner = pool.inner.lock().await;
-        assert!(inner.idle.len() <= 2, "pool exceeded max_size: {}", inner.idle.len());
+        assert!(
+            inner.idle.len() <= 2,
+            "pool exceeded max_size: {}",
+            inner.idle.len()
+        );
         drop(inner);
 
         let _ = pool.shutdown_tx.send(true);
@@ -284,7 +299,10 @@ mod tests {
 
         // acquire() must evict the stale conn and fall back to a fresh connect.
         let result = pool.acquire().await;
-        assert!(result.is_ok(), "acquire should succeed via fallback: {result:?}");
+        assert!(
+            result.is_ok(),
+            "acquire should succeed via fallback: {result:?}"
+        );
 
         let inner = pool.inner.lock().await;
         assert_eq!(inner.idle.len(), 0, "pool should be empty after eviction");
@@ -307,7 +325,10 @@ mod tests {
         // Backdate the stale conn using real time subtraction.
         let stale_instant = Instant::now() - Duration::from_secs(60);
         let stale_conn = IdleConn::with_age(stale_stream, stale_instant);
-        let fresh_conn = IdleConn { stream: fresh_stream, created_at: Instant::now() };
+        let fresh_conn = IdleConn {
+            stream: fresh_stream,
+            created_at: Instant::now(),
+        };
 
         let pool = pool_with_config(addr, default_config());
         {
@@ -367,7 +388,10 @@ mod tests {
             let (server_side, _) = listener.accept().await.unwrap();
             server_sides.push(server_side);
             let mut inner = pool.inner.lock().await;
-            inner.idle.push_back(IdleConn { stream, created_at: Instant::now() });
+            inner.idle.push_back(IdleConn {
+                stream,
+                created_at: Instant::now(),
+            });
         }
 
         pool.shutdown().await;
@@ -405,7 +429,10 @@ mod tests {
 
         // Both stale → evict both → fresh connect fallback.
         let result = pool.acquire().await;
-        assert!(result.is_ok(), "acquire should succeed via fallback after evicting all stale");
+        assert!(
+            result.is_ok(),
+            "acquire should succeed via fallback after evicting all stale"
+        );
 
         let inner = pool.inner.lock().await;
         assert_eq!(inner.idle.len(), 0);
@@ -422,7 +449,10 @@ mod tests {
         // Empty pool → fresh connect path.
         let stream = pool.acquire().await.unwrap();
         // nodelay() returns the current TCP_NODELAY setting.
-        assert!(stream.nodelay().unwrap_or(false), "TCP_NODELAY must be set on fresh connect");
+        assert!(
+            stream.nodelay().unwrap_or(false),
+            "TCP_NODELAY must be set on fresh connect"
+        );
     }
 
     #[tokio::test]
@@ -491,7 +521,10 @@ mod tests {
         let _ = pool.shutdown_tx.send(true);
 
         let result = tokio::time::timeout(Duration::from_millis(500), warmer).await;
-        assert!(result.is_ok(), "warm_loop must exit within timeout after shutdown signal");
+        assert!(
+            result.is_ok(),
+            "warm_loop must exit within timeout after shutdown signal"
+        );
         assert!(result.unwrap().is_ok(), "warm_loop task must not panic");
     }
 
@@ -511,13 +544,19 @@ mod tests {
         let stream = TcpStream::connect(addr).await.unwrap();
         {
             let mut inner = pool.inner.lock().await;
-            inner.idle.push_back(IdleConn { stream, created_at: Instant::now() });
+            inner.idle.push_back(IdleConn {
+                stream,
+                created_at: Instant::now(),
+            });
         }
 
         pool.shutdown().await;
 
         // After shutdown, pool is empty — acquire must fall back to fresh connect.
         let result = pool.acquire().await;
-        assert!(result.is_ok(), "acquire after shutdown must succeed via fresh connect");
+        assert!(
+            result.is_ok(),
+            "acquire after shutdown must succeed via fresh connect"
+        );
     }
 }

@@ -100,29 +100,65 @@ impl Default for LoggingConfig {
     }
 }
 
-fn default_cp_enabled() -> bool { false }
-fn default_cp_endpoint() -> String { String::new() }
-fn default_cp_agent_name() -> String { String::new() }
-fn default_cp_interval() -> u64 { 30 }
+fn default_cp_enabled() -> bool {
+    false
+}
+fn default_cp_endpoint() -> String {
+    String::new()
+}
+fn default_cp_agent_name() -> String {
+    String::new()
+}
+fn default_cp_interval() -> u64 {
+    30
+}
 
-fn default_kr_enabled() -> bool { false }
-fn default_kr_max_bytes() -> u64 { 10_737_418_240 } // 10 GB
-fn default_kr_max_seconds() -> u64 { 86_400 }       // 24 hours
+fn default_kr_enabled() -> bool {
+    false
+}
+fn default_kr_max_bytes() -> u64 {
+    10_737_418_240
+} // 10 GB
+fn default_kr_max_seconds() -> u64 {
+    86_400
+} // 24 hours
 
-fn default_tls_enabled() -> bool { false }
-fn default_tls_listen_addr() -> String { "0.0.0.0:8440".to_string() }
-fn default_tls_cert_path() -> PathBuf { PathBuf::from("./keys/tls.crt") }
-fn default_tls_key_path() -> PathBuf { PathBuf::from("./keys/tls.key") }
+fn default_tls_enabled() -> bool {
+    false
+}
+fn default_tls_listen_addr() -> String {
+    "0.0.0.0:8440".to_string()
+}
+fn default_tls_cert_path() -> PathBuf {
+    PathBuf::from("./keys/tls.crt")
+}
+fn default_tls_key_path() -> PathBuf {
+    PathBuf::from("./keys/tls.key")
+}
 
-fn default_quic_enabled() -> bool { false }
-fn default_quic_listen_addr() -> String { "0.0.0.0:8441".to_string() }
+fn default_quic_enabled() -> bool {
+    false
+}
+fn default_quic_listen_addr() -> String {
+    "0.0.0.0:8441".to_string()
+}
 
-fn default_admin_enabled() -> bool { false }
-fn default_admin_listen_addr() -> String { "0.0.0.0:8445".to_string() }
-fn default_admin_rate_limit() -> u32 { 5 }
-fn default_admin_handshake_timeout() -> u64 { 10 }
+fn default_admin_enabled() -> bool {
+    false
+}
+fn default_admin_listen_addr() -> String {
+    "0.0.0.0:8445".to_string()
+}
+fn default_admin_rate_limit() -> u32 {
+    5
+}
+fn default_admin_handshake_timeout() -> u64 {
+    10
+}
 
-fn default_require_client_auth() -> bool { true }
+fn default_require_client_auth() -> bool {
+    true
+}
 
 // ── AdminConfig ────────────────────────────────────────────────────────────────
 
@@ -329,8 +365,8 @@ pub struct ValidConfig {
     pub tls_key_path: PathBuf,
     pub quic_enabled: bool,
     pub quic_listen_addr: SocketAddr,
-    pub quic_cert_path: PathBuf,   // only meaningful when quic_enabled = true
-    pub quic_key_path: PathBuf,    // only meaningful when quic_enabled = true
+    pub quic_cert_path: PathBuf, // only meaningful when quic_enabled = true
+    pub quic_key_path: PathBuf,  // only meaningful when quic_enabled = true
     /// true si se configuro [auth].client_vk_path — el bridge exigira autenticacion del cliente.
     pub client_auth_enabled: bool,
     /// Ruta a la VK del cliente (solo significativa cuando client_auth_enabled = true).
@@ -375,12 +411,24 @@ impl std::fmt::Debug for ValidConfig {
             .field("client_vk_path", &self.client_vk_path)
             .field("admin_enabled", &self.admin_enabled)
             .field("admin_listen_addr", &self.admin_listen_addr)
-            .field("admin_control_plane_vk_path", &self.admin_control_plane_vk_path)
-            .field("admin_rate_limit_per_second", &self.admin_rate_limit_per_second)
-            .field("admin_handshake_timeout_secs", &self.admin_handshake_timeout_secs)
+            .field(
+                "admin_control_plane_vk_path",
+                &self.admin_control_plane_vk_path,
+            )
+            .field(
+                "admin_rate_limit_per_second",
+                &self.admin_rate_limit_per_second,
+            )
+            .field(
+                "admin_handshake_timeout_secs",
+                &self.admin_handshake_timeout_secs,
+            )
             .field(
                 "control_plane_install_token",
-                &self.control_plane_install_token.as_ref().map(|_| "[REDACTED]"),
+                &self
+                    .control_plane_install_token
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
             )
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
@@ -437,9 +485,7 @@ impl Config {
         let control_plane_endpoint = self.control_plane.endpoint.clone();
 
         if control_plane_enabled && control_plane_endpoint.is_empty() {
-            anyhow::bail!(
-                "control_plane.endpoint must be set when control_plane.enabled = true"
-            );
+            anyhow::bail!("control_plane.endpoint must be set when control_plane.enabled = true");
         }
 
         if control_plane_enabled && !control_plane_endpoint.is_empty() {
@@ -453,9 +499,8 @@ impl Config {
             self.control_plane.agent_name.clone()
         };
 
-        let heartbeat_interval = std::time::Duration::from_secs(
-            self.control_plane.heartbeat_interval_secs.max(5),
-        );
+        let heartbeat_interval =
+            std::time::Duration::from_secs(self.control_plane.heartbeat_interval_secs.max(5));
 
         // ── install_token resolution (env var takes precedence over TOML) ───
         let control_plane_install_token = match std::env::var("INSTALL_TOKEN") {
@@ -513,7 +558,10 @@ impl Config {
         }
 
         // ── QUIC listener validation ─────────────────────────────────────────
-        let quic_listen_addr: SocketAddr = self.quic.listen_addr.parse()
+        let quic_listen_addr: SocketAddr = self
+            .quic
+            .listen_addr
+            .parse()
             .context("invalid quic.listen_addr")?;
 
         if self.quic.enabled {
@@ -555,7 +603,10 @@ impl Config {
         let client_vk_path = self.auth.client_vk_path;
 
         // ── Admin PQC listener validation ────────────────────────────────────
-        let admin_listen_addr: SocketAddr = self.admin.listen_addr.parse()
+        let admin_listen_addr: SocketAddr = self
+            .admin
+            .listen_addr
+            .parse()
             .context("invalid admin.listen_addr")?;
 
         if self.admin.enabled {
@@ -623,7 +674,9 @@ impl Config {
             heartbeat_interval,
             key_rotation_enabled: self.key_rotation.enabled,
             max_bytes_per_key: self.key_rotation.max_bytes_per_key,
-            key_rotation_interval: std::time::Duration::from_secs(self.key_rotation.max_seconds_per_key),
+            key_rotation_interval: std::time::Duration::from_secs(
+                self.key_rotation.max_seconds_per_key,
+            ),
             tls_enabled: self.tls.enabled,
             tls_listen_addr,
             tls_cert_path: self.tls.cert_path,
@@ -658,7 +711,8 @@ mod tests {
         // Tests that don't set [auth] get require_client_auth = false automatically
         // so non-auth tests don't break due to the secure-by-default requirement.
         if !content.contains("[auth]") {
-            f.write_all(b"[auth]\nrequire_client_auth = false\n\n").unwrap();
+            f.write_all(b"[auth]\nrequire_client_auth = false\n\n")
+                .unwrap();
         }
         f.write_all(content.as_bytes()).unwrap();
         f
@@ -689,7 +743,10 @@ level = "debug"
         assert_eq!(cfg.listen_addr.to_string(), "127.0.0.1:9443");
         assert_eq!(cfg.backend_addr.to_string(), "127.0.0.1:9080");
         assert_eq!(cfg.max_frame_size, 32768);
-        assert_eq!(cfg.signing_key_path, PathBuf::from("/etc/latticeshield/server.sk"));
+        assert_eq!(
+            cfg.signing_key_path,
+            PathBuf::from("/etc/latticeshield/server.sk")
+        );
         assert_eq!(cfg.metrics_addr.to_string(), "127.0.0.1:9444");
         assert_eq!(cfg.log_level, "debug");
     }
@@ -845,9 +902,7 @@ listen_addr = "not_an_addr"
 
     #[test]
     fn control_plane_enabled_malformed_url_rejected() {
-        let f = write_toml(
-            "[control_plane]\nenabled = true\nendpoint = \"not a url\"\n",
-        );
+        let f = write_toml("[control_plane]\nenabled = true\nendpoint = \"not a url\"\n");
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(
             err.contains("control_plane.endpoint"),
@@ -857,9 +912,7 @@ listen_addr = "not_an_addr"
 
     #[test]
     fn control_plane_disabled_non_empty_endpoint_accepted() {
-        let f = write_toml(
-            "[control_plane]\nenabled = false\nendpoint = \"garbage string\"\n",
-        );
+        let f = write_toml("[control_plane]\nenabled = false\nendpoint = \"garbage string\"\n");
         // should NOT error even with garbage endpoint when disabled
         Config::load(f.path()).unwrap();
     }
@@ -881,7 +934,10 @@ listen_addr = "not_an_addr"
         let cfg = Config::load(f.path()).unwrap();
         assert!(!cfg.key_rotation_enabled);
         assert_eq!(cfg.max_bytes_per_key, 10_737_418_240);
-        assert_eq!(cfg.key_rotation_interval, std::time::Duration::from_secs(86_400));
+        assert_eq!(
+            cfg.key_rotation_interval,
+            std::time::Duration::from_secs(86_400)
+        );
     }
 
     #[test]
@@ -892,7 +948,10 @@ listen_addr = "not_an_addr"
         let cfg = Config::load(f.path()).unwrap();
         assert!(cfg.key_rotation_enabled);
         assert_eq!(cfg.max_bytes_per_key, 1_048_576);
-        assert_eq!(cfg.key_rotation_interval, std::time::Duration::from_secs(60));
+        assert_eq!(
+            cfg.key_rotation_interval,
+            std::time::Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -926,14 +985,16 @@ listen_addr = "not_an_addr"
 
     #[test]
     fn tls_enabled_empty_cert_path_rejected() {
-        let f = write_toml("[tls]\nenabled = true\ncert_path = \"\"\nkey_path = \"./keys/tls.key\"\n");
+        let f =
+            write_toml("[tls]\nenabled = true\ncert_path = \"\"\nkey_path = \"./keys/tls.key\"\n");
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("cert_path"), "got: {err}");
     }
 
     #[test]
     fn tls_enabled_empty_key_path_rejected() {
-        let f = write_toml("[tls]\nenabled = true\ncert_path = \"./keys/tls.crt\"\nkey_path = \"\"\n");
+        let f =
+            write_toml("[tls]\nenabled = true\ncert_path = \"./keys/tls.crt\"\nkey_path = \"\"\n");
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("key_path"), "got: {err}");
     }
@@ -996,20 +1057,22 @@ listen_addr = "not_an_addr"
 
     #[test]
     fn quic_enabled_missing_cert_path_rejected() {
-        let f = write_toml(
-            "[quic]\nenabled = true\n"
-        );
+        let f = write_toml("[quic]\nenabled = true\n");
         let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(err.contains("cert_path"), "expected cert_path in error, got: {err}");
+        assert!(
+            err.contains("cert_path"),
+            "expected cert_path in error, got: {err}"
+        );
     }
 
     #[test]
     fn quic_enabled_missing_key_path_rejected() {
-        let f = write_toml(
-            "[quic]\nenabled = true\ncert_path = \"./keys/tls.crt\"\n"
-        );
+        let f = write_toml("[quic]\nenabled = true\ncert_path = \"./keys/tls.crt\"\n");
         let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(err.contains("key_path"), "expected key_path in error, got: {err}");
+        assert!(
+            err.contains("key_path"),
+            "expected key_path in error, got: {err}"
+        );
     }
 
     #[test]
@@ -1019,7 +1082,10 @@ listen_addr = "not_an_addr"
             "[quic]\nenabled = true\nlisten_addr = \"0.0.0.0:8443\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
         );
         let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(err.contains("conflicts"), "expected conflicts in error, got: {err}");
+        assert!(
+            err.contains("conflicts"),
+            "expected conflicts in error, got: {err}"
+        );
     }
 
     #[test]
@@ -1030,7 +1096,10 @@ listen_addr = "not_an_addr"
              [quic]\nenabled = true\nlisten_addr = \"0.0.0.0:8440\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
         );
         let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(err.contains("conflicts"), "expected conflicts in error, got: {err}");
+        assert!(
+            err.contains("conflicts"),
+            "expected conflicts in error, got: {err}"
+        );
     }
 
     #[test]
@@ -1040,15 +1109,16 @@ listen_addr = "not_an_addr"
             "[quic]\nenabled = true\nlisten_addr = \"0.0.0.0:8444\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n"
         );
         let err = Config::load(f.path()).unwrap_err().to_string();
-        assert!(err.contains("conflicts"), "expected conflicts in error, got: {err}");
+        assert!(
+            err.contains("conflicts"),
+            "expected conflicts in error, got: {err}"
+        );
     }
 
     #[test]
     fn quic_disabled_skips_cert_and_collision_validation() {
         // enabled=false, no cert_path, colliding addr → no error
-        let f = write_toml(
-            "[quic]\nenabled = false\nlisten_addr = \"0.0.0.0:8443\"\n"
-        );
+        let f = write_toml("[quic]\nenabled = false\nlisten_addr = \"0.0.0.0:8443\"\n");
         Config::load(f.path()).unwrap();
     }
 
@@ -1129,7 +1199,10 @@ handshake_timeout_secs = 30
         let cfg = Config::load(f.path()).unwrap();
         assert!(cfg.admin_enabled);
         assert_eq!(cfg.admin_listen_addr.to_string(), "0.0.0.0:8445");
-        assert_eq!(cfg.admin_control_plane_vk_path, Some(PathBuf::from("./keys/cp.vk")));
+        assert_eq!(
+            cfg.admin_control_plane_vk_path,
+            Some(PathBuf::from("./keys/cp.vk"))
+        );
         assert_eq!(cfg.admin_rate_limit_per_second, 10);
         assert_eq!(cfg.admin_handshake_timeout_secs, 30);
     }
@@ -1220,16 +1293,14 @@ handshake_timeout_secs = 30
         let f = write_toml("[control_plane]\n");
         let cfg = Config::load(f.path()).unwrap();
         assert_eq!(
-            cfg.control_plane_install_token,
-            None,
+            cfg.control_plane_install_token, None,
             "control_plane_install_token should be None when neither TOML nor env var is set"
         );
 
         // Case 5: control_plane.enabled = true with no install_token is non-fatal (warn only)
         std::env::remove_var("INSTALL_TOKEN");
-        let f = write_toml(
-            "[control_plane]\nenabled = true\nendpoint = \"http://localhost:9000\"\n",
-        );
+        let f =
+            write_toml("[control_plane]\nenabled = true\nendpoint = \"http://localhost:9000\"\n");
         let cfg = Config::load(f.path()).unwrap();
         assert!(cfg.control_plane_enabled);
         assert_eq!(cfg.control_plane_install_token, None);
@@ -1312,5 +1383,4 @@ handshake_timeout_secs = 30
             "shutdown_timeout must be 60s when SHUTDOWN_TIMEOUT_SECS=60"
         );
     }
-
 }

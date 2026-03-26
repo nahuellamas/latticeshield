@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -88,10 +88,7 @@ pub async fn start(
     cmd_tx: tokio::sync::mpsc::Sender<BridgeCommand>,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) {
-    let client = match Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
         Ok(c) => c,
         Err(e) => {
             warn!("control plane: failed to build HTTP client: {e}");
@@ -159,8 +156,14 @@ pub async fn start(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-async fn try_register(client: &Client, config: &ValidConfig, identity: &ServerIdentity) -> Option<String> {
-    let server_vk: String = identity.verifying_key.to_bytes()
+async fn try_register(
+    client: &Client,
+    config: &ValidConfig,
+    identity: &ServerIdentity,
+) -> Option<String> {
+    let server_vk: String = identity
+        .verifying_key
+        .to_bytes()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
@@ -405,10 +408,18 @@ mod tests {
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
-        let server_vk = body["server_vk"].as_str().expect("server_vk must be present in payload");
-        assert_eq!(server_vk.len(), 3904, "server_vk must be 3904 hex chars (1952 bytes * 2)");
+        let server_vk = body["server_vk"]
+            .as_str()
+            .expect("server_vk must be present in payload");
+        assert_eq!(
+            server_vk.len(),
+            3904,
+            "server_vk must be 3904 hex chars (1952 bytes * 2)"
+        );
         assert!(
-            server_vk.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            server_vk
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
             "server_vk must be lowercase hex"
         );
     }
@@ -447,7 +458,15 @@ mod tests {
         let signable = make_signable();
         let mut rng = rand_core::OsRng;
 
-        let result = send_heartbeat(&client, &config, "test-agent-id", &signable, &identity, &mut rng).await;
+        let result = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+        )
+        .await;
         assert!(result.is_ok(), "send_heartbeat failed: {:?}", result.err());
     }
 
@@ -468,21 +487,32 @@ mod tests {
         let signable = make_signable();
         let mut rng = rand_core::OsRng;
 
-        send_heartbeat(&client, &config, "test-agent-id", &signable, &identity, &mut rng)
-            .await
-            .unwrap();
+        send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+        )
+        .await
+        .unwrap();
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
 
-        let sig_b64 = body["signature"].as_str().expect("signature field must be present");
-        let decoded = base64::engine::general_purpose::STANDARD.decode(sig_b64)
+        let sig_b64 = body["signature"]
+            .as_str()
+            .expect("signature field must be present");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64)
             .expect("signature must be valid base64");
         assert_eq!(
             decoded.len(),
             latticeshield_crypto::signing::SIGNATURE_LEN,
-            "decoded signature must be exactly {} bytes", latticeshield_crypto::signing::SIGNATURE_LEN
+            "decoded signature must be exactly {} bytes",
+            latticeshield_crypto::signing::SIGNATURE_LEN
         );
     }
 
@@ -503,9 +533,16 @@ mod tests {
         let signable = make_signable();
         let mut rng = rand_core::OsRng;
 
-        send_heartbeat(&client, &config, "test-agent-id", &signable, &identity, &mut rng)
-            .await
-            .unwrap();
+        send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+        )
+        .await
+        .unwrap();
 
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -515,12 +552,15 @@ mod tests {
 
         // Decode the base64 signature
         let sig_b64 = body["signature"].as_str().unwrap();
-        let sig_bytes = base64::engine::general_purpose::STANDARD.decode(sig_b64).unwrap();
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64)
+            .unwrap();
         let sig = latticeshield_crypto::signing::Signature::from_bytes(&sig_bytes).unwrap();
 
         // Verify against the bridge's verifying key
         assert!(
-            latticeshield_crypto::signing::verify(&identity.verifying_key, &canonical, &sig).is_ok(),
+            latticeshield_crypto::signing::verify(&identity.verifying_key, &canonical, &sig)
+                .is_ok(),
             "signature must verify with the bridge's verifying key"
         );
     }
@@ -542,13 +582,21 @@ mod tests {
         let signable = make_signable();
         let mut rng = rand_core::OsRng;
 
-        let resp = send_heartbeat(&client, &config, "test-agent-id", &signable, &identity, &mut rng)
-            .await
-            .unwrap();
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+        )
+        .await
+        .unwrap();
 
         assert!(
             resp.pending_commands.is_none(),
-            "empty body should yield pending_commands: None, got: {:?}", resp.pending_commands
+            "empty body should yield pending_commands: None, got: {:?}",
+            resp.pending_commands
         );
     }
 
@@ -572,9 +620,16 @@ mod tests {
         let signable = make_signable();
         let mut rng = rand_core::OsRng;
 
-        let resp = send_heartbeat(&client, &config, "test-agent-id", &signable, &identity, &mut rng)
-            .await
-            .unwrap();
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+        )
+        .await
+        .unwrap();
 
         let cmds = resp.pending_commands.expect("should have pending_commands");
         assert_eq!(cmds.len(), 1);
@@ -601,12 +656,26 @@ mod tests {
         let signable = make_signable();
         let mut rng = rand_core::OsRng;
 
-        let resp = send_heartbeat(&client, &config, "test-agent-id", &signable, &identity, &mut rng)
-            .await;
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+        )
+        .await;
 
         // Must not error — Unknown variant absorbs unknown command types
-        assert!(resp.is_ok(), "unknown command type should not cause an error: {:?}", resp.err());
-        let cmds = resp.unwrap().pending_commands.expect("should have pending_commands");
+        assert!(
+            resp.is_ok(),
+            "unknown command type should not cause an error: {:?}",
+            resp.err()
+        );
+        let cmds = resp
+            .unwrap()
+            .pending_commands
+            .expect("should have pending_commands");
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], BridgeCommand::Unknown));
     }
