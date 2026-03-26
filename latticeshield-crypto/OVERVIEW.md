@@ -18,9 +18,8 @@ latticeshield-crypto is the foundation that all other crates depend on. lattices
 
 ## What Changed in This Release
 
-- The encrypted channel now keeps a counter. Every message sent through the channel gets a number, and the receiver checks that numbers always go up. If the same message arrives twice (whether by accident or because someone is trying to trick the system), the second copy is thrown away.
-- Tampering with the counter is also detected. The counter is protected by the same mathematical seal that protects the message content — changing even one digit of the counter makes the seal invalid and the message is discarded.
-- A new error type was introduced so that code calling the channel can tell the difference between a replayed message, a tampered message, a broken connection, and an invalid format — without having to guess from error text.
+- The "rotate encryption keys" instruction exchanged mid-session is now itself encrypted. Before this release, the rotation secret — a short code used to agree on the new key — traveled in the clear inside the channel. A passive observer on the wire could have read it. Now the rotation secret is wrapped in the same mathematical lock that protects all other messages, so it cannot be read without already holding the session key.
+- Removed an internal component (an anti-replay filter for one-time entry tickets) that was built for a feature — instant reconnection without a full handshake — that was never implemented. The component had no callers and provided no security benefit in practice. Removing it reduces the code that must be audited and maintained.
 
 ---
-*Last updated: 2026-03-25 — latticeshield-mes17-seq-numbers*
+*Last updated: 2026-03-26 — latticeshield-mes18-security*

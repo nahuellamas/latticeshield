@@ -2426,3 +2426,209 @@ Mes 17 agrego 6 tests unitarios nuevos en `channel.rs` y la expansion de tests d
 | `normal_sequential_receive` | Canal A escribe 3 frames (seq 0, 1, 2), canal B los lee en orden; `recv_seq==2` al final |
 
 Los tests de rotacion existentes (`rotate_key_produces_different_ciphertext`, `rotate_key_is_deterministic_same_nonce`, `hkdf_ratchet_chain_two_rotations`) fueron actualizados para usar `let mut channel` y siguen pasando sin cambios de logica.
+
+---
+
+# Mes 18 — Seguridad obligatoria: autenticacion por defecto y KEY_ROTATE cifrado
+
+---
+
+## El problema que existia
+
+Tres gaps de seguridad del audit de Mes 13 permanecian abiertos antes de esta version. Cada uno era menor en aislamiento, pero en combinacion representaban riesgos reales para deployments en produccion.
+
+**Gap G2 — Autenticacion del cliente era opt-in:** Un deployment fresco del bridge, sin ninguna configuracion `[auth]`, aceptaba conexiones de cualquier cliente sin verificar su identidad. El bridge autenticaba su propia identidad al cliente (firmando el ServerHello con ML-DSA-65), pero no exigia lo mismo del lado del cliente. En entornos donde el bridge esta expuesto a internet, cualquier proceso que conociera el protocolo podia conectarse y usarlo como relay. La intencion del sistema era siempre autenticacion mutua; la implementacion lo dejaba como configuracion opcional.
+
+**Gap G4 — El nonce de KEY_ROTATE viajaba en claro:** Cuando el bridge rotaba la clave de sesion, enviaba al cliente un frame `KEY_ROTATE` con 33 bytes: un byte de tipo (`0x02`) y 32 bytes del nonce de rotacion. Ese nonce es el material de entrada al ratchet HKDF que deriva la nueva clave de sesion. Un atacante que interceptara ese nonce y tuviera acceso a la clave actual podia derivar todas las claves futuras de la sesion, vaciando el valor de la rotacion.
+
+**Gap G5 — Codigo muerto: `AntiReplayFilter`:** El modulo `anti_replay.rs` implementaba un filtro de replay para tickets 0-RTT que nunca llego a existir en la arquitectura final. El codigo estaba exportado desde el crate raiz, tenia tests propios, y su sola presencia implicaba que existia un mecanismo de replay prevention independiente del introducido en Mes 17 con numeros de secuencia. El Mes 17 ya cubre replay en DATA frames a nivel de protocolo; el modulo era ruido que podia confundir a futuros colaboradores.
+
+---
+
+## latticeshield-bridge/src/config.rs — Autenticacion del cliente requerida por defecto
+
+### AuthConfig — el nuevo campo require_client_auth
+
+```rust
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Ruta a la clave de verificacion publica del cliente.
+    /// Requerida cuando require_client_auth = true.
+    pub client_vk_path: Option<PathBuf>,
+    /// Si true (default), el bridge falla al arrancar si no hay client_vk_path configurado.
+    /// Set to false para permitir conexiones sin autenticacion del cliente.
+    #[serde(default = "default_require_client_auth")]
+    pub require_client_auth: bool,
+}
+
+fn default_require_client_auth() -> bool { true }
+```
+
+El campo `require_client_auth` es `true` por defecto. Esto significa que un archivo de configuracion vacio (sin ninguna seccion `[auth]`) ahora produce un error en el arranque del bridge. El mensaje de error indica exactamente que hacer:
+
+```
+[auth] require_client_auth = true but client_vk_path is not set.
+Configure [auth].client_vk_path or set require_client_auth = false to opt out.
+```
+
+Para deployments que necesitan aceptar clientes sin autenticar (por ejemplo, un reverse proxy publico), la opt-out es explicita:
+
+```toml
+[auth]
+require_client_auth = false
+```
+
+### La logica de validacion en validate()
+
+```rust
+let require_client_auth = self.auth.require_client_auth;
+if require_client_auth && self.auth.client_vk_path.is_none() {
+    anyhow::bail!(
+        "[auth] require_client_auth = true but client_vk_path is not set. \
+         Configure [auth].client_vk_path or set require_client_auth = false to opt out."
+    );
+}
+let client_auth_enabled = require_client_auth && self.auth.client_vk_path.is_some();
+```
+
+La validacion ocurre en `Config::load()`, el mismo punto donde se validan todos los demas campos requeridos (TLS, QUIC, admin). El bridge falla antes de abrir cualquier socket, con un mensaje de error claro, en lugar de arrancar silenciosamente en modo inseguro.
+
+`ValidConfig.client_auth_enabled` no gana un campo nuevo: el resultado de la validacion es un `bool` que captura el estado final. Si `require_client_auth = true` llega a `client_auth_enabled`, garantizamos por construccion que `client_vk_path` es `Some` (de lo contrario `bail!` ya habria detenido la ejecucion).
+
+### Por que el default es `true` y no `false`?
+
+Un proxy de seguridad cuyo default es "no verificar al cliente" es seguro-por-exclusion-opt-in. Cualquier operador que instale el bridge sin leer la documentacion tiene un sistema que acepta conexiones anonimas. La filosofia del proyecto es secure-by-default: si el operador quiere relajar la seguridad, debe hacer una decision explicita y documentada. La opt-out (`require_client_auth = false`) es un cambio de una linea; la opt-in requeria antes conocer la existencia del campo.
+
+### Por que es un error de startup y no un warning?
+
+Un warning en el arranque es ruidoso al principio y luego ignorado. Los warnings en logs de produccion se normalizan: los operadores los ven tantas veces que dejan de prestarles atencion. Un error de startup es imposible de ignorar: el proceso no arranca hasta que el operador tome una decision consciente. Para una decision de seguridad, ese nivel de friccion intencional es correcto.
+
+---
+
+## latticeshield-crypto/src/channel.rs — KEY_ROTATE frame cifrado
+
+### El nuevo formato de wire del frame KEY_ROTATE
+
+```
+// v1 (antes de Mes 18) — 33 bytes, nonce en claro:
+// [0x02][32B rotation nonce]
+
+// v2 (Mes 18+) — 61 bytes, nonce cifrado:
+// [0x02][12B GCM nonce][32B encrypted rotation nonce + 16B GCM tag]
+```
+
+```rust
+// Constante documentada en el codigo:
+pub const KEY_ROTATE_FRAME_LEN: usize = 1 + NONCE_LEN + ROTATION_NONCE_LEN + TAG_LEN;
+//                                       ^ tipo ^ nonce GCM  ^ payload cifrado + tag
+//                                       = 1   + 12        + 32               + 16  = 61
+```
+
+### send_key_rotate — generacion y cifrado del nonce
+
+```rust
+pub async fn send_key_rotate(
+    &self,
+    writer: &mut (impl AsyncWrite + Unpin),
+    nonce: &[u8; 32],      // nonce de rotacion HKDF — debe viajar cifrado
+) -> anyhow::Result<()> {
+    // Nonce GCM fresco para este frame — nunca reutilizado bajo la misma clave
+    let mut gcm_nonce_bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut gcm_nonce_bytes);
+    let gcm_nonce = Nonce::from_slice(&gcm_nonce_bytes);
+
+    // Cifrar el nonce de rotacion con la clave de sesion actual
+    let mut rotation_nonce = *nonce;
+    let tag = self.cipher
+        .encrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce)
+        .map_err(|_| anyhow::anyhow!("KEY_ROTATE encrypt failed"))?;
+
+    writer.write_all(&[FRAME_KEY_ROTATE]).await?;
+    writer.write_all(&gcm_nonce_bytes).await?;    // 12B — nonce GCM en claro
+    writer.write_all(&rotation_nonce).await?;     // 32B — nonce HKDF cifrado
+    writer.write_all(tag.as_slice()).await?;       // 16B — GCM tag
+    Ok(())
+}
+```
+
+La firma de `send_key_rotate` no cambia (`&self`): el metodo no muta el canal. El cifrado usa `OsRng.fill_bytes` directamente, igual que `write_frame`, sin necesitar `&mut self` para el generador de numeros aleatorios.
+
+### read_frame — arm FRAME_KEY_ROTATE
+
+```rust
+FRAME_KEY_ROTATE => {
+    // Leer [12B GCM nonce][32B ciphertext + 16B tag]
+    let mut gcm_nonce_bytes = [0u8; NONCE_LEN];
+    reader.read_exact(&mut gcm_nonce_bytes).await?;
+
+    let mut ct_and_tag = [0u8; ROTATION_NONCE_LEN + TAG_LEN]; // 48B
+    reader.read_exact(&mut ct_and_tag).await?;
+
+    let (ct, tag_bytes) = ct_and_tag.split_at(ROTATION_NONCE_LEN);
+    let tag = Tag::from_slice(tag_bytes);
+    let mut rotation_nonce = [0u8; ROTATION_NONCE_LEN];
+    rotation_nonce.copy_from_slice(ct);
+
+    let gcm_nonce = Nonce::from_slice(&gcm_nonce_bytes);
+    self.cipher
+        .decrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce, tag)
+        .map_err(|_| FrameError::AeadFailure)?;
+
+    Ok(FrameResult::KeyRotate(rotation_nonce)) // nonce ya descifrado
+}
+```
+
+El caller en `client_session.rs` no cambia:
+
+```rust
+Ok(FrameResult::KeyRotate(nonce)) => {
+    channel.rotate_key(&nonce); // nonce llega ya descifrado por read_frame
+}
+```
+
+El descifrado ocurre dentro de `read_frame` antes de devolver el `FrameResult`. El caller nunca ve el nonce cifrado.
+
+### Por que cifrar el nonce de rotacion?
+
+El nonce de rotacion es el `ikm` (input key material) del ratchet HKDF. La derivacion es:
+
+```
+nueva_clave = HKDF-SHA256(ikm=clave_actual, salt=nonce, info="latticeshield-v1-key-rotation")
+```
+
+Si el nonce viaja en claro y un atacante lo captura, tiene en su poder: la clave actual (si en algun momento logra leer un frame del canal, lo que requiere comprometer AES-256-GCM) y el nonce. Con esos dos ingredientes puede derivar la nueva clave, y la siguiente, y todas las subsiguientes. Cifrar el nonce con la clave actual antes de enviarlo garantiza que solo quien ya tiene la clave actual puede leer el nonce — exactamente la misma propiedad que el resto del trafico del canal.
+
+### Por que tamano fijo (61 bytes) y sin campo de longitud?
+
+El frame KEY_ROTATE tiene un payload siempre fijo: 32 bytes de nonce HKDF. El ciphertext es igualmente fijo: 32 bytes (AES-GCM no expande el plaintext) mas 16 bytes de tag. No hay variabilidad de longitud, por lo que un campo de longitud seria redundante. La constante `KEY_ROTATE_FRAME_LEN = 61` documenta este invariante y permite al receptor leer exactamente los bytes necesarios sin parsear una longitud.
+
+---
+
+## latticeshield-crypto/src/anti_replay.rs — eliminado
+
+El modulo `anti_replay.rs` implementaba un `AntiReplayFilter` basado en `HashSet` para detectar tickets 0-RTT duplicados dentro de una ventana temporal. El mecanismo de 0-RTT (reutilizar material de sesion de una conexion anterior sin hacer un nuevo handshake completo) nunca fue implementado en el protocolo. El filtro nunca fue conectado a ningun caller en el bridge ni en el cliente.
+
+Mes 17 introdujo proteccion anti-replay para todos los DATA frames del canal establecido, via numeros de secuencia monotonos y AEAD. Esa proteccion cubre el unico vector de replay actualmente presente en el protocolo.
+
+El modulo fue eliminado completamente. `latticeshield-crypto/src/lib.rs` ya no exporta `AntiReplayFilter`.
+
+---
+
+## Cobertura de tests (308 tests totales despues de Mes 18)
+
+El conteo total baja de 309 a 308: los 3 tests del modulo `anti_replay` eliminado (−3), la eliminacion del test `control_plane_enabled_no_install_token_does_not_error` fusionado en `install_token_env_var_resolution` (−1), la consolidacion de 2 tests de auth pre-existentes en variantes mas precisas (−2), y la adicion de 5 tests nuevos: 4 de auth y 1 de KEY_ROTATE (+ 5). Neto: −1.
+
+### Tests nuevos relevantes
+
+| Test | Que verifica |
+|------|-------------|
+| `auth_section_absent_errors_by_default` | Config vacia (sin `[auth]`) → `Config::load()` retorna error con mensaje que menciona `require_client_auth` y `client_vk_path` |
+| `auth_required_true_without_vk_path_errors` | `[auth] require_client_auth = true` explicito sin `client_vk_path` → error de validacion |
+| `auth_opt_out_without_vk_path_gives_client_auth_disabled` | `[auth] require_client_auth = false` sin VK path → startup OK, `client_auth_enabled = false` |
+| `auth_required_false_with_vk_path_enables_auth` | `require_client_auth = false` con VK path → auth desactivado (el flag gobierna, no la presencia del path) |
+| `key_rotate_tampered_payload_returns_aead_failure` | Flipear un byte del payload cifrado del KEY_ROTATE → `FrameError::AeadFailure` (el GCM tag no coincide con el payload modificado) |
+
+El test `key_rotate_frame_is_33_bytes_starting_0x02` fue renombrado a `key_rotate_frame_is_61_bytes_starting_0x02` y actualizado para verificar el nuevo tamano fijo. El test de roundtrip `read_frame_key_rotate_roundtrip` fue actualizado para usar dos instancias separadas (sender/receiver) con la misma clave, verificando que el descifrado del nonce es correcto en el lado receptor.
+
+---

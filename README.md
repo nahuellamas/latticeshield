@@ -1,8 +1,20 @@
 # LatticeShield
 
+<p align="center">
+  <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
+  <img src="https://img.shields.io/badge/tests-308_passing-brightgreen?style=for-the-badge" alt="308 tests passing">
+  <img src="https://img.shields.io/badge/no_FFI-pure_Rust-blue?style=for-the-badge" alt="No FFI — pure Rust">
+  <img src="https://img.shields.io/badge/PQC-ML--KEM--768_%2B_ML--DSA--65-blueviolet?style=for-the-badge" alt="PQC: ML-KEM-768 + ML-DSA-65">
+  <img src="https://img.shields.io/badge/license-UNLICENSED-lightgrey?style=for-the-badge" alt="UNLICENSED">
+</p>
+
 A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cryptography (PQC) layer — **X25519 + ML-KEM-768** — as a transparent encryption layer between clients and backend services, with no FFI, no OpenSSL, no `oqs-rs`.
 
 ## What's New
+
+### Security Enforcement — Client Auth, Encrypted Key Rotation, and Dead Code Removal (2026-03-26)
+
+The bridge now requires that every connecting client prove its identity before the session is accepted. Before this release, client verification was optional and off by default, meaning the bridge would accept connections from anyone who knew the server's address. Now the bridge refuses to start unless it is either given a key to check clients against, or explicitly told that open access is intentional — via `require_client_auth = false` in the config file. We also closed a gap where the secret used to agree on a new encryption key mid-session traveled in the clear inside the channel; that secret is now itself encrypted with the same lock that protects all other traffic. Finally, we removed an unused internal component (an anti-replay filter for one-time entry tickets that were never implemented) that added complexity without providing any real security benefit.
 
 ### Replay-proof DATA frames — Framing v3 (2026-03-25)
 
@@ -124,9 +136,9 @@ Security property: an attacker must break **both** X25519 (classically hard) and
 
 `SessionKey` implements `ZeroizeOnDrop` — the 32-byte key material is wiped from memory as soon as it goes out of scope.
 
-### Anti-Replay (0-RTT)
+### Anti-Replay (DATA frames)
 
-A sliding-window filter (`AntiReplayFilter`) tracks consumed session tickets. Each 32-byte ticket can only be used once per time window. The window resets automatically; tickets from a previous window are discarded.
+Every DATA frame carries an 8-byte monotonic sequence number authenticated as AEAD AAD. The receiver requires each incoming `seq` to be strictly greater than the last accepted value. Replayed frames are rejected with `FrameError::Replay`; any tampering with the sequence number produces an AEAD authentication failure. Counters reset to zero on every `rotate_key()` call (new epoch, new counter).
 
 ## Workspace Structure
 
@@ -139,8 +151,7 @@ latticeshield/
 │       ├── lib.rs
 │       ├── handshake.rs         # Hybrid X25519 + ML-KEM-768 + HKDF-SHA256 + server auth
 │       ├── signing.rs           # ML-DSA-65 sign/verify (OTA + server authentication)
-│       ├── channel.rs           # AES-256-GCM frame format + HKDF ratchet (shared transport)
-│       └── anti_replay.rs       # 0-RTT anti-replay filter
+│       └── channel.rs           # AES-256-GCM frame format + HKDF ratchet + monotonic seq (shared transport)
 ├── latticeshield-bridge/        # Server-side proxy agent (also exposes [lib] for identity + tls)
 │   └── src/
 │       ├── main.rs              # Entry point — config load + server startup (deprecated keygen subcommands removed)
@@ -209,6 +220,7 @@ This writes `admin.sk` (0o600) and `admin.vk` (0o644) to `./keys`. The bridge lo
 | `libcrux-ml-dsa 0.0.7` instead of `ml-dsa` | `ml-dsa 0.0.4` has RUSTSEC-2025-0144 (timing side-channel) + CVE-2026-24850. Using audited libcrux alternative until RustCrypto publishes `ml-dsa 0.1.0` stable |
 | Pre-shared server VerifyingKey | Server's ML-DSA-65 VK is distributed out-of-band — never transmitted on the wire, preventing MITM key substitution |
 | Pre-shared client VerifyingKey | Client's ML-DSA-65 VK is pre-shared to the bridge (one authorized keypair per bridge). Bridge rejects any unsigned or wrongly-signed ClientResponse |
+| `require_client_auth = true` by default | Bridge refuses to start if `[auth].client_vk_path` is not set. Set `require_client_auth = false` in the `[auth]` section to allow unauthenticated clients (opt-out) |
 | Session-bound client signature | Client signs `ClientResponse bytes \|\| ServerHello bytes` — the signature covers the server's per-session nonce, making replay attacks across sessions impossible |
 | `mlock(2)` on SigningKey | Key material stored in heap-allocated `Box<[u8; 4032]>` and memory-locked via `libc::mlock` — never paged to swap |
 
@@ -249,7 +261,7 @@ cargo build --release
 
 ## Tests
 
-309 unit + integration tests across all four crates — all passing.
+308 unit + integration tests across all four crates — all passing.
 
 ### latticeshield-crypto (39 tests)
 
@@ -257,8 +269,7 @@ cargo build --release
 |---|---|
 | `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection), mutual auth (signed ClientResponse roundtrip, wrong VK, tampered CR, wrong ServerHello) |
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
-| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, error types, `rotate_key` HKDF ratchet (deterministic, chained), seq monotonic increment, replay rejection, post-rotation seq reset, tampered-seq AEAD failure, sequential receive |
-| `anti_replay` | Accept once, reject duplicate, window expiry |
+| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, encrypted KEY_ROTATE wire format (61B: GCM nonce + encrypted nonce + tag), tampered KEY_ROTATE AEAD failure, error types, `rotate_key` HKDF ratchet (deterministic, chained), seq monotonic increment, replay rejection, post-rotation seq reset, tampered-seq AEAD failure, sequential receive |
 
 ### latticeshield-bridge (202 tests)
 
@@ -318,14 +329,14 @@ cargo build --release
 | 15 | Hybrid TLS + Command Wiring — post-quantum-safe outbound HTTPS for bridge→cloud (reqwest + rustls, X25519MLKEM768), `BridgeCommand::Rotate` wired to actual key rotation |
 | 16 | Pre-production Hardening — graceful shutdown (SIGTERM/SIGINT drain with configurable timeout), Mutex poison recovery in `vk_share.rs`, flaky test eliminated in `control_plane` and `session` |
 | 17 | Sequence Numbers + Framing v3 — monotonic `seq` (u64 BE) field in DATA frames authenticated as AEAD AAD; receiver rejects replays; `FrameError` enum; `rotate_key()` resets both counters; closes G1/D4 |
+| 18 | Security Enforcement — `require_client_auth = true` by default with explicit opt-out via `[auth]` section (G2); KEY_ROTATE nonce encrypted with AES-256-GCM (61-byte wire format) instead of plaintext (G4); `AntiReplayFilter` dead code removed — 0-RTT tickets never implemented (G5); env-var race in `control_plane` tests eliminated |
 
 ### Upcoming
 
 | Month | Milestone |
 |---|---|
-| 18 | **Security Enforcement** — Make client auth required by default with explicit opt-out (G2), encrypt KEY_ROTATE nonce inside a DATA frame instead of plaintext (G4), integrate AntiReplayFilter into bridge/admin handshake or remove dead code with justification (G5) |
 | 19 | **Release Pipeline + Install Script** — GitHub Actions cross-compile for linux-x64/arm64 and darwin-x64/arm64, `install.sh` with platform detection + systemd/launchd setup, SHA-256 checksum verification |
-| 20+ | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, bloom filter for AntiReplayFilter at scale, cloud-side heartbeat signature verification |
+| 20+ | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, cloud-side heartbeat signature verification |
 
 ## License
 
