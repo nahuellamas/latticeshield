@@ -29,10 +29,15 @@ use zeroize::Zeroizing;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const SEQ_LEN: usize = 8;
+const ROTATION_NONCE_LEN: usize = 32;
 
 const FRAME_DATA: u8 = 0x01;
 const FRAME_KEY_ROTATE: u8 = 0x02;
 const ROTATION_HKDF_INFO: &[u8] = b"latticeshield-v1-key-rotation";
+
+/// Total wire size of a KEY_ROTATE frame:
+/// [0x02][12B GCM nonce][32B encrypted rotation nonce + 16B GCM tag] = 61 bytes
+pub const KEY_ROTATE_FRAME_LEN: usize = 1 + NONCE_LEN + ROTATION_NONCE_LEN + TAG_LEN;
 
 /// Error de framing — distingue Replay de fallos I/O y AEAD.
 #[derive(Debug, thiserror::Error)]
@@ -181,24 +186,52 @@ impl EncryptedChannel {
             }
 
             FRAME_KEY_ROTATE => {
-                let mut nonce = [0u8; 32];
-                reader.read_exact(&mut nonce).await?;
-                Ok(FrameResult::KeyRotate(nonce))
+                // Read: [12B GCM nonce][32B encrypted rotation nonce + 16B tag]
+                let mut gcm_nonce_bytes = [0u8; NONCE_LEN];
+                reader.read_exact(&mut gcm_nonce_bytes).await?;
+
+                let mut ct_and_tag = [0u8; ROTATION_NONCE_LEN + TAG_LEN];
+                reader.read_exact(&mut ct_and_tag).await?;
+
+                let (ct, tag_bytes) = ct_and_tag.split_at(ROTATION_NONCE_LEN);
+                let tag = Tag::from_slice(tag_bytes);
+                let mut rotation_nonce = [0u8; ROTATION_NONCE_LEN];
+                rotation_nonce.copy_from_slice(ct);
+
+                let gcm_nonce = Nonce::from_slice(&gcm_nonce_bytes);
+                self.cipher
+                    .decrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce, tag)
+                    .map_err(|_| FrameError::AeadFailure)?;
+
+                Ok(FrameResult::KeyRotate(rotation_nonce))
             }
 
             other => Err(FrameError::Invalid(format!("unknown frame type: {other:#04x}"))),
         }
     }
 
-    /// Escribe un KEY_ROTATE frame en `writer`.
-    /// Formato: [0x02][32B nonce] — 33 bytes fijos, sin cifrado.
+    /// Escribe un KEY_ROTATE frame cifrado en `writer`.
+    /// Formato: [0x02][12B GCM nonce][32B encrypted rotation nonce + 16B GCM tag] = 61 bytes.
+    /// El rotation nonce viaja cifrado con la clave de sesion actual (AES-256-GCM).
     pub async fn send_key_rotate(
         &self,
         writer: &mut (impl AsyncWrite + Unpin),
-        nonce: &[u8; 32],
+        nonce: &[u8; ROTATION_NONCE_LEN],
     ) -> anyhow::Result<()> {
-        writer.write_all(&[FRAME_KEY_ROTATE]).await.context("write key rotate type")?;
-        writer.write_all(nonce).await.context("write rotation nonce")?;
+        let mut gcm_nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut gcm_nonce_bytes);
+        let gcm_nonce = Nonce::from_slice(&gcm_nonce_bytes);
+
+        let mut rotation_nonce = *nonce;
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce)
+            .map_err(|_| anyhow::anyhow!("KEY_ROTATE encrypt failed"))?;
+
+        writer.write_all(&[FRAME_KEY_ROTATE]).await.context("write KEY_ROTATE type")?;
+        writer.write_all(&gcm_nonce_bytes).await.context("write KEY_ROTATE gcm_nonce")?;
+        writer.write_all(&rotation_nonce).await.context("write KEY_ROTATE encrypted nonce")?;
+        writer.write_all(tag.as_slice()).await.context("write KEY_ROTATE tag")?;
         Ok(())
     }
 
@@ -245,14 +278,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_rotate_frame_is_33_bytes_starting_0x02() {
+    async fn key_rotate_frame_is_61_bytes_starting_0x02() {
         let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
-        let nonce = [0xABu8; 32];
+        let rotation_nonce = [0xABu8; 32];
         let mut buf = Vec::new();
-        channel.send_key_rotate(&mut buf, &nonce).await.unwrap();
-        assert_eq!(buf.len(), 33, "KEY_ROTATE frame must be exactly 33 bytes");
+        channel.send_key_rotate(&mut buf, &rotation_nonce).await.unwrap();
+        assert_eq!(buf.len(), KEY_ROTATE_FRAME_LEN, "KEY_ROTATE frame must be exactly 61 bytes");
         assert_eq!(buf[0], 0x02, "KEY_ROTATE frame must start with 0x02");
-        assert_eq!(&buf[1..], &nonce, "remaining 32 bytes must be the nonce");
+    }
+
+    #[tokio::test]
+    async fn key_rotate_tampered_payload_returns_aead_failure() {
+        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let rotation_nonce = [0xABu8; 32];
+        let mut buf = Vec::new();
+        channel.send_key_rotate(&mut buf, &rotation_nonce).await.unwrap();
+
+        // Flip a byte in the encrypted payload (after [type=1B][gcm_nonce=12B])
+        buf[14] ^= 0xFF;
+
+        let mut reader = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut cursor = std::io::Cursor::new(buf);
+        let err = reader.read_frame(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::AeadFailure),
+            "tampered KEY_ROTATE must cause AeadFailure, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -271,14 +322,16 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_key_rotate_roundtrip() {
-        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
-        let nonce = [0x7Fu8; 32];
+        // Sender and receiver share the same key — receiver must decrypt nonce correctly.
+        let sender = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut receiver = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let rotation_nonce = [0x7Fu8; 32];
         let mut buf = Vec::new();
-        channel.send_key_rotate(&mut buf, &nonce).await.unwrap();
+        sender.send_key_rotate(&mut buf, &rotation_nonce).await.unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
-        match channel.read_frame(&mut cursor).await.unwrap() {
-            FrameResult::KeyRotate(received) => assert_eq!(received, nonce),
+        match receiver.read_frame(&mut cursor).await.unwrap() {
+            FrameResult::KeyRotate(received) => assert_eq!(received, rotation_nonce),
             FrameResult::Data(_) => panic!("expected KeyRotate, got Data"),
         }
     }
