@@ -147,13 +147,15 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
         })?;
         let handle = crate::admin::spawn_admin_listener(
             config.admin_listen_addr,
-            Arc::clone(&identity),
-            Arc::new(cp_vk),
-            Arc::clone(&vk_store),
-            Arc::clone(&metrics_state),
-            Arc::clone(&rotate_tx),
-            metrics_handle.clone(),
-            tls_base_url.clone(),
+            crate::admin::AdminServices {
+                identity: Arc::clone(&identity),
+                cp_vk: Arc::new(cp_vk),
+                vk_store: Arc::clone(&vk_store),
+                metrics_state: Arc::clone(&metrics_state),
+                rotate_tx: Arc::clone(&rotate_tx),
+                prometheus_handle: metrics_handle.clone(),
+                tls_base_url: tls_base_url.clone(),
+            },
             crate::admin::AdminListenerConfig {
                 rate_limit_per_second: config.admin_rate_limit_per_second,
                 handshake_timeout_secs: config.admin_handshake_timeout_secs,
@@ -224,15 +226,17 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                let identity = Arc::clone(&identity);
-                let client_vk = client_vk.clone();
-                let ms = Arc::clone(&metrics_state);
-                let rtx = Arc::clone(&rotate_tx);
+                let ctx = session::SessionContext {
+                    identity: Arc::clone(&identity),
+                    client_auth: client_vk.clone(),
+                    metrics_state: Arc::clone(&metrics_state),
+                    rotate_tx: Arc::clone(&rotate_tx),
+                };
                 let cfg = config.clone();
                 let session_shutdown_rx = shutdown_rx.clone();
 
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = session::handle(socket, peer, identity, client_vk, ms, rtx, cfg, session_shutdown_rx).await {
+                    if let Err(e) = session::handle(socket, peer, ctx, cfg, session_shutdown_rx).await {
                         error!(%peer, "sesion error: {e:#}");
                     }
                 });

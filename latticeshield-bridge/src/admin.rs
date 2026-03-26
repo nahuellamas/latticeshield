@@ -53,6 +53,18 @@ pub enum AdminResponse {
     Error { message: String },
 }
 
+/// Servicios compartidos por todas las conexiones del listener admin.
+#[derive(Clone)]
+pub struct AdminServices {
+    pub identity: Arc<ServerIdentity>,
+    pub cp_vk: Arc<ControlPlaneVerifyingIdentity>,
+    pub vk_store: VkShareStore,
+    pub metrics_state: Arc<MetricsState>,
+    pub rotate_tx: Arc<watch::Sender<u64>>,
+    pub prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
+    pub tls_base_url: String,
+}
+
 /// Configuracion de runtime del listener admin.
 pub struct AdminListenerConfig {
     pub rate_limit_per_second: u32,
@@ -96,19 +108,13 @@ async fn do_handshake(
 async fn handle_admin_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
-    identity: Arc<ServerIdentity>,
-    cp_vk: Arc<ControlPlaneVerifyingIdentity>,
-    vk_store: VkShareStore,
-    metrics_state: Arc<MetricsState>,
-    rotate_tx: Arc<watch::Sender<u64>>,
-    prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
-    tls_base_url: String,
+    services: AdminServices,
     handshake_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     // Handshake con timeout
     let session_key = match tokio::time::timeout(
         Duration::from_secs(handshake_timeout_secs),
-        do_handshake(&mut stream, &identity, &cp_vk),
+        do_handshake(&mut stream, &services.identity, &services.cp_vk),
     )
     .await
     {
@@ -155,9 +161,11 @@ async fn handle_admin_connection(
 
     // Dispatch command
     let response = match cmd_frame.cmd {
-        AdminCommand::GetMetrics => handle_get_metrics(&prometheus_handle),
-        AdminCommand::Rotate => handle_rotate(&rotate_tx, &metrics_state),
-        AdminCommand::GetVkToken => handle_get_vk_token(&vk_store, &identity, &tls_base_url),
+        AdminCommand::GetMetrics => handle_get_metrics(&services.prometheus_handle),
+        AdminCommand::Rotate => handle_rotate(&services.rotate_tx, &services.metrics_state),
+        AdminCommand::GetVkToken => {
+            handle_get_vk_token(&services.vk_store, &services.identity, &services.tls_base_url)
+        }
     };
 
     let resp_bytes = serde_json::to_vec(&response)?;
@@ -200,13 +208,7 @@ fn handle_get_vk_token(
 
 pub fn spawn_admin_listener(
     listen_addr: SocketAddr,
-    identity: Arc<ServerIdentity>,
-    cp_vk: Arc<ControlPlaneVerifyingIdentity>,
-    vk_store: VkShareStore,
-    metrics_state: Arc<MetricsState>,
-    rotate_tx: Arc<watch::Sender<u64>>,
-    prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
-    tls_base_url: String,
+    services: AdminServices,
     config: AdminListenerConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
@@ -252,29 +254,12 @@ pub fn spawn_admin_listener(
                 continue;
             }
 
-            let identity = Arc::clone(&identity);
-            let cp_vk = Arc::clone(&cp_vk);
-            let vk_store = Arc::clone(&vk_store);
-            let metrics_state = Arc::clone(&metrics_state);
-            let rotate_tx = Arc::clone(&rotate_tx);
-            let prometheus_handle = prometheus_handle.clone();
-            let tls_base_url = tls_base_url.clone();
+            let services = services.clone();
             let timeout_secs = config.handshake_timeout_secs;
 
             tokio::spawn(async move {
-                if let Err(e) = handle_admin_connection(
-                    stream,
-                    peer,
-                    identity,
-                    cp_vk,
-                    vk_store,
-                    metrics_state,
-                    rotate_tx,
-                    prometheus_handle,
-                    tls_base_url,
-                    timeout_secs,
-                )
-                .await
+                if let Err(e) =
+                    handle_admin_connection(stream, peer, services, timeout_secs).await
                 {
                     warn!(%peer, "admin: connection error: {e:#}");
                 }
