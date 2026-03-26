@@ -22,7 +22,7 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-Every encrypted message sent between the bridge and a client agent now carries a sequence number (that means: a counter that goes up by one with every message). The bridge checks that each incoming message has a higher counter than the previous one. If an attacker copies a message and sends it again later, the bridge recognises that the counter is not new and discards the message immediately. The counter is protected by the same mathematical seal that protects the message content, so an attacker cannot change it without detection either.
+- The bridge now requires that connecting clients prove their identity by default. Before this release, client verification was opt-in — the bridge would let anyone connect unless you explicitly loaded a verification key. Now the default is reversed: the bridge refuses to start unless you either provide a client verification key or explicitly set `require_client_auth = false` in the configuration file to allow open connections. New deployments are secure out of the box rather than open by default.
 
 ---
-*Last updated: 2026-03-25 — latticeshield-mes17-seq-numbers*
+*Last updated: 2026-03-26 — latticeshield-mes18-security*
