@@ -163,9 +163,11 @@ async fn handle_admin_connection(
     let response = match cmd_frame.cmd {
         AdminCommand::GetMetrics => handle_get_metrics(&services.prometheus_handle),
         AdminCommand::Rotate => handle_rotate(&services.rotate_tx, &services.metrics_state),
-        AdminCommand::GetVkToken => {
-            handle_get_vk_token(&services.vk_store, &services.identity, &services.tls_base_url)
-        }
+        AdminCommand::GetVkToken => handle_get_vk_token(
+            &services.vk_store,
+            &services.identity,
+            &services.tls_base_url,
+        ),
     };
 
     let resp_bytes = serde_json::to_vec(&response)?;
@@ -258,8 +260,7 @@ pub fn spawn_admin_listener(
             let timeout_secs = config.handshake_timeout_secs;
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_admin_connection(stream, peer, services, timeout_secs).await
+                if let Err(e) = handle_admin_connection(stream, peer, services, timeout_secs).await
                 {
                     warn!(%peer, "admin: connection error: {e:#}");
                 }
