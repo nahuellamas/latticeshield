@@ -110,23 +110,13 @@ impl Default for LoggingSection {
 
 // ── Root Config ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ClientConfig {
     pub client: ClientSection,
     pub logging: LoggingSection,
     #[serde(default)]
     pub pool: PoolConfig,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            client: ClientSection::default(),
-            logging: LoggingSection::default(),
-            pool: PoolConfig::default(),
-        }
-    }
 }
 
 // ── ValidClientConfig — post-validation ────────────────────────────────────────

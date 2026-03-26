@@ -55,7 +55,7 @@ impl ConnectionPool {
             while inner
                 .idle
                 .front()
-                .map_or(false, |c| c.created_at.elapsed() >= timeout)
+                .is_some_and(|c| c.created_at.elapsed() >= timeout)
             {
                 let evicted = inner.idle.pop_front().unwrap();
                 debug!(bridge = %self.bridge_addr, "evicted stale idle connection");
