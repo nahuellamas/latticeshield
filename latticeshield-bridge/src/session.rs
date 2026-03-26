@@ -36,19 +36,24 @@ use crate::identity::{ClientVerifyingIdentity, ServerIdentity};
 use crate::metrics::{ActiveGuard, MetricsActiveGuard, MetricsState};
 use latticeshield_crypto::channel::{EncryptedChannel, FrameResult};
 
+/// Estado compartido que se pasa a cada handler de sesion.
+pub struct SessionContext {
+    pub identity: Arc<ServerIdentity>,
+    pub client_auth: Option<Arc<ClientVerifyingIdentity>>,
+    pub metrics_state: Arc<MetricsState>,
+    pub rotate_tx: Arc<watch::Sender<u64>>,
+}
+
 pub async fn handle(
     mut client: TcpStream,
     peer: SocketAddr,
-    identity: Arc<ServerIdentity>,
-    client_auth: Option<Arc<ClientVerifyingIdentity>>,
-    metrics_state: Arc<MetricsState>,
-    rotate_tx: Arc<watch::Sender<u64>>,
+    ctx: SessionContext,
     config: ValidConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     info!(%peer, "conexion entrante");
     metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
-    metrics_state
+    ctx.metrics_state
         .connections_total
         .fetch_add(1, Ordering::Relaxed);
 
@@ -59,7 +64,7 @@ pub async fn handle(
 
     // Firma el ServerHello con la clave de largo plazo — VK pre-shared en el cliente
     let hello_bytes = server
-        .server_hello_signed_bytes(&identity.signing_key, &mut OsRng)
+        .server_hello_signed_bytes(&ctx.identity.signing_key, &mut OsRng)
         .context("firma del ServerHello")?;
 
     client
@@ -68,7 +73,7 @@ pub async fn handle(
         .context("envio ServerHello firmado")?;
     debug!(%peer, "ServerHello firmado enviado ({} bytes)", SERVER_HELLO_SIGNED_LEN);
 
-    let session_key = match &client_auth {
+    let session_key = match &ctx.client_auth {
         Some(client_identity) => {
             let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
             client
@@ -102,7 +107,7 @@ pub async fn handle(
     // ── 2. Canal cifrado ─────────────────────────────────────────────────────
 
     let _guard = ActiveGuard::new();
-    let _ms_guard = MetricsActiveGuard::new(&metrics_state);
+    let _ms_guard = MetricsActiveGuard::new(&ctx.metrics_state);
     let mut channel = EncryptedChannel::new(session_key.as_bytes(), config.max_frame_size);
 
     // ── 3. Conexion al backend ───────────────────────────────────────────────
@@ -121,7 +126,7 @@ pub async fn handle(
     let mut bytes_this_epoch: u64 = 0;
 
     // Watch receiver para rotacion manual via POST /rotate
-    let mut rotate_rx = rotate_tx.subscribe();
+    let mut rotate_rx = ctx.rotate_tx.subscribe();
 
     // Intervalo de tiempo para rotacion periodica.
     // El primer tick dispara inmediatamente — lo consumimos antes del loop.
@@ -153,7 +158,7 @@ pub async fn handle(
                     }
                     Err(e) => {
                         warn!(%peer, "error leyendo frame del cliente: {e}");
-                        metrics_state.channel_errors_total.fetch_add(1, Ordering::Relaxed);
+                        ctx.metrics_state.channel_errors_total.fetch_add(1, Ordering::Relaxed);
                         metrics::counter!(crate::metrics::CHANNEL_ERRORS).increment(1);
                         break;
                     }
@@ -171,7 +176,7 @@ pub async fn handle(
                         channel.write_frame(&mut client_w, &backend_buf[..n])
                             .await
                             .context("write frame al cliente")?;
-                        metrics_state.bytes_transmitted_total.fetch_add(n as u64, Ordering::Relaxed);
+                        ctx.metrics_state.bytes_transmitted_total.fetch_add(n as u64, Ordering::Relaxed);
                         metrics::counter!(crate::metrics::BYTES_TRANSMITTED).increment(n as u64);
                         bytes_this_epoch += n as u64;
                         // Trigger por umbral de bytes
@@ -204,7 +209,7 @@ pub async fn handle(
         };
 
         if should_rotate {
-            do_rotate(&mut channel, &mut client_w, &metrics_state, peer).await?;
+            do_rotate(&mut channel, &mut client_w, &ctx.metrics_state, peer).await?;
             bytes_this_epoch = 0;
         }
     }

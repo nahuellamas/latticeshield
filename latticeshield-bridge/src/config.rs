@@ -308,7 +308,7 @@ impl Default for QuicConfig {
 
 // ── Root Config ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -323,23 +323,6 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub admin: AdminConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            crypto: CryptoConfig::default(),
-            metrics: MetricsConfig::default(),
-            logging: LoggingConfig::default(),
-            control_plane: ControlPlaneConfig::default(),
-            key_rotation: KeyRotationConfig::default(),
-            tls: TlsConfig::default(),
-            quic: QuicConfig::default(),
-            auth: AuthConfig::default(),
-            admin: AdminConfig::default(),
-        }
-    }
 }
 
 // ── ValidConfig — post-validation, what server::run() receives ─────────────────

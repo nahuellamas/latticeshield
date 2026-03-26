@@ -144,10 +144,12 @@ async fn full_pqc_handshake_and_relay() {
         let _ = crate::session::handle(
             socket,
             peer,
-            identity,
-            None,
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: None,
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             test_config(backend_addr),
             shutdown_rx,
         )
@@ -210,10 +212,12 @@ async fn two_sessions_produce_different_keys() {
             let _ = crate::session::handle(
                 socket,
                 peer,
-                identity,
-                None,
-                MetricsState::new(),
-                test_rotate_tx(),
+                crate::session::SessionContext {
+                    identity,
+                    client_auth: None,
+                    metrics_state: MetricsState::new(),
+                    rotate_tx: test_rotate_tx(),
+                },
                 test_config(backend_addr),
                 shutdown_rx,
             )
@@ -262,10 +266,12 @@ async fn tampered_client_response_is_rejected() {
         crate::session::handle(
             socket,
             peer,
-            identity,
-            None,
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: None,
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             test_config(backend_addr),
             shutdown_rx,
         )
@@ -483,10 +489,12 @@ async fn full_session_records_connections_and_bytes() {
         let _ = crate::session::handle(
             socket,
             peer,
-            identity,
-            None,
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: None,
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             test_config(backend_addr),
             shutdown_rx,
         )
@@ -581,10 +589,12 @@ async fn full_relay_survives_key_rotation() {
         let _ = crate::session::handle(
             socket,
             peer,
-            identity,
-            None,
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: None,
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             cfg,
             shutdown_rx,
         )
@@ -668,10 +678,12 @@ async fn byte_threshold_triggers_rotation() {
         let _ = crate::session::handle(
             socket,
             peer,
-            identity,
-            None,
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: None,
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             cfg,
             shutdown_rx,
         )
@@ -794,10 +806,12 @@ async fn test_session_with_client_auth() {
         let _ = crate::session::handle(
             socket,
             peer,
-            identity,
-            Some(client_auth),
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: Some(client_auth),
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             test_config(backend_addr),
             shutdown_rx,
         )
@@ -865,10 +879,12 @@ async fn test_session_without_client_auth() {
         let _ = crate::session::handle(
             socket,
             peer,
-            identity,
-            None,
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: None,
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             test_config(backend_addr),
             shutdown_rx,
         )
@@ -934,10 +950,12 @@ async fn test_session_wrong_client_vk() {
         crate::session::handle(
             socket,
             peer,
-            identity,
-            Some(wrong_client_auth),
-            MetricsState::new(),
-            test_rotate_tx(),
+            crate::session::SessionContext {
+                identity,
+                client_auth: Some(wrong_client_auth),
+                metrics_state: MetricsState::new(),
+                rotate_tx: test_rotate_tx(),
+            },
             test_config(backend_addr),
             shutdown_rx,
         )
@@ -1024,13 +1042,15 @@ async fn admin_channel_get_metrics_full_handshake() {
     let _admin_shutdown_tx = admin_shutdown_tx;
     crate::admin::spawn_admin_listener(
         admin_addr,
-        Arc::clone(&bridge_identity),
-        Arc::clone(&cp_vk),
-        Arc::clone(&vk_store),
-        Arc::clone(&metrics_state),
-        Arc::clone(&rotate_tx),
-        prometheus_handle,
-        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminServices {
+            identity: Arc::clone(&bridge_identity),
+            cp_vk: Arc::clone(&cp_vk),
+            vk_store: Arc::clone(&vk_store),
+            metrics_state: Arc::clone(&metrics_state),
+            rotate_tx: Arc::clone(&rotate_tx),
+            prometheus_handle,
+            tls_base_url: "https://127.0.0.1:8440".to_string(),
+        },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
             handshake_timeout_secs: 5,
@@ -1114,13 +1134,15 @@ async fn admin_channel_wrong_client_sk_rejected() {
     let _admin_shutdown_tx = admin_shutdown_tx;
     crate::admin::spawn_admin_listener(
         admin_addr,
-        Arc::clone(&bridge_identity),
-        Arc::clone(&cp_vk),
-        Arc::clone(&vk_store),
-        Arc::clone(&metrics_state),
-        Arc::clone(&rotate_tx),
-        prometheus_handle,
-        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminServices {
+            identity: Arc::clone(&bridge_identity),
+            cp_vk: Arc::clone(&cp_vk),
+            vk_store: Arc::clone(&vk_store),
+            metrics_state: Arc::clone(&metrics_state),
+            rotate_tx: Arc::clone(&rotate_tx),
+            prometheus_handle,
+            tls_base_url: "https://127.0.0.1:8440".to_string(),
+        },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
             handshake_timeout_secs: 5,
@@ -1189,13 +1211,15 @@ async fn admin_channel_rotate_full_handshake() {
     let _admin_shutdown_tx = admin_shutdown_tx;
     crate::admin::spawn_admin_listener(
         admin_addr,
-        Arc::clone(&bridge_identity),
-        Arc::clone(&cp_vk),
-        Arc::clone(&vk_store),
-        Arc::clone(&metrics_state),
-        Arc::clone(&rotate_tx),
-        prometheus_handle,
-        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminServices {
+            identity: Arc::clone(&bridge_identity),
+            cp_vk: Arc::clone(&cp_vk),
+            vk_store: Arc::clone(&vk_store),
+            metrics_state: Arc::clone(&metrics_state),
+            rotate_tx: Arc::clone(&rotate_tx),
+            prometheus_handle,
+            tls_base_url: "https://127.0.0.1:8440".to_string(),
+        },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
             handshake_timeout_secs: 5,
@@ -1269,13 +1293,15 @@ async fn admin_channel_get_vk_token_full_handshake() {
     let _admin_shutdown_tx = admin_shutdown_tx;
     crate::admin::spawn_admin_listener(
         admin_addr,
-        Arc::clone(&bridge_identity),
-        Arc::clone(&cp_vk),
-        Arc::clone(&vk_store),
-        Arc::clone(&metrics_state),
-        Arc::clone(&rotate_tx),
-        prometheus_handle,
-        "https://127.0.0.1:8440".to_string(),
+        crate::admin::AdminServices {
+            identity: Arc::clone(&bridge_identity),
+            cp_vk: Arc::clone(&cp_vk),
+            vk_store: Arc::clone(&vk_store),
+            metrics_state: Arc::clone(&metrics_state),
+            rotate_tx: Arc::clone(&rotate_tx),
+            prometheus_handle,
+            tls_base_url: "https://127.0.0.1:8440".to_string(),
+        },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
             handshake_timeout_secs: 5,
