@@ -1,0 +1,17 @@
+[Unit]
+Description=LatticeShield Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=latticeshield
+ExecStart=/usr/local/bin/latticeshield-bridge run --config /etc/latticeshield/config.toml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/etc/latticeshield /var/log/latticeshield
+
+[Install]
+WantedBy=multi-user.target

@@ -22,7 +22,10 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-- The bridge now requires that connecting clients prove their identity by default. Before this release, client verification was opt-in — the bridge would let anyone connect unless you explicitly loaded a verification key. Now the default is reversed: the bridge refuses to start unless you either provide a client verification key or explicitly set `require_client_auth = false` in the configuration file to allow open connections. New deployments are secure out of the box rather than open by default.
+- Pre-built binaries are now published automatically to GitHub Releases on every version tag. You no longer need to compile the bridge from source — download the right binary for your platform and it is ready to run.
+- A ready-to-use systemd unit file (`contrib/systemd/latticeshield-bridge.service`) is now included. It runs the bridge as a dedicated low-privilege user with filesystem write access restricted to only the config and log directories, preventing a compromised process from touching the rest of the system.
+- A ready-to-use launchd plist (`contrib/launchd/com.latticeshield.bridge.plist`) is now included for macOS deployments, with automatic restart and log file routing configured.
+- The bridge binary no longer pulls in OpenSSL indirectly through its Prometheus dependency. The metrics exporter now activates only the HTTP listener feature it actually uses, removing an unused code path that added unnecessary dependencies.
 
 ---
-*Last updated: 2026-03-26 — latticeshield-mes18-security*
+*Last updated: 2026-03-26 — latticeshield-mes19-ci-release*

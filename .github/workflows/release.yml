@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install aarch64 cross toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake
+
+      - name: Set cross-compile env
+        if: matrix.cross
+        run: |
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          echo "AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bin latticeshield-bridge \
+            --bin latticeshield-client \
+            --bin latticeshield
+
+      - name: Rename binaries
+        run: |
+          for bin in latticeshield-bridge latticeshield-client latticeshield; do
+            mv "target/${{ matrix.target }}/release/${bin}" "./${bin}-${{ matrix.target }}"
+          done
+
+      - name: Generate per-target checksums
+        run: |
+          sha256sum \
+            "latticeshield-bridge-${{ matrix.target }}" \
+            "latticeshield-client-${{ matrix.target }}" \
+            "latticeshield-${{ matrix.target }}" \
+            > "checksums-${{ matrix.target }}.txt"
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.target }}
+          path: |
+            latticeshield-bridge-${{ matrix.target }}
+            latticeshield-client-${{ matrix.target }}
+            latticeshield-${{ matrix.target }}
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums-${{ matrix.target }}
+          path: checksums-${{ matrix.target }}.txt
+
+  merge-checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all checksum artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: checksums-*
+          merge-multiple: true
+
+      - name: Merge into single checksums.txt
+        run: cat checksums-*.txt | sort > checksums.txt
+
+      - name: Upload merged checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums-final
+          path: checksums.txt
+
+  upload-release:
+    needs: [build, merge-checksums]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bins-*
+          merge-multiple: true
+
+      - name: Download merged checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums-final
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            latticeshield-bridge-*
+            latticeshield-client-*
+            latticeshield-x86_64-*
+            latticeshield-aarch64-*
+            checksums.txt
