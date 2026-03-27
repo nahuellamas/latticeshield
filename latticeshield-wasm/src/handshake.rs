@@ -130,7 +130,7 @@ fn client_respond(
     let mut rng = OsRng;
 
     // Efimero X25519 del cliente
-    let client_x25519_secret = EphemeralSecret::random_from_rng(&mut rng);
+    let client_x25519_secret = EphemeralSecret::random_from_rng(rng);
     let client_x25519_public = X25519PublicKey::from(&client_x25519_secret);
 
     // Secreto X25519
