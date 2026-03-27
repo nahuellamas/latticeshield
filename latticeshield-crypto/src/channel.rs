@@ -13,7 +13,9 @@
 //! Cada DATA frame tiene nonce unico — nunca se reutiliza bajo la misma clave.
 //! El campo seq (u64 BE) se autentica como AAD del GCM — no puede ser manipulado sin deteccion.
 //! rotate_key() deriva una nueva clave via HKDF-SHA256 y zeroiza la anterior.
-//! Ambos contadores (send_seq, recv_seq) se resetean a 0 en rotate_key().
+//! Ambos contadores de DATA (send_seq, recv_seq) se resetean a 0 en rotate_key().
+//! Los contadores KEY_ROTATE (key_rotate_send_seq, key_rotate_recv_seq) persisten a traves
+//! de rotaciones para prevenir replay cross-epoch.
 
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
@@ -78,6 +80,12 @@ pub struct EncryptedChannel {
     /// Indica si al menos un frame fue recibido en esta epoca de clave.
     /// Necesario para distinguir "nunca recibido, seq=0 es bootstrap" de "ya recibio seq=0".
     recv_initialized: bool,
+    /// Contador monotono de KEY_ROTATE frames enviados. AAD del GCM — previene replay.
+    /// NO se resetea en rotate_key() para bloquear replay cross-epoch.
+    key_rotate_send_seq: u64,
+    /// Contador monotono de KEY_ROTATE frames recibidos. AAD del GCM — previene replay.
+    /// NO se resetea en rotate_key() para bloquear replay cross-epoch.
+    key_rotate_recv_seq: u64,
 }
 
 impl EncryptedChannel {
@@ -90,6 +98,8 @@ impl EncryptedChannel {
             send_seq: 0,
             recv_seq: 0,
             recv_initialized: false,
+            key_rotate_send_seq: 0,
+            key_rotate_recv_seq: 0,
         }
     }
 
@@ -198,11 +208,13 @@ impl EncryptedChannel {
                 let mut rotation_nonce = [0u8; ROTATION_NONCE_LEN];
                 rotation_nonce.copy_from_slice(ct);
 
+                let aad = self.key_rotate_recv_seq.to_be_bytes();
                 let gcm_nonce = Nonce::from_slice(&gcm_nonce_bytes);
                 self.cipher
-                    .decrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce, tag)
+                    .decrypt_in_place_detached(gcm_nonce, &aad, &mut rotation_nonce, tag)
                     .map_err(|_| FrameError::AeadFailure)?;
 
+                self.key_rotate_recv_seq += 1;
                 Ok(FrameResult::KeyRotate(rotation_nonce))
             }
 
@@ -215,8 +227,9 @@ impl EncryptedChannel {
     /// Escribe un KEY_ROTATE frame cifrado en `writer`.
     /// Formato: [0x02][12B GCM nonce][32B encrypted rotation nonce + 16B GCM tag] = 61 bytes.
     /// El rotation nonce viaja cifrado con la clave de sesion actual (AES-256-GCM).
+    /// `key_rotate_send_seq` se usa como AAD — previene replay incluso si el GCM nonce se repite.
     pub async fn send_key_rotate(
-        &self,
+        &mut self,
         writer: &mut (impl AsyncWrite + Unpin),
         nonce: &[u8; ROTATION_NONCE_LEN],
     ) -> anyhow::Result<()> {
@@ -224,10 +237,11 @@ impl EncryptedChannel {
         OsRng.fill_bytes(&mut gcm_nonce_bytes);
         let gcm_nonce = Nonce::from_slice(&gcm_nonce_bytes);
 
+        let aad = self.key_rotate_send_seq.to_be_bytes();
         let mut rotation_nonce = *nonce;
         let tag = self
             .cipher
-            .encrypt_in_place_detached(gcm_nonce, b"", &mut rotation_nonce)
+            .encrypt_in_place_detached(gcm_nonce, &aad, &mut rotation_nonce)
             .map_err(|_| anyhow::anyhow!("KEY_ROTATE encrypt failed"))?;
 
         writer
@@ -246,12 +260,16 @@ impl EncryptedChannel {
             .write_all(tag.as_slice())
             .await
             .context("write KEY_ROTATE tag")?;
+
+        self.key_rotate_send_seq += 1;
         Ok(())
     }
 
     /// Deriva una nueva clave via HKDF-SHA256 y reemplaza el cipher.
     /// La clave anterior es zeroizada automaticamente cuando `key_bytes` es reemplazado.
-    /// Ambos contadores de secuencia se resetean a 0 (nueva epoca de claves).
+    /// Los contadores DATA (send_seq, recv_seq) se resetean a 0 (nueva epoca de claves).
+    /// Los contadores KEY_ROTATE (key_rotate_send_seq, key_rotate_recv_seq) NO se resetean —
+    /// persisten a traves de rotaciones para prevenir replay cross-epoch.
     ///
     /// `new_key = HKDF-SHA256(ikm=current_key, salt=nonce, info="latticeshield-v1-key-rotation")`
     pub fn rotate_key(&mut self, nonce: &[u8; 32]) {
@@ -294,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_rotate_frame_is_61_bytes_starting_0x02() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let rotation_nonce = [0xABu8; 32];
         let mut buf = Vec::new();
         channel
@@ -311,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_rotate_tampered_payload_returns_aead_failure() {
-        let channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut channel = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let rotation_nonce = [0xABu8; 32];
         let mut buf = Vec::new();
         channel
@@ -348,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn read_frame_key_rotate_roundtrip() {
         // Sender and receiver share the same key — receiver must decrypt nonce correctly.
-        let sender = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut sender = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let mut receiver = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
         let rotation_nonce = [0x7Fu8; 32];
         let mut buf = Vec::new();
@@ -583,6 +601,35 @@ mod tests {
         assert!(
             matches!(err, FrameError::AeadFailure),
             "tampered seq must cause AeadFailure, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_rotate_replay_is_rejected() {
+        // El mismo KEY_ROTATE frame enviado dos veces al receiver debe fallar la segunda vez.
+        // El contador key_rotate_recv_seq avanza tras el primer decrypt, haciendo que el
+        // segundo intento use AAD distinto → AeadFailure.
+        let mut sender = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let rotation_nonce = [0xCCu8; 32];
+        let mut buf = Vec::new();
+        sender
+            .send_key_rotate(&mut buf, &rotation_nonce)
+            .await
+            .unwrap();
+
+        let mut receiver = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+
+        // Primera lectura: debe ser Ok
+        let mut cursor1 = std::io::Cursor::new(buf.clone());
+        receiver.read_frame(&mut cursor1).await.unwrap();
+
+        // Segunda lectura del mismo frame: AAD del receiver es ahora seq=1, pero el frame
+        // fue cifrado con seq=0 → AeadFailure
+        let mut cursor2 = std::io::Cursor::new(buf.clone());
+        let err = receiver.read_frame(&mut cursor2).await.unwrap_err();
+        assert!(
+            matches!(err, FrameError::AeadFailure),
+            "replayed KEY_ROTATE must cause AeadFailure, got: {err:?}"
         );
     }
 
