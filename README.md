@@ -227,7 +227,7 @@ This writes `admin.sk` (0o600) and `admin.vk` (0o644) to `./keys`. The bridge lo
 | Pure Rust — no FFI | Eliminates entire class of memory-safety bugs at the boundary |
 | No `oqs-rs` | C FFI wrapper; rejected in favor of native Rust implementations |
 | No `openssl` | Legacy C library; rejected via `cargo-deny` |
-| `libcrux-ml-dsa 0.0.7` instead of `ml-dsa` | `ml-dsa 0.0.4` has RUSTSEC-2025-0144 (timing side-channel) + CVE-2026-24850. Using audited libcrux alternative until RustCrypto publishes `ml-dsa 0.1.0` stable |
+| `libcrux-ml-dsa 0.0.8` instead of `ml-dsa` | `ml-dsa 0.0.4` has RUSTSEC-2025-0144 (timing side-channel) + CVE-2026-24850. Using audited libcrux alternative until RustCrypto publishes `ml-dsa 0.1.0` stable. `0.0.8` fixes two correctness bugs in signature verification (γ₁ norm check + hint decoding panic) |
 | Pre-shared server VerifyingKey | Server's ML-DSA-65 VK is distributed out-of-band — never transmitted on the wire, preventing MITM key substitution |
 | Pre-shared client VerifyingKey | Client's ML-DSA-65 VK is pre-shared to the bridge (one authorized keypair per bridge). Bridge rejects any unsigned or wrongly-signed ClientResponse |
 | `require_client_auth = true` by default | Bridge refuses to start if `[auth].client_vk_path` is not set. Set `require_client_auth = false` in the `[auth]` section to allow unauthenticated clients (opt-out) |
@@ -346,7 +346,9 @@ cargo build --release
 
 | Month | Milestone |
 |---|---|
-| 20+ | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, cloud-side heartbeat signature verification |
+| 20 | **Post-launch Improvements** — `Zeroizing<Vec<u8>>` for `ikm` in `derive_session_key` (G8), nonce-misuse-resistant AEAD (AES-GCM-SIV) for high-frame sessions, cloud-side heartbeat signature verification |
+| 21 | **WASM Spike** — validate `libcrux-ml-dsa` compilation to `wasm32-unknown-unknown`; establish fallback strategy (noble-post-quantum) if WASM target is unsupported; define the `latticeshield-wasm` crate boundary (pure crypto, no I/O, no tokio) |
+| 22 | **Browser SDK** — `latticeshield-wasm` (Rust → WASM via wasm-bindgen: session init, AES-GCM encrypt/decrypt, server hello verification) + `latticeshield-js` npm package (TypeScript, React hooks, fetch interceptor) + HTTP/WebSocket relay mode in `latticeshield-bridge` for browser clients; closes the gap between server-to-server PQC and browser-native application-layer PQC |
 
 ## License
 
