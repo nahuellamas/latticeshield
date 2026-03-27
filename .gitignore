@@ -10,3 +10,5 @@ Cargo.lock
 node_modules/
 latticeshield-js/node_modules/
 latticeshield-js/.vite/
+.DS_Store
+.gga
