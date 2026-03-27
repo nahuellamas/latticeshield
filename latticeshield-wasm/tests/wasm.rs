@@ -3,12 +3,12 @@ use wasm_bindgen_test::*;
 // Run tests in Node.js (no chromedriver required — works in headless CI)
 // wasm_bindgen_test_configure!(run_in_browser); // disabled — use --node runner
 
+use latticeshield_wasm::handshake::{
+    generate_client_response, CLIENT_RESPONSE_LEN, MLKEM768_EK_LEN, NONCE_LEN, SERVER_HELLO_LEN,
+    SERVER_HELLO_SIGNED_LEN, SESSION_KEY_LEN, X25519_KEY_LEN,
+};
 use latticeshield_wasm::signing::{
     generate_keypair, sign_msg, verify_msg, SIGNATURE_LEN, SIGNING_KEY_LEN, VERIFYING_KEY_LEN,
-};
-use latticeshield_wasm::handshake::{
-    generate_client_response, CLIENT_RESPONSE_LEN, SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
-    SESSION_KEY_LEN, X25519_KEY_LEN, MLKEM768_EK_LEN, NONCE_LEN,
 };
 
 // ── Task 4.1: sign+verify round-trip ─────────────────────────────────────────
@@ -20,7 +20,12 @@ fn sign_verify_round_trip() {
     let msg = b"latticeshield firmware v1.0";
 
     let sig = sign_msg(sk.to_bytes(), msg).expect("sign should succeed");
-    assert_eq!(sig.len(), SIGNATURE_LEN, "signature must be {} bytes", SIGNATURE_LEN);
+    assert_eq!(
+        sig.len(),
+        SIGNATURE_LEN,
+        "signature must be {} bytes",
+        SIGNATURE_LEN
+    );
 
     verify_msg(vk.to_bytes(), msg, &sig).expect("verify should succeed for valid sig");
 }
@@ -46,8 +51,18 @@ fn keypair_byte_lengths() {
     let mut rng = rand_core::OsRng;
     let (sk, vk) = generate_keypair(&mut rng);
 
-    assert_eq!(sk.to_bytes().len(), SIGNING_KEY_LEN, "SK must be {} bytes", SIGNING_KEY_LEN);
-    assert_eq!(vk.to_bytes().len(), VERIFYING_KEY_LEN, "VK must be {} bytes", VERIFYING_KEY_LEN);
+    assert_eq!(
+        sk.to_bytes().len(),
+        SIGNING_KEY_LEN,
+        "SK must be {} bytes",
+        SIGNING_KEY_LEN
+    );
+    assert_eq!(
+        vk.to_bytes().len(),
+        VERIFYING_KEY_LEN,
+        "VK must be {} bytes",
+        VERIFYING_KEY_LEN
+    );
 }
 
 #[wasm_bindgen_test]
@@ -72,9 +87,9 @@ fn wrong_key_length_returns_err() {
 
 #[wasm_bindgen_test]
 fn ml_kem_client_response_round_trip() {
-    use rand_core::RngCore;
     use libcrux_ml_dsa::ml_dsa_65;
-    use ml_kem::{KemCore, MlKem768, EncodedSizeUser};
+    use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+    use rand_core::RngCore;
     let mut rng = rand_core::OsRng;
 
     // 1. Server ML-DSA-65 keypair (for signing ServerHello)
@@ -105,7 +120,8 @@ fn ml_kem_client_response_round_trip() {
 
     // 3. Sign SERVER_HELLO → SERVER_HELLO_SIGNED
     let sk_bytes: &[u8; latticeshield_wasm::signing::SIGNING_KEY_LEN] = kp.signing_key.as_ref();
-    let vk_bytes: &[u8; latticeshield_wasm::signing::VERIFYING_KEY_LEN] = kp.verification_key.as_ref();
+    let vk_bytes: &[u8; latticeshield_wasm::signing::VERIFYING_KEY_LEN] =
+        kp.verification_key.as_ref();
 
     let mut signing_randomness = [0u8; libcrux_ml_dsa::SIGNING_RANDOMNESS_SIZE];
     rng.fill_bytes(&mut signing_randomness);
@@ -123,10 +139,26 @@ fn ml_kem_client_response_round_trip() {
         .expect("generate_client_response must succeed");
 
     // 5. Assert output sizes
-    assert_eq!(cr_bytes.len(), CLIENT_RESPONSE_LEN, "client_response must be {} bytes", CLIENT_RESPONSE_LEN);
-    assert_eq!(sk_session.len(), SESSION_KEY_LEN, "session_key must be {} bytes", SESSION_KEY_LEN);
+    assert_eq!(
+        cr_bytes.len(),
+        CLIENT_RESPONSE_LEN,
+        "client_response must be {} bytes",
+        CLIENT_RESPONSE_LEN
+    );
+    assert_eq!(
+        sk_session.len(),
+        SESSION_KEY_LEN,
+        "session_key must be {} bytes",
+        SESSION_KEY_LEN
+    );
 
     // 6. Verify client_response is non-zero (real crypto ran)
-    assert!(cr_bytes.iter().any(|&b| b != 0), "client_response must not be all zeros");
-    assert!(sk_session.iter().any(|&b| b != 0), "session_key must not be all zeros");
+    assert!(
+        cr_bytes.iter().any(|&b| b != 0),
+        "client_response must not be all zeros"
+    );
+    assert!(
+        sk_session.iter().any(|&b| b != 0),
+        "session_key must not be all zeros"
+    );
 }

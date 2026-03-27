@@ -8,10 +8,7 @@
 
 use hkdf::Hkdf;
 use hybrid_array::Array;
-use ml_kem::{
-    kem::{Encapsulate},
-    EncodedSizeUser, KemCore, MlKem768,
-};
+use ml_kem::{kem::Encapsulate, EncodedSizeUser, KemCore, MlKem768};
 use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
@@ -146,7 +143,8 @@ fn client_respond(
         .map_err(|_| WasmError::HandshakeError("ML-KEM encapsulation failed".to_string()))?;
 
     // Derivar session key via HKDF-SHA256
-    let session_key = derive_session_key(x25519_shared.as_bytes(), kem_shared.as_ref(), &hello.nonce)?;
+    let session_key =
+        derive_session_key(x25519_shared.as_bytes(), kem_shared.as_ref(), &hello.nonce)?;
 
     // Serializar ClientResponse: [32B X25519 pubkey][1088B ML-KEM ciphertext]
     let mut cr = [0u8; CLIENT_RESPONSE_LEN];

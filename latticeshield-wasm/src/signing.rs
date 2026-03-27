@@ -37,10 +37,11 @@ pub struct SigningKey(Box<[u8; SIGNING_KEY_LEN]>);
 impl SigningKey {
     /// Construye una `SigningKey` desde un slice de bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WasmError> {
-        let arr: [u8; SIGNING_KEY_LEN] = bytes.try_into().map_err(|_| WasmError::InvalidKeyLength {
-            expected: SIGNING_KEY_LEN,
-            got: bytes.len(),
-        })?;
+        let arr: [u8; SIGNING_KEY_LEN] =
+            bytes.try_into().map_err(|_| WasmError::InvalidKeyLength {
+                expected: SIGNING_KEY_LEN,
+                got: bytes.len(),
+            })?;
         Ok(Self(Box::new(arr)))
     }
 
@@ -90,10 +91,12 @@ impl Signature {
     /// Construye una `Signature` desde un slice de bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WasmError> {
         let arr: [u8; SIGNATURE_LEN] =
-            bytes.try_into().map_err(|_| WasmError::InvalidSignatureLength {
-                expected: SIGNATURE_LEN,
-                got: bytes.len(),
-            })?;
+            bytes
+                .try_into()
+                .map_err(|_| WasmError::InvalidSignatureLength {
+                    expected: SIGNATURE_LEN,
+                    got: bytes.len(),
+                })?;
         Ok(Self(arr))
     }
 
