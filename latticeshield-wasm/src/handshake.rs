@@ -12,7 +12,7 @@ use ml_kem::{kem::Encapsulate, EncodedSizeUser, KemCore, MlKem768};
 use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::WasmError;
 use crate::signing::{Signature, VerifyingKey, SIGNATURE_LEN, VERIFYING_KEY_LEN};
@@ -165,11 +165,12 @@ fn derive_session_key(
     ikm.extend_from_slice(kem_secret);
 
     let hkdf = Hkdf::<Sha256>::new(Some(nonce), &ikm);
-    let mut okm = [0u8; SESSION_KEY_LEN];
-    hkdf.expand(HKDF_INFO, &mut okm)
+    let mut okm = Zeroizing::new([0u8; SESSION_KEY_LEN]);
+    hkdf.expand(HKDF_INFO, okm.as_mut())
         .map_err(|_| WasmError::HandshakeError("HKDF expansion failed".to_string()))?;
 
     ikm.zeroize();
 
-    Ok(okm)
+    let result = *okm; // copia los bytes; okm (Zeroizing) se dropea aqui y zeroza el original
+    Ok(result)
 }
