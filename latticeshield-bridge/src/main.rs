@@ -21,6 +21,7 @@ mod server;
 mod session;
 mod tls;
 mod vk_share;
+mod ws;
 
 #[cfg(test)]
 mod tests;

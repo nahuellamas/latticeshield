@@ -71,6 +71,13 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         admin_handshake_timeout_secs: 10,
         control_plane_install_token: None,
         shutdown_timeout: std::time::Duration::from_secs(30),
+        ws_enabled: false,
+        ws_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        ws_cert_path: std::path::PathBuf::from("./keys/ws.crt"),
+        ws_key_path: std::path::PathBuf::from("./keys/ws.key"),
+        ws_allowed_origins: Vec::new(),
+        ws_handshake_timeout_secs: 10,
+        ws_max_connections_per_ip: 100,
     }
 }
 

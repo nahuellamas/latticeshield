@@ -23,7 +23,7 @@ use crate::{
     identity::{ClientVerifyingIdentity, ServerIdentity},
     metrics,
     metrics::MetricsState,
-    quic, session, tls, vk_share,
+    quic, session, tls, vk_share, ws,
 };
 
 /// Estado compartido del servidor HTTP de metricas.
@@ -168,6 +168,20 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
         None
     };
 
+    // ── WebSocket listener (optional — only when websocket.enabled = true) ──
+    let ws_handle = if config.ws_enabled {
+        Some(spawn_ws_listener(
+            config.clone(),
+            Arc::clone(&identity),
+            client_vk.clone(),
+            Arc::clone(&metrics_state),
+            Arc::clone(&rotate_tx),
+            shutdown_rx.clone(),
+        ))
+    } else {
+        None
+    };
+
     // ── TCP proxy listener ───────────────────────────────────────────────────
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "LatticeShield escuchando");
@@ -286,6 +300,14 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
             .is_err()
         {
             warn!("shutdown: admin listener drain timeout exceeded, forcing exit");
+        }
+    }
+    if let Some(h) = ws_handle {
+        if tokio::time::timeout(config.shutdown_timeout, h)
+            .await
+            .is_err()
+        {
+            warn!("shutdown: WS listener drain timeout exceeded, forcing exit");
         }
     }
     if let Some(h) = cp_handle {
@@ -518,6 +540,136 @@ fn spawn_quic_listener(
                     Err(e) => {
                         tracing::warn!("QUIC handshake failed: {e}");
                     }
+                }
+            });
+        }
+    })
+}
+
+fn spawn_ws_listener(
+    config: ValidConfig,
+    identity: Arc<ServerIdentity>,
+    client_vk: Option<Arc<ClientVerifyingIdentity>>,
+    metrics_state: Arc<MetricsState>,
+    rotate_tx: Arc<watch::Sender<u64>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Build TLS acceptor from ws cert+key paths
+        let acceptor = match tls::build_acceptor(&config.ws_cert_path, &config.ws_key_path) {
+            Ok(a) => Arc::new(a),
+            Err(e) => {
+                error!(addr = %config.ws_listen_addr, "WS listener TLS setup failed: {e:#}");
+                return;
+            }
+        };
+
+        let listener = match TcpListener::bind(config.ws_listen_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(addr = %config.ws_listen_addr, "WS listener bind failed: {e}");
+                return;
+            }
+        };
+        info!(addr = %config.ws_listen_addr, "WebSocket (WSS) listener active");
+
+        // Warn if origin validation is disabled (development mode)
+        if config.ws_allowed_origins.is_empty() {
+            warn!(
+                "websocket.allowed_origins is empty — origin validation is disabled (development mode)"
+            );
+        }
+
+        // Per-IP connection counter shared across connection tasks
+        let ip_counter: ws::IpCounterMap =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        loop {
+            let (socket, peer) = tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::warn!("WS accept error: {e}");
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("shutdown: WS listener stopping");
+                    break;
+                }
+            };
+
+            let peer_ip = peer.ip();
+            let max_per_ip = config.ws_max_connections_per_ip as usize;
+
+            // ── Per-IP rate limiting ──────────────────────────────────────
+            {
+                let mut map = ip_counter.lock().unwrap_or_else(|e| e.into_inner());
+                let count = map.entry(peer_ip).or_insert(0);
+                if *count >= max_per_ip {
+                    tracing::warn!(%peer, "WS: connection rejected — IP rate limit ({max_per_ip}) exceeded");
+                    drop(socket);
+                    continue;
+                }
+                *count += 1;
+            }
+
+            let acceptor = Arc::clone(&acceptor);
+            let allowed_origins = config.ws_allowed_origins.clone();
+            let handshake_timeout =
+                std::time::Duration::from_secs(config.ws_handshake_timeout_secs);
+            let ip_counter = Arc::clone(&ip_counter);
+            let ctx = session::SessionContext {
+                identity: Arc::clone(&identity),
+                client_auth: client_vk.clone(),
+                metrics_state: Arc::clone(&metrics_state),
+                rotate_tx: Arc::clone(&rotate_tx),
+            };
+            let cfg = config.clone();
+            let session_shutdown_rx = shutdown_rx.clone();
+
+            tokio::spawn(async move {
+                // Decrement IP counter on drop — regardless of outcome
+                let _ip_guard = ws::IpCountGuard {
+                    ip: peer_ip,
+                    map: Arc::clone(&ip_counter),
+                };
+
+                // ── TLS handshake ─────────────────────────────────────────
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(%peer, "WS TLS handshake failed: {e}");
+                        return;
+                    }
+                };
+
+                // ── WebSocket upgrade with origin check ───────────────────
+                let origin_check = ws::OriginCheck { allowed_origins };
+                let ws_stream =
+                    match tokio_tungstenite::accept_hdr_async(tls_stream, origin_check).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(%peer, "WS upgrade failed: {e}");
+                            return;
+                        }
+                    };
+
+                tracing::debug!(%peer, "WS upgrade complete");
+
+                // ── Wrap as AsyncRead + AsyncWrite and run PQC session ────
+                let ws_io = ws::WsStream::new(ws_stream);
+                let handle_fut = session::handle(ws_io, peer, ctx, cfg, session_shutdown_rx);
+                match tokio::time::timeout(handshake_timeout, handle_fut).await {
+                    Ok(Ok(())) => tracing::debug!(%peer, "WS session complete"),
+                    Ok(Err(e)) => tracing::warn!(%peer, "WS session error: {e:#}"),
+                    Err(_) => tracing::warn!(
+                        %peer,
+                        "WS session timed out after {}s",
+                        handshake_timeout.as_secs()
+                    ),
                 }
             });
         }
