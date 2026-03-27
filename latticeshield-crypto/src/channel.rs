@@ -111,11 +111,10 @@ impl EncryptedChannel {
         writer: &mut (impl AsyncWrite + Unpin),
         data: &[u8],
     ) -> Result<(), FrameError> {
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
         let seq_be = self.send_seq.to_be_bytes();
+        let mut nonce_bytes = [0u8; NONCE_LEN]; // primeros 8B = seq, últimos 4B = 0x00000000
+        nonce_bytes[..SEQ_LEN].copy_from_slice(&seq_be);
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
         let mut buf = data.to_vec();
         let tag = self
