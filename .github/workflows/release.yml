@@ -19,15 +19,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             cross: false
+            sha256_cmd: sha256sum
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04
             cross: true
+            sha256_cmd: sha256sum
           - target: x86_64-apple-darwin
             runner: macos-14
             cross: false
+            sha256_cmd: shasum -a 256
           - target: aarch64-apple-darwin
             runner: macos-14
             cross: false
+            sha256_cmd: shasum -a 256
 
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +55,7 @@ jobs:
         run: |
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
-          echo "AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build binaries
         run: |
@@ -68,7 +72,7 @@ jobs:
 
       - name: Generate per-target checksums
         run: |
-          sha256sum \
+          ${{ matrix.sha256_cmd }} \
             "latticeshield-bridge-${{ matrix.target }}" \
             "latticeshield-client-${{ matrix.target }}" \
             "latticeshield-${{ matrix.target }}" \
