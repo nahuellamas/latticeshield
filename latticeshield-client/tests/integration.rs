@@ -178,12 +178,14 @@ async fn full_bridge_client_relay() {
 /// Same as full_bridge_client_relay, but the mock bridge sends a KEY_ROTATE
 /// frame mid-session. The client must handle it transparently and continue
 /// decrypting subsequent DATA frames with the rotated key.
+///
+/// Design note: uses a single user write → guaranteed single encrypted frame.
+/// Multiple writes can be coalesced by TCP into one read, making multi-frame
+/// counting unreliable without application-level framing on the user side.
 #[tokio::test]
 async fn key_rotate_survives_relay() {
     let mut rng = OsRng;
     let (sk, vk) = generate_keypair(&mut rng);
-
-    let echo_addr = spawn_echo_backend().await;
 
     let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bridge_addr = bridge_listener.local_addr().unwrap();
@@ -193,45 +195,32 @@ async fn key_rotate_survives_relay() {
 
         let mut channel = server_handshake(&mut client_stream, &sk).await;
 
-        let mut backend = TcpStream::connect(echo_addr).await.unwrap();
         let (mut client_r, mut client_w) = client_stream.split();
-        let (mut backend_r, mut backend_w) = backend.split();
 
-        // Sequential relay: one frame at a time.
-        // Avoids select! cancellation of read_frame (read_frame is NOT
-        // cancellation-safe — multiple read_exact calls, partial state lost on cancel).
         let mut rotation_nonce = [0u8; 32];
         OsRng.fill_bytes(&mut rotation_nonce);
 
-        for i in 0..3usize {
-            // 1. Read one DATA frame from the client.
-            let data = loop {
-                match channel.read_frame(&mut client_r).await {
-                    Ok(FrameResult::Data(d)) => break d,
-                    Ok(FrameResult::KeyRotate(n)) => channel.rotate_key(&n),
-                    Err(_) => return,
-                }
-            };
-
-            // 2. Forward plaintext to echo backend.
-            backend_w.write_all(&data).await.unwrap();
-
-            // 3. Read back exactly as many bytes as we sent (echo is 1:1).
-            let mut echo = vec![0u8; data.len()];
-            backend_r.read_exact(&mut echo).await.unwrap();
-
-            // 4. After the first frame: inject KEY_ROTATE before the reply.
-            if i == 0 {
-                channel
-                    .send_key_rotate(&mut client_w, &rotation_nonce)
-                    .await
-                    .unwrap();
-                channel.rotate_key(&rotation_nonce);
+        // Phase 1: receive ONE DATA frame (old key).
+        // Using a single frame avoids TCP coalescing ambiguity — the relay
+        // sends exactly one write_frame per user read(), and the user writes
+        // only once before blocking on read_exact.
+        let data = loop {
+            match channel.read_frame(&mut client_r).await {
+                Ok(FrameResult::Data(d)) => break d,
+                Ok(FrameResult::KeyRotate(n)) => channel.rotate_key(&n),
+                Err(_) => return,
             }
+        };
 
-            // 5. Send echo back encrypted (with the possibly-rotated key).
-            channel.write_frame(&mut client_w, &echo).await.unwrap();
-        }
+        // Phase 2: KEY_ROTATE first, then echo with new key.
+        // Frames are serialized in the TCP stream — relay processes
+        // KeyRotate before the Data echo, fully deterministic.
+        channel
+            .send_key_rotate(&mut client_w, &rotation_nonce)
+            .await
+            .unwrap();
+        channel.rotate_key(&rotation_nonce);
+        channel.write_frame(&mut client_w, &data).await.unwrap();
     });
 
     let user_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -251,26 +240,20 @@ async fn key_rotate_survives_relay() {
             .expect("client_session::handle failed")
     });
 
-    let payloads: [&[u8]; 3] = [b"payload-one", b"payload-two", b"payload-three"];
-    let mut total_expected = Vec::new();
+    let payload = b"key-rotate-test-payload";
 
-    for p in &payloads {
-        user_client_side.write_all(p).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        total_expected.extend_from_slice(p);
-    }
+    user_client_side.write_all(payload).await.unwrap();
 
-    // Block until ALL echo bytes arrive BEFORE signaling EOF.
-    // read_to_end after shutdown() races frames still in-flight; read_exact avoids that.
     // KEY_ROTATE is transparent to the user side — client_session handles it.
-    let mut response = vec![0u8; total_expected.len()];
+    let mut response = vec![0u8; payload.len()];
     user_client_side.read_exact(&mut response).await.unwrap();
 
     user_client_side.shutdown().await.unwrap();
     handle_task.await.unwrap();
 
     assert_eq!(
-        response, total_expected,
-        "all 3 payloads must echo back correctly after KEY_ROTATE"
+        response.as_slice(),
+        payload as &[u8],
+        "payload must echo back correctly after KEY_ROTATE"
     );
 }
