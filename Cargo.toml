@@ -4,6 +4,7 @@ members = [
     "latticeshield-bridge",
     "latticeshield-client",
     "latticeshield-cli",
+    "latticeshield-wasm",
 ]
 resolver = "2"
 
