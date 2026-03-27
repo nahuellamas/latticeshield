@@ -7,3 +7,6 @@ Cargo.lock
 *.key
 *.crt
 /docs
+node_modules/
+latticeshield-js/node_modules/
+latticeshield-js/.vite/
