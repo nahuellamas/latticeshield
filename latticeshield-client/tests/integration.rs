@@ -197,52 +197,40 @@ async fn key_rotate_survives_relay() {
         let (mut client_r, mut client_w) = client_stream.split();
         let (mut backend_r, mut backend_w) = backend.split();
 
-        let mut frames_relayed = 0usize;
+        // Sequential relay: one frame at a time.
+        // Avoids select! cancellation of read_frame (read_frame is NOT
+        // cancellation-safe — multiple read_exact calls, partial state lost on cancel).
+        let mut rotation_nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut rotation_nonce);
 
-        loop {
-            tokio::select! {
-                frame = channel.read_frame(&mut client_r) => {
-                    match frame {
-                        Ok(FrameResult::Data(data)) => {
-                            frames_relayed += 1;
-                            backend_w.write_all(&data).await.unwrap();
-                        }
-                        Ok(FrameResult::KeyRotate(nonce)) => {
-                            channel.rotate_key(&nonce);
-                        }
-                        Err(_) => break,
-                    }
+        for i in 0..3usize {
+            // 1. Read one DATA frame from the client.
+            let data = loop {
+                match channel.read_frame(&mut client_r).await {
+                    Ok(FrameResult::Data(d)) => break d,
+                    Ok(FrameResult::KeyRotate(n)) => channel.rotate_key(&n),
+                    Err(_) => return,
                 }
+            };
 
-                result = backend_r.read_u8() => {
-                    match result {
-                        Ok(byte) => {
-                            let mut buf = vec![byte];
-                            let mut tmp = [0u8; 4096];
-                            loop {
-                                match backend_r.try_read(&mut tmp) {
-                                    Ok(0) => break,
-                                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                                    Err(_) => break,
-                                }
-                            }
+            // 2. Forward plaintext to echo backend.
+            backend_w.write_all(&data).await.unwrap();
 
-                            if frames_relayed == 1 {
-                                let mut rotation_nonce = [0u8; 32];
-                                OsRng.fill_bytes(&mut rotation_nonce);
-                                channel
-                                    .send_key_rotate(&mut client_w, &rotation_nonce)
-                                    .await
-                                    .unwrap();
-                                channel.rotate_key(&rotation_nonce);
-                            }
+            // 3. Read back exactly as many bytes as we sent (echo is 1:1).
+            let mut echo = vec![0u8; data.len()];
+            backend_r.read_exact(&mut echo).await.unwrap();
 
-                            channel.write_frame(&mut client_w, &buf).await.unwrap();
-                        }
-                        Err(_) => break,
-                    }
-                }
+            // 4. After the first frame: inject KEY_ROTATE before the reply.
+            if i == 0 {
+                channel
+                    .send_key_rotate(&mut client_w, &rotation_nonce)
+                    .await
+                    .unwrap();
+                channel.rotate_key(&rotation_nonce);
             }
+
+            // 5. Send echo back encrypted (with the possibly-rotated key).
+            channel.write_frame(&mut client_w, &echo).await.unwrap();
         }
     });
 
