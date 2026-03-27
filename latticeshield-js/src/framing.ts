@@ -18,7 +18,7 @@
  *   - AAD = key_rotate_recv_seq as 8B BE
  */
 
-import { FRAME_DATA, FRAME_KEY_ROTATE, KEY_ROTATE_FRAME_LEN } from './types.js';
+import { FRAME_DATA, FRAME_KEY_ROTATE, KEY_ROTATE_FRAME_LEN } from "./types";
 
 // ── Session key type ──────────────────────────────────────────────────────────
 
@@ -93,7 +93,12 @@ export async function encodeFrame(
   // Cast to Uint8Array<ArrayBuffer> — crypto.subtle expects ArrayBuffer-backed views
   const ctWithTag = new Uint8Array(
     await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: nonce as Uint8Array<ArrayBuffer>, additionalData: aad as Uint8Array<ArrayBuffer>, tagLength: 128 },
+      {
+        name: "AES-GCM",
+        iv: nonce as Uint8Array<ArrayBuffer>,
+        additionalData: aad as Uint8Array<ArrayBuffer>,
+        tagLength: 128,
+      },
       key.aes,
       plaintext as Uint8Array<ArrayBuffer>,
     ),
@@ -157,7 +162,7 @@ export async function decodeFrame(
   offset += 1;
 
   if (tag !== FRAME_DATA) {
-    throw new Error(`unexpected frame tag: 0x${tag?.toString(16) ?? '??'}`);
+    throw new Error(`unexpected frame tag: 0x${tag?.toString(16) ?? "??"}`);
   }
 
   const len = view.getUint32(offset, false); // big-endian u32
@@ -190,7 +195,9 @@ export async function decodeFrame(
   const expectedNonce = seqToNonce(seq);
   for (let i = 0; i < 12; i++) {
     if (nonce[i] !== expectedNonce[i]) {
-      throw new Error(`nonce mismatch at byte ${i}: frame nonce does not match seq-derived nonce`);
+      throw new Error(
+        `nonce mismatch at byte ${i}: frame nonce does not match seq-derived nonce`,
+      );
     }
   }
 
@@ -198,7 +205,12 @@ export async function decodeFrame(
 
   const plaintext = new Uint8Array(
     await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: nonce as Uint8Array<ArrayBuffer>, additionalData: aad as Uint8Array<ArrayBuffer>, tagLength: 128 },
+      {
+        name: "AES-GCM",
+        iv: nonce as Uint8Array<ArrayBuffer>,
+        additionalData: aad as Uint8Array<ArrayBuffer>,
+        tagLength: 128,
+      },
       key.aes,
       ctWithTag as Uint8Array<ArrayBuffer>,
     ),
@@ -229,7 +241,9 @@ export function parseKeyRotateFrame(buf: Uint8Array): {
   }
 
   if (buf[0] !== FRAME_KEY_ROTATE) {
-    throw new Error(`not a KEY_ROTATE frame: tag=0x${buf[0]?.toString(16) ?? '??'}`);
+    throw new Error(
+      `not a KEY_ROTATE frame: tag=0x${buf[0]?.toString(16) ?? "??"}`,
+    );
   }
 
   const nonce = buf.slice(1, 13); // 12 bytes
@@ -278,7 +292,12 @@ export async function processKeyRotate(
   // Decrypt the rotation nonce with the current AES-GCM session key
   const rotationNonceBytes = new Uint8Array(
     await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: nonce as Uint8Array<ArrayBuffer>, additionalData: aad as Uint8Array<ArrayBuffer>, tagLength: 128 },
+      {
+        name: "AES-GCM",
+        iv: nonce as Uint8Array<ArrayBuffer>,
+        additionalData: aad as Uint8Array<ArrayBuffer>,
+        tagLength: 128,
+      },
       currentKey.aes,
       ciphertextWithTag as Uint8Array<ArrayBuffer>,
     ),
@@ -298,18 +317,18 @@ export async function processKeyRotate(
   // currentKey.hkdf is a non-extractable CryptoKey with algorithm.name='HKDF'
   // imported from the same raw bytes as currentKey.aes — this lets Web Crypto
   // use the session key as HKDF IKM without ever exposing the raw bytes (EC-2).
-  const info = new TextEncoder().encode('latticeshield-v1-key-rotation');
+  const info = new TextEncoder().encode("latticeshield-v1-key-rotation");
   const newAesKey = await crypto.subtle.deriveKey(
     {
-      name: 'HKDF',
-      hash: 'SHA-256',
+      name: "HKDF",
+      hash: "SHA-256",
       salt: rotationNonceBytes as Uint8Array<ArrayBuffer>,
       info: info as Uint8Array<ArrayBuffer>,
     },
     currentKey.hkdf,
-    { name: 'AES-GCM', length: 256 },
+    { name: "AES-GCM", length: 256 },
     false, // non-extractable (EC-2)
-    ['encrypt', 'decrypt'],
+    ["encrypt", "decrypt"],
   );
 
   // Derive the companion HKDF key for the new session key (needed for future rotations).
@@ -318,8 +337,8 @@ export async function processKeyRotate(
   const newKeyRaw = new Uint8Array(
     await crypto.subtle.deriveBits(
       {
-        name: 'HKDF',
-        hash: 'SHA-256',
+        name: "HKDF",
+        hash: "SHA-256",
         salt: rotationNonceBytes as Uint8Array<ArrayBuffer>,
         info: info as Uint8Array<ArrayBuffer>,
       },
@@ -329,11 +348,11 @@ export async function processKeyRotate(
   );
 
   const newHkdfKey = await crypto.subtle.importKey(
-    'raw',
+    "raw",
     newKeyRaw as Uint8Array<ArrayBuffer>,
-    { name: 'HKDF' },
+    { name: "HKDF" },
     false, // non-extractable (EC-2)
-    ['deriveKey', 'deriveBits'],
+    ["deriveKey", "deriveBits"],
   );
 
   // Zeroize derived raw bytes and rotation nonce
@@ -358,25 +377,27 @@ export async function processKeyRotate(
  * @param keyBytes  32-byte session key from WASM handshake
  * @returns Non-extractable SessionKey
  */
-export async function importSessionKey(keyBytes: Uint8Array): Promise<SessionKey> {
+export async function importSessionKey(
+  keyBytes: Uint8Array,
+): Promise<SessionKey> {
   if (keyBytes.length !== 32) {
     throw new Error(`session key must be 32 bytes, got ${keyBytes.length}`);
   }
 
   const [aes, hkdf] = await Promise.all([
     crypto.subtle.importKey(
-      'raw',
+      "raw",
       keyBytes as Uint8Array<ArrayBuffer>,
-      { name: 'AES-GCM', length: 256 },
+      { name: "AES-GCM", length: 256 },
       false, // non-extractable (EC-2)
-      ['encrypt', 'decrypt'],
+      ["encrypt", "decrypt"],
     ),
     crypto.subtle.importKey(
-      'raw',
+      "raw",
       keyBytes as Uint8Array<ArrayBuffer>,
-      { name: 'HKDF' },
+      { name: "HKDF" },
       false, // non-extractable (EC-2)
-      ['deriveKey', 'deriveBits'],
+      ["deriveKey", "deriveBits"],
     ),
   ]);
 
