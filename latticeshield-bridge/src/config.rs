@@ -160,6 +160,19 @@ fn default_require_client_auth() -> bool {
     true
 }
 
+fn default_ws_enabled() -> bool {
+    false
+}
+fn default_ws_listen_addr() -> String {
+    "0.0.0.0:8446".to_string()
+}
+fn default_ws_handshake_timeout_secs() -> u64 {
+    10
+}
+fn default_ws_max_connections_per_ip() -> u32 {
+    100
+}
+
 // ── AdminConfig ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -306,6 +319,43 @@ impl Default for QuicConfig {
     }
 }
 
+// ── WsConfig ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WsConfig {
+    #[serde(default = "default_ws_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ws_listen_addr")]
+    pub listen_addr: String,
+    /// TLS cert path — required when enabled = true (WS runs over WSS only in production)
+    pub cert_path: Option<PathBuf>,
+    /// TLS key path — required when enabled = true
+    pub key_path: Option<PathBuf>,
+    /// Allowed Origin headers. Empty = accept all origins (development mode — emits WARN at startup).
+    pub allowed_origins: Vec<String>,
+    /// Maximum seconds to wait for the PQC handshake to complete after WS upgrade.
+    #[serde(default = "default_ws_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Maximum concurrent WebSocket connections per source IP.
+    #[serde(default = "default_ws_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ws_enabled(),
+            listen_addr: default_ws_listen_addr(),
+            cert_path: None,
+            key_path: None,
+            allowed_origins: Vec::new(),
+            handshake_timeout_secs: default_ws_handshake_timeout_secs(),
+            max_connections_per_ip: default_ws_max_connections_per_ip(),
+        }
+    }
+}
+
 // ── Root Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -323,6 +373,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub websocket: WsConfig,
 }
 
 // ── ValidConfig — post-validation, what server::run() receives ─────────────────
@@ -364,6 +416,14 @@ pub struct ValidConfig {
     pub control_plane_install_token: Option<String>,
     /// Graceful shutdown drain timeout. Sessions still active after this duration are forced.
     pub shutdown_timeout: std::time::Duration,
+    // ── WebSocket listener (:8446) ───────────────────────────────────────────────
+    pub ws_enabled: bool,
+    pub ws_listen_addr: SocketAddr,
+    pub ws_cert_path: PathBuf, // only meaningful when ws_enabled = true
+    pub ws_key_path: PathBuf,  // only meaningful when ws_enabled = true
+    pub ws_allowed_origins: Vec<String>,
+    pub ws_handshake_timeout_secs: u64,
+    pub ws_max_connections_per_ip: u32,
 }
 
 impl std::fmt::Debug for ValidConfig {
@@ -414,6 +474,13 @@ impl std::fmt::Debug for ValidConfig {
                     .map(|_| "[REDACTED]"),
             )
             .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("ws_enabled", &self.ws_enabled)
+            .field("ws_listen_addr", &self.ws_listen_addr)
+            .field("ws_cert_path", &self.ws_cert_path)
+            .field("ws_key_path", &self.ws_key_path)
+            .field("ws_allowed_origins", &self.ws_allowed_origins)
+            .field("ws_handshake_timeout_secs", &self.ws_handshake_timeout_secs)
+            .field("ws_max_connections_per_ip", &self.ws_max_connections_per_ip)
             .finish()
     }
 }
@@ -637,6 +704,57 @@ impl Config {
             }
         }
 
+        // ── WebSocket listener validation ────────────────────────────────────
+        let ws_listen_addr: SocketAddr = self
+            .websocket
+            .listen_addr
+            .parse()
+            .context("invalid websocket.listen_addr")?;
+
+        if self.websocket.enabled {
+            if self.websocket.cert_path.is_none() {
+                anyhow::bail!("websocket.cert_path must be set when websocket.enabled = true");
+            }
+            if self.websocket.key_path.is_none() {
+                anyhow::bail!("websocket.key_path must be set when websocket.enabled = true");
+            }
+            if ws_listen_addr == listen_addr {
+                anyhow::bail!(
+                    "websocket.listen_addr ({}) conflicts with server.listen_addr — they must be different ports",
+                    ws_listen_addr
+                );
+            }
+            if ws_listen_addr == metrics_addr {
+                anyhow::bail!(
+                    "websocket.listen_addr ({}) conflicts with metrics.listen_addr — they must be different ports",
+                    ws_listen_addr
+                );
+            }
+            if self.tls.enabled && ws_listen_addr == tls_listen_addr {
+                anyhow::bail!(
+                    "websocket.listen_addr ({}) conflicts with tls.listen_addr — they must be different ports",
+                    ws_listen_addr
+                );
+            }
+            if self.quic.enabled && ws_listen_addr == quic_listen_addr {
+                anyhow::bail!(
+                    "websocket.listen_addr ({}) conflicts with quic.listen_addr — they must be different ports",
+                    ws_listen_addr
+                );
+            }
+            if self.admin.enabled && ws_listen_addr == admin_listen_addr {
+                anyhow::bail!(
+                    "websocket.listen_addr ({}) conflicts with admin.listen_addr — they must be different ports",
+                    ws_listen_addr
+                );
+            }
+            if self.websocket.allowed_origins.is_empty() {
+                tracing::warn!(
+                    "websocket.allowed_origins is empty — origin validation is disabled (development mode)"
+                );
+            }
+        }
+
         // ── Graceful shutdown timeout ────────────────────────────────────────
         let shutdown_timeout_secs = std::env::var("SHUTDOWN_TIMEOUT_SECS")
             .ok()
@@ -677,6 +795,13 @@ impl Config {
             admin_handshake_timeout_secs: self.admin.handshake_timeout_secs,
             control_plane_install_token,
             shutdown_timeout,
+            ws_enabled: self.websocket.enabled,
+            ws_listen_addr,
+            ws_cert_path: self.websocket.cert_path.unwrap_or_default(),
+            ws_key_path: self.websocket.key_path.unwrap_or_default(),
+            ws_allowed_origins: self.websocket.allowed_origins,
+            ws_handshake_timeout_secs: self.websocket.handshake_timeout_secs,
+            ws_max_connections_per_ip: self.websocket.max_connections_per_ip,
         })
     }
 }
@@ -1326,6 +1451,13 @@ handshake_timeout_secs = 30
             admin_handshake_timeout_secs: 10,
             control_plane_install_token: Some("super-secret-value".to_string()),
             shutdown_timeout: std::time::Duration::from_secs(30),
+            ws_enabled: false,
+            ws_listen_addr: "127.0.0.1:8446".parse().unwrap(),
+            ws_cert_path: PathBuf::from("./keys/ws.crt"),
+            ws_key_path: PathBuf::from("./keys/ws.key"),
+            ws_allowed_origins: Vec::new(),
+            ws_handshake_timeout_secs: 10,
+            ws_max_connections_per_ip: 100,
         };
 
         let debug_str = format!("{cfg:?}");
@@ -1337,6 +1469,113 @@ handshake_timeout_secs = 30
             debug_str.contains("[REDACTED]"),
             "Debug output must contain '[REDACTED]', got: {debug_str}"
         );
+    }
+
+    // ── WsConfig tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn ws_disabled_by_default() {
+        let f = write_toml("");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.ws_enabled);
+        assert_eq!(cfg.ws_listen_addr.to_string(), "0.0.0.0:8446");
+        assert_eq!(cfg.ws_handshake_timeout_secs, 10);
+        assert_eq!(cfg.ws_max_connections_per_ip, 100);
+        assert!(cfg.ws_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn ws_section_parsed_from_toml() {
+        let f = write_toml(
+            r#"
+[websocket]
+enabled = true
+listen_addr = "127.0.0.1:8446"
+cert_path = "./keys/ws.crt"
+key_path = "./keys/ws.key"
+allowed_origins = ["https://app.example.com"]
+handshake_timeout_secs = 20
+max_connections_per_ip = 50
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.ws_enabled);
+        assert_eq!(cfg.ws_listen_addr.to_string(), "127.0.0.1:8446");
+        assert_eq!(cfg.ws_cert_path, PathBuf::from("./keys/ws.crt"));
+        assert_eq!(cfg.ws_key_path, PathBuf::from("./keys/ws.key"));
+        assert_eq!(
+            cfg.ws_allowed_origins,
+            vec!["https://app.example.com".to_string()]
+        );
+        assert_eq!(cfg.ws_handshake_timeout_secs, 20);
+        assert_eq!(cfg.ws_max_connections_per_ip, 50);
+    }
+
+    #[test]
+    fn ws_enabled_missing_cert_path_rejected() {
+        let f = write_toml("[websocket]\nenabled = true\nkey_path = \"./keys/ws.key\"\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("cert_path"),
+            "expected cert_path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ws_enabled_missing_key_path_rejected() {
+        let f = write_toml("[websocket]\nenabled = true\ncert_path = \"./keys/ws.crt\"\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("key_path"),
+            "expected key_path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ws_listen_addr_collides_with_pqc_rejected() {
+        // default server.listen_addr is 0.0.0.0:8443
+        let f = write_toml(
+            "[websocket]\nenabled = true\nlisten_addr = \"0.0.0.0:8443\"\ncert_path = \"./keys/ws.crt\"\nkey_path = \"./keys/ws.key\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts, got: {err}");
+    }
+
+    #[test]
+    fn ws_listen_addr_collides_with_metrics_rejected() {
+        // default metrics is 0.0.0.0:8444
+        let f = write_toml(
+            "[websocket]\nenabled = true\nlisten_addr = \"0.0.0.0:8444\"\ncert_path = \"./keys/ws.crt\"\nkey_path = \"./keys/ws.key\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts, got: {err}");
+    }
+
+    #[test]
+    fn ws_listen_addr_collides_with_tls_rejected() {
+        let f = write_toml(
+            "[tls]\nenabled = true\nlisten_addr = \"0.0.0.0:8440\"\ncert_path = \"./keys/tls.crt\"\nkey_path = \"./keys/tls.key\"\n\
+             [websocket]\nenabled = true\nlisten_addr = \"0.0.0.0:8440\"\ncert_path = \"./keys/ws.crt\"\nkey_path = \"./keys/ws.key\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts, got: {err}");
+    }
+
+    #[test]
+    fn ws_listen_addr_collides_with_admin_rejected() {
+        let f = write_toml(
+            "[admin]\nenabled = true\nlisten_addr = \"0.0.0.0:8445\"\ncontrol_plane_vk_path = \"./keys/cp.vk\"\n\
+             [websocket]\nenabled = true\nlisten_addr = \"0.0.0.0:8445\"\ncert_path = \"./keys/ws.crt\"\nkey_path = \"./keys/ws.key\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "expected conflicts, got: {err}");
+    }
+
+    #[test]
+    fn ws_disabled_skips_cert_and_collision_validation() {
+        // enabled=false with colliding addr and no cert → no error
+        let f = write_toml("[websocket]\nenabled = false\nlisten_addr = \"0.0.0.0:8443\"\n");
+        Config::load(f.path()).unwrap();
     }
 
     // ── shutdown_timeout env-var tests ────────────────────────────────────────

@@ -24,8 +24,7 @@ use latticeshield_crypto::{
 };
 use rand_core::{OsRng, RngCore};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::watch,
     time::MissedTickBehavior,
 };
@@ -44,13 +43,16 @@ pub struct SessionContext {
     pub rotate_tx: Arc<watch::Sender<u64>>,
 }
 
-pub async fn handle(
-    mut client: TcpStream,
+pub async fn handle<T>(
+    client: T,
     peer: SocketAddr,
     ctx: SessionContext,
     config: ValidConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!(%peer, "conexion entrante");
     metrics::counter!(crate::metrics::CONNECTIONS_TOTAL).increment(1);
     ctx.metrics_state
@@ -58,6 +60,10 @@ pub async fn handle(
         .fetch_add(1, Ordering::Relaxed);
 
     // ── 1. Handshake PQC autenticado ────────────────────────────────────────
+
+    // Split early so we can use the generic AsyncRead + AsyncWrite halves
+    // for both the handshake phase and the relay loop below.
+    let (mut client_r, mut client_w) = tokio::io::split(client);
 
     let t_handshake = Instant::now();
     let server = ServerHandshake::new(&mut OsRng);
@@ -67,7 +73,7 @@ pub async fn handle(
         .server_hello_signed_bytes(&ctx.identity.signing_key, &mut OsRng)
         .context("firma del ServerHello")?;
 
-    client
+    client_w
         .write_all(&hello_bytes)
         .await
         .context("envio ServerHello firmado")?;
@@ -76,7 +82,7 @@ pub async fn handle(
     let session_key = match &ctx.client_auth {
         Some(client_identity) => {
             let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
-            client
+            client_r
                 .read_exact(&mut buf)
                 .await
                 .context("lectura ClientResponse firmado")?;
@@ -90,7 +96,7 @@ pub async fn handle(
         }
         None => {
             let mut buf = [0u8; CLIENT_RESPONSE_LEN];
-            client
+            client_r
                 .read_exact(&mut buf)
                 .await
                 .context("lectura ClientResponse")?;
@@ -112,14 +118,12 @@ pub async fn handle(
 
     // ── 3. Conexion al backend ───────────────────────────────────────────────
 
-    let mut backend = TcpStream::connect(config.backend_addr)
+    let mut backend = tokio::net::TcpStream::connect(config.backend_addr)
         .await
         .context(format!("conexion a backend {}", config.backend_addr))?;
     debug!(%peer, "conectado al backend {}", config.backend_addr);
 
     // ── 4. Relay bidireccional con rotacion de clave ─────────────────────────
-
-    let (mut client_r, mut client_w) = client.split();
     let (mut backend_r, mut backend_w) = backend.split();
 
     let mut backend_buf = vec![0u8; config.max_frame_size];
