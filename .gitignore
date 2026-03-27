@@ -6,3 +6,4 @@ Cargo.lock
 *.pem
 *.key
 *.crt
+/docs
