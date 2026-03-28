@@ -70,6 +70,12 @@ impl ActiveGuard {
     }
 }
 
+impl Default for ActiveGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         metrics::gauge!(CONNECTIONS_ACTIVE).decrement(1.0);

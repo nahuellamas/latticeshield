@@ -12,6 +12,23 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### WebSocket Browser SDK (2026-03-28)
+
+Browsers can now connect directly to the LatticeShield PQC channel — no native agent, no plugin. The bridge listens on a new WebSocket port (`:8446` by default) and speaks the same hybrid ML-KEM-768 + X25519 + AES-256-GCM handshake that the Rust client agent uses. A TypeScript npm package, `@latticeshield/js`, handles the full session lifecycle: it spawns a Web Worker, loads the `latticeshield-wasm` WASM module inside that worker (so crypto keys never touch the main thread), performs the handshake, and exposes a clean `PQCSession` class and a `usePQCSession` React hook.
+
+Enable the WebSocket listener by adding a `[websocket]` section to the bridge config:
+
+```toml
+[websocket]
+enabled = true
+listen_addr = "0.0.0.0:8446"
+cert_path = "/path/to/cert.pem"
+key_path  = "/path/to/key.pem"
+allowed_origins = ["https://your-app.example.com"]
+```
+
+See [`latticeshield-js/README.md`](latticeshield-js/README.md) for install instructions, CSP guidance (`wasm-unsafe-eval`), and the full API reference.
+
 ### CI/Release Pipeline and One-Command Install (2026-03-26)
 
 LatticeShield now ships pre-built binaries for Linux (x86_64 and arm64) and macOS (Intel and Apple Silicon). Install with a single command — no Rust, no compiler, no manual file copying required:
