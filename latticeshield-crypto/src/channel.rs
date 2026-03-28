@@ -131,6 +131,7 @@ impl EncryptedChannel {
         writer.write_all(&nonce_bytes).await?;
         writer.write_all(&buf).await?;
         writer.write_all(tag.as_slice()).await?;
+        writer.flush().await?;
 
         self.send_seq += 1;
         Ok(())
@@ -259,6 +260,7 @@ impl EncryptedChannel {
             .write_all(tag.as_slice())
             .await
             .context("write KEY_ROTATE tag")?;
+        writer.flush().await.context("flush KEY_ROTATE")?;
 
         self.key_rotate_send_seq += 1;
         Ok(())

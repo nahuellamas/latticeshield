@@ -77,6 +77,10 @@ where
         .write_all(&hello_bytes)
         .await
         .context("envio ServerHello firmado")?;
+    client_w
+        .flush()
+        .await
+        .context("flush ServerHello firmado")?;
     debug!(%peer, "ServerHello firmado enviado ({} bytes)", SERVER_HELLO_SIGNED_LEN);
 
     let session_key = match &ctx.client_auth {
