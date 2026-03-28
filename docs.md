@@ -3055,3 +3055,257 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "blo
 Las features erroneas no causaban fallos de compilacion ni de tests — la build simplemente incluia codigo extra y dependencias no deseadas. El pipeline de release fue el momento natural para detectarlas: al compilar para el target `aarch64-unknown-linux-gnu` con cross-compile, las dependencias de C nativas (OpenSSL) son mucho mas problematicas que en un build nativo. El proceso de preparar el cross-compile para el release hizo estas dependencias inaceptables en la practica.
 
 ---
+
+---
+
+# Mes 21 — WASM Spike (`latticeshield-wasm`)
+
+---
+
+## El problema que existia
+
+El canal PQC de latticeshield esta completamente implementado en Rust. Los clientes de escritorio usan `latticeshield-client`. Pero los navegadores no pueden abrir conexiones TCP directas — solo HTTP/WebSocket. Para que un navegador pueda hacer el handshake PQC necesita el codigo criptografico disponible en JavaScript. La unica forma de reutilizar la implementacion Rust sin reescribirla en JS es compilarla a WebAssembly.
+
+El objetivo de Mes 21 es validar que la hipotesis tecnica es correcta: ¿puede el stack PQC de latticeshield compilar a `wasm32-unknown-unknown`? No es obvio porque las librerias criptograficas tienen dependencias del sistema operativo (generacion de numeros aleatorios, instrucciones SIMD) que no existen en el entorno WASM del navegador.
+
+---
+
+## latticeshield-wasm/Cargo.toml — el crate nuevo
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+```
+
+`cdylib` es el tipo de crate que produce un archivo `.wasm` que wasm-bindgen puede procesar. `rlib` se mantiene para que los tests de Rust puedan importar el crate normalmente.
+
+Dependencias clave:
+- `wasm-bindgen` — la macro `#[wasm_bindgen]` que expone funciones Rust como funciones JS
+- `js-sys` — bindings para tipos JavaScript nativos como `Uint8Array` y `Object`
+- `latticeshield-crypto` — el mismo crate de crypto que usa el bridge, sin modificaciones
+
+**Gotcha**: `js-sys` es necesario aunque no lo uses directamente. `wasm-bindgen` lo requiere en el grafo de dependencias para compilar correctamente cuando devuelves `JsValue` desde funciones exportadas.
+
+---
+
+## latticeshield-wasm/src/lib.rs — las funciones exportadas
+
+Hay cuatro funciones publicas marcadas con `#[wasm_bindgen]`:
+
+**`wasm_generate_keypair()`** — genera un par de claves ML-DSA-65. Retorna un objeto JS `{ sk: Uint8Array(4032), vk: Uint8Array(1952) }`. Se usa para la identidad del cliente en autenticacion mutua.
+
+**`wasm_sign(sk_bytes, msg)`** — firma un mensaje con ML-DSA-65. Retorna la firma (3309 bytes).
+
+**`wasm_verify(vk_bytes, msg, sig_bytes)`** — verifica una firma ML-DSA-65. Retorna `Ok(())` o un error JS.
+
+**`wasm_generate_client_response(server_hello_signed, server_vk_bytes)`** — la funcion central del handshake PQC. Recibe el `ServerHello` firmado (4557 bytes) y la VK pre-shared del servidor (1952 bytes). Retorna `{ client_response: Uint8Array(1120), session_key: Uint8Array(32) }`. Internamente:
+1. Verifica la firma ML-DSA-65 del ServerHello con la VK pre-shared
+2. Parsea el ServerHello para extraer la clave efimera X25519 y la encapsulation key ML-KEM-768
+3. Ejecuta el KEM hibrido: X25519 Diffie-Hellman + ML-KEM encapsulation
+4. Deriva la session key via HKDF-SHA256 sobre los dos secretos
+5. Retorna el ciphertext ML-KEM (ClientResponse) y la session key
+
+La session key devuelta debe ser inmediatamente importada como `CryptoKey` no-extractable via `crypto.subtle.importKey` y zeroizada. Nunca debe persistir en memoria JS.
+
+### Por que retornar objetos JS con js_sys::Object?
+
+Las funciones WASM solo pueden retornar tipos primitivos o tipos que wasm-bindgen sabe serializar. Para retornar multiples valores, la opcion mas simple es un objeto JS plano. `js_sys::Reflect::set` es la forma de setear propiedades en un objeto JS desde Rust — es verbose pero explicita.
+
+---
+
+## Resultado de la validacion
+
+`libcrux-ml-kem` y `libcrux-ml-dsa` compilan a `wasm32-unknown-unknown` sin problemas. No hay instrucciones SIMD incompatibles ni dependencias del SO. `rand_core::OsRng` en WASM usa la API `crypto.getRandomValues()` del navegador automaticamente.
+
+El spike valido la hipotesis: el stack PQC completo puede correr en un navegador. Mes 22 construye sobre esta base.
+
+### Gotchas de tooling
+
+1. `wasm-pack` no esta en `$PATH` por defecto — hay que usar `~/.cargo/bin/wasm-pack` o instalarlo con `cargo install wasm-pack`.
+2. `wasm-opt` puede fallar con `--enable-bulk-memory` si la version de `binaryen` es antigua. Actualizar con `brew upgrade binaryen` o deshabilitar wasm-opt en `Cargo.toml` con `[package.metadata.wasm-pack.profile.release] wasm-opt = false`.
+3. Los tests de WASM no se corren con `cargo test` — requieren `wasm-pack test --node` o `--headless`. Los tests en `src/lib.rs` usando `#[cfg(test)]` con `#[test]` solo cubren el codigo Rust nativo.
+
+---
+
+---
+
+# Mes 22 — Browser SDK (WebSocket + `@latticeshield/js`)
+
+---
+
+## El problema que existia
+
+Despues de Mes 21 el WASM existe, pero el navegador todavia no puede conectarse al bridge. El bridge escucha en `:8443` (TCP crudo) y `:8446` no existe. Los navegadores estan restringidos a HTTP y WebSocket — no pueden abrir conexiones TCP directas. El WASM permite hacer el handshake PQC en el browser, pero falta el transporte.
+
+Mes 22 cierra esta brecha con dos cambios ortogonales:
+1. **Bridge**: nuevo listener WebSocket en `:8446` que transporta el protocolo PQC existente sobre WebSocket (sin cambiar el protocolo en si)
+2. **latticeshield-js**: paquete npm TypeScript que implementa el cliente PQC para navegadores
+
+---
+
+## latticeshield-bridge/src/ws.rs — el adaptador WsStream
+
+Este es el archivo mas interesante de Mes 22. El problema central es: `session::handle()` espera un stream que implemente `AsyncRead + AsyncWrite`. Un `WebSocketStream` de tokio-tungstenite no implementa esos traits directamente — tiene su propia API de mensajes binarios.
+
+`WsStream<S>` resuelve esto. Es un wrapper que implementa `AsyncRead` y `AsyncWrite` sobre un `WebSocketStream<S>`:
+
+```
+AsyncRead  ← WsStream ← WebSocketStream (mensajes binarios)
+AsyncWrite → WsStream → WebSocketStream (mensajes binarios)
+```
+
+**Lado de lectura (`poll_read`)**: cuando alguien llama `read()` en el WsStream, el adaptador pollea el stream WebSocket interno esperando el proximo mensaje binario. Cuando llega, guarda el payload en `read_buf` y va copiando bytes al caller a medida que los pide. Si el mensaje es mas grande que el buffer del caller, los bytes restantes quedan en `read_buf` y se entregan en las proximas llamadas a `read()`.
+
+**Lado de escritura (`poll_write` + `poll_flush`)**: `poll_write` simplemente acumula bytes en `write_buf`. No envia nada todavia. `poll_flush` es cuando se envia el frame WebSocket binario con todo el contenido acumulado. Esto significa que multiples llamadas a `write_all()` se coalesan en un solo mensaje WebSocket.
+
+**Por que este diseno y no enviar en cada `write_all`?** El protocolo PQC escribe el frame en multiples partes (`write_all` para el header, `write_all` para el ciphertext, etc.). Si cada `write_all` enviara un mensaje WebSocket separado, el receptor recibiria multiples mensajes donde espera uno continuo. Coalescer en flush produce el comportamiento correcto: un mensaje WebSocket = un frame PQC completo.
+
+**Implicacion critica**: cualquier funcion que escribe al canal PQC y espera que los bytes lleguen al otro lado DEBE llamar `flush()` explicitamente despues de los `write_all`. Con `TcpStream` el SO flushea al nivel del kernel y esto no es visible. Con `WsStream` no hay flush implicito. Este bug existia en `channel.rs::write_frame` y `send_key_rotate` — se descubrio cuando el integration test `ws_full_pqc_handshake_session_key_derived` quedo colgado indefinidamente (deadlock: servidor esperando ClientResponse que nunca llegaba porque su propio ServerHello todavia estaba en el write_buf).
+
+**`OriginCheck`**: callback de tungstenite que valida el header `Origin` antes del upgrade WebSocket. Si `allowed_origins` esta vacio, acepta todo (modo desarrollo con warning). Si tiene valores, rechaza cualquier origin que no coincida con HTTP 403. Esto implementa la proteccion CORS a nivel de upgrade — antes de que el handshake PQC empiece.
+
+**`IpCountGuard`**: struct RAII que decrementa el contador de conexiones de una IP al hacer drop. La logica de enforcement esta en `spawn_ws_listener()`: antes de aceptar una conexion, si `count >= max_per_ip` la conexion se rechaza. El Guard garantiza que el contador vuelva a cero aunque la sesion termine con error — no hay leaks de contadores.
+
+---
+
+## latticeshield-bridge/src/session.rs — generalizacion a `handle<T>`
+
+Antes de Mes 22:
+```rust
+pub async fn handle(client: TcpStream, ...) -> anyhow::Result<()>
+```
+
+Despues:
+```rust
+pub async fn handle<T>(client: T, ...) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+```
+
+El cambio es minimal pero tiene impacto grande: ahora el mismo `handle()` sirve para `TcpStream` (listener PQC en :8443), `TlsStream<TcpStream>` (no usado directamente pero posible), y `WsStream<TlsStream<TcpStream>>` (listener WebSocket en :8446).
+
+La generalizacion tambien requirio cambiar `client.split()` por `tokio::io::split(client)`. La razon: `TcpStream::split()` es un metodo especifico de `TcpStream`. `tokio::io::split()` es generica — funciona con cualquier tipo que implemente `AsyncRead + AsyncWrite`.
+
+Todos los tests existentes siguen pasando sin modificacion porque `TcpStream` satisface el trait bound.
+
+---
+
+## latticeshield-bridge/src/config.rs — WsConfig
+
+```toml
+[websocket]
+enabled = true
+listen_addr = "0.0.0.0:8446"
+cert_path = "/path/to/cert.pem"
+key_path  = "/path/to/key.pem"
+allowed_origins = ["https://your-app.example.com"]
+handshake_timeout_secs = 10   # default
+max_connections_per_ip = 10   # default
+```
+
+El listener WebSocket es completamente opt-in. Si no hay seccion `[websocket]` en el config, no se bindea ningun puerto adicional. Sigue el mismo patron que `[quic]` y `[tls]`.
+
+La validacion chequea colisiones de puertos contra todos los otros listeners (PQC, TLS, QUIC, admin, metrics) y exige `cert_path` + `key_path` cuando `enabled = true` — el WS listener siempre es WSS (TLS), nunca WS plano.
+
+---
+
+## latticeshield-bridge/src/server.rs — spawn_ws_listener()
+
+`spawn_ws_listener()` sigue exactamente el patron de `spawn_tls_listener()` y `spawn_quic_listener()`:
+
+1. Construye el `TlsAcceptor` desde los paths del cert/key
+2. Bindea un `TcpListener` en `ws_listen_addr`
+3. Loop: acepta TCP → TLS handshake → WebSocket upgrade con `OriginCheck` → `WsStream::new()` → `session::handle()`
+4. Se integra al canal de graceful shutdown existente
+
+El timeout de handshake se implementa con `tokio::time::timeout()` alrededor de `session::handle()`. Si el cliente abre la conexion WebSocket pero no envia `ClientResponse` dentro de `handshake_timeout_secs`, la tarea se cancela y el Guard RAII libera el slot de IP.
+
+---
+
+## latticeshield-js/ — el paquete npm TypeScript
+
+El paquete `@latticeshield/js` permite que una aplicacion web se conecte al bridge PQC con unas pocas lineas:
+
+```typescript
+import { usePQCSession } from "@latticeshield/js";
+
+function App() {
+  const { status, send, lastMessage } = usePQCSession({
+    bridgeUrl: "wss://bridge.example.com:8446",
+    serverVkBytes: VK_BYTES,  // pre-shared, cargado en build time
+  });
+}
+```
+
+### Arquitectura Web Worker
+
+Todo el codigo criptografico corre dentro de un Web Worker dedicado (`crypto.worker.ts`). El hilo principal nunca toca la `CryptoKey` de sesion ni la memoria lineal de WASM. Esto mitiga XSS: incluso si un script malicioso corre en el hilo principal, no puede extraer la clave de sesion.
+
+La comunicacion main thread ↔ Worker es via `postMessage`:
+- Main → Worker: `{ type: "connect" }`, `{ type: "send", payload: Uint8Array }`, `{ type: "disconnect" }`
+- Worker → Main: `{ type: "state", state: SessionState }`, `{ type: "message", payload: Uint8Array }`, `{ type: "error", message: string }`
+
+### framing.ts — el protocolo de frames en TypeScript
+
+Re-implementacion del framing v3 de `channel.rs` usando `crypto.subtle` (AES-256-GCM nativo del navegador):
+
+**DATA frame** (mismo formato que Rust):
+```
+[0x01][4B u32 BE len][8B u64 BE seq][12B nonce][ciphertext][16B GCM tag]
+```
+
+**`seq` es BigInt** — no `number`. Un `number` de JavaScript tiene precision de 53 bits. La sesion PQC usa seq como `u64` (64 bits). En sesiones largas `seq` puede superar `Number.MAX_SAFE_INTEGER` (2^53 - 1) y un `number` perderia precision silenciosamente. `BigInt` no tiene este problema.
+
+**Nonce determinista**: el nonce de 12 bytes se deriva del seq — los 4 primeros bytes son cero, los 8 siguientes son el seq en big-endian. Esto es consistente con EC-7 aplicado al bridge. Un nonce aleatorio en cada frame crearia el "birthday problem": con suficientes frames hay probabilidad no-trivial de repetir un nonce, lo que rompe la seguridad de AES-GCM. Con seq como nonce la unicidad esta garantizada por la monotonicidad del contador.
+
+**AAD = seq como 8 bytes BE** — el seq esta autenticado por el GCM tag, exactamente como en Rust. Un atacante no puede modificar el seq sin que el decrypt falle.
+
+### session.ts — PQCSession
+
+`PQCSession` es la clase que maneja el ciclo de vida completo dentro del Worker:
+
+1. `connect()`: abre el WebSocket, espera el `ServerHello` firmado del bridge, llama a `wasm_generate_client_response()` para verificar la firma ML-DSA-65 y derivar la session key, importa la session key como `CryptoKey` no-extractable, zeroiza el `Uint8Array` con la clave cruda, envia el `ClientResponse` al bridge
+2. `send(data)`: encripta con `crypto.subtle`, escribe el frame v3 por WebSocket
+3. `recv()`: desencripta frames entrantes, aplica replay detection
+4. `KEY_ROTATE`: cuando llega un frame `0x02`, drena la cola de envios pendientes, decripta el rotation nonce (el nonce de rotacion viaja cifrado con la clave actual como mecanismo anti-replay), deriva la nueva clave via HKDF-SHA256, reemplaza la `CryptoKey` atomicamente, resetea los contadores de secuencia
+
+### vk.ts — distribucion de la VK
+
+`fetchVK(baseUrl, token)` hace un GET a `/vk/:token` (endpoint de vk-share del bridge) para obtener la VK del servidor en formato hex. Esta funcion existe para el flujo de onboarding automatico — el caso default es que la VK este pinneada en build time como un Uint8Array literal.
+
+### hooks/usePQCSession.ts — React hook
+
+Envuelve `PQCSession` en el modelo de lifecycle de React:
+- `useEffect` con `[]` deps: conecta al montar, llama `session.close()` al desmontar (cleanup)
+- Backoff exponencial: hasta 3 intentos de reconexion con delay creciente
+- Strict Mode safe: el doble-mount de React 18 en desarrollo no crea sesiones duplicadas
+
+---
+
+## Seguridad: EC-7, EC-8, EC-9
+
+Tres fixes de seguridad aplicados en la misma Mes:
+
+**EC-7 — Nonce determinista en write_frame**: el nonce de AES-256-GCM cambia de aleatorio (`OsRng`) a determinista (derivado del seq). Elimina la dependencia de OsRng en el hot path de DATA frames y cierra el birthday problem para sesiones de alto volumen.
+
+**EC-8 — KEY_ROTATE anti-replay**: `send_key_rotate` y el branch `KEY_ROTATE` en `read_frame` usaban AAD vacia (`b""`). Dos frames `KEY_ROTATE` identicos eran indistinguibles → replay posible. Fix: AAD = `key_rotate_send_seq` como 8B BE. El receptor incrementa su propio `key_rotate_recv_seq` y lo usa como AAD esperado. Un frame repetido tiene seq incorrecto → GCM authentication falla.
+
+**EC-9 — Zeroizacion del OKM en WASM**: en `derive_session_key` del crate WASM el buffer `okm` no era zeroizado despues de usarse para derivar la clave. El material de clave quedaba accesible en la memoria lineal de WASM. Fix: `okm.zeroize()` inmediatamente despues del import.
+
+---
+
+## Tests
+
+**Rust** — 8 integration tests en `latticeshield-bridge/tests/ws_integration.rs`:
+- `ws_full_pqc_handshake_session_key_derived` — handshake PQC completo sobre `WsStream<DuplexStream>` (sin TLS real, sin red real), confirma que `session::handle<T>` funciona con WsStream
+- `origin_check_rejects_unknown_origin` / `_accepts_allowed_origin` / `_empty_list_accepts_any` — validacion de origin
+- `ip_rate_limit_enforced_and_released_on_drop` / `_independent_per_ip` — enforcement del contador RAII
+- `ws_handshake_timeout_fires_when_client_silent` / `_after_hello_sent` — timeout de handshake
+
+**TypeScript** — 62 tests en vitest:
+- `framing.test.ts` (47 tests): round-trip encrypt/decrypt, BigInt seq, replay detection, KEY_ROTATE parse, HKDF derivation, non-extractable key import, zeroize
+- `session.test.ts` (15 tests): wss:// enforcement, wire constants, event emitter
+
+**Total workspace**: 406 tests Rust, todos passing.
+
+---
