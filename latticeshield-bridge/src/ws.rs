@@ -89,12 +89,12 @@ where
                         if data.is_empty() {
                             return Poll::Ready(Ok(()));
                         }
-                        me.read_buf = data;
+                        me.read_buf = data.into();
                         me.read_pos = 0;
                         // Loop back to drain into `buf`.
                     }
                     Message::Text(text) => {
-                        let data = text.into_bytes();
+                        let data: Vec<u8> = text.as_bytes().to_vec();
                         if data.is_empty() {
                             return Poll::Ready(Ok(()));
                         }
@@ -143,7 +143,7 @@ where
                 Poll::Ready(Ok(())) => {}
             }
             let payload = std::mem::take(&mut me.write_buf);
-            if let Err(e) = Pin::new(&mut me.inner).start_send(Message::Binary(payload)) {
+            if let Err(e) = Pin::new(&mut me.inner).start_send(Message::Binary(payload.into())) {
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
             }
         }

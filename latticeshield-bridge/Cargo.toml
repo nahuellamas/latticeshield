@@ -39,7 +39,7 @@ httparse                    = "1"
 quinn              = { workspace = true }
 rustls             = { workspace = true }
 sha2               = { workspace = true }
-tokio-tungstenite  = { version = "0.21", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite  = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-core       = "0.3"
 futures-sink       = "0.3"
 uuid   = { version = "1", features = ["v4"] }
