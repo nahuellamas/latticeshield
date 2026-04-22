@@ -1057,6 +1057,7 @@ async fn admin_channel_get_metrics_full_handshake() {
             rotate_tx: Arc::clone(&rotate_tx),
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
+            cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
@@ -1149,6 +1150,7 @@ async fn admin_channel_wrong_client_sk_rejected() {
             rotate_tx: Arc::clone(&rotate_tx),
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
+            cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
@@ -1226,6 +1228,7 @@ async fn admin_channel_rotate_full_handshake() {
             rotate_tx: Arc::clone(&rotate_tx),
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
+            cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
@@ -1308,6 +1311,7 @@ async fn admin_channel_get_vk_token_full_handshake() {
             rotate_tx: Arc::clone(&rotate_tx),
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
+            cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,

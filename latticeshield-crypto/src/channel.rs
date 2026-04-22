@@ -86,6 +86,10 @@ pub struct EncryptedChannel {
     /// Contador monotono de KEY_ROTATE frames recibidos. AAD del GCM — previene replay.
     /// NO se resetea en rotate_key() para bloquear replay cross-epoch.
     key_rotate_recv_seq: u64,
+    /// Epoch de rotacion de clave. Se incrementa en cada rotate_key().
+    /// Se embebe en los bytes 8..12 del nonce AES-GCM — garantiza unicidad del nonce
+    /// incluso cuando send_seq se resetea a 0 al inicio de cada nueva epoca.
+    epoch: u32,
 }
 
 impl EncryptedChannel {
@@ -100,6 +104,7 @@ impl EncryptedChannel {
             recv_initialized: false,
             key_rotate_send_seq: 0,
             key_rotate_recv_seq: 0,
+            epoch: 0,
         }
     }
 
@@ -112,8 +117,9 @@ impl EncryptedChannel {
         data: &[u8],
     ) -> Result<(), FrameError> {
         let seq_be = self.send_seq.to_be_bytes();
-        let mut nonce_bytes = [0u8; NONCE_LEN]; // primeros 8B = seq, últimos 4B = 0x00000000
+        let mut nonce_bytes = [0u8; NONCE_LEN]; // bytes 0..8 = seq, bytes 8..12 = epoch
         nonce_bytes[..SEQ_LEN].copy_from_slice(&seq_be);
+        nonce_bytes[SEQ_LEN..].copy_from_slice(&self.epoch.to_be_bytes());
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let mut buf = data.to_vec();
@@ -285,10 +291,13 @@ impl EncryptedChannel {
         // Mover new_key a key_bytes — la clave vieja es zeroizada en el drop de key_bytes
         self.key_bytes = new_key;
 
-        // Resetear contadores — nueva epoca de secuencia
+        // Resetear contadores DATA — nueva epoca de secuencia.
+        // El epoch se incrementa para garantizar unicidad del nonce AES-GCM
+        // incluso cuando send_seq vuelve a 0.
         self.send_seq = 0;
         self.recv_seq = 0;
         self.recv_initialized = false;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 }
 

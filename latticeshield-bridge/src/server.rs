@@ -155,6 +155,7 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                 rotate_tx: Arc::clone(&rotate_tx),
                 prometheus_handle: metrics_handle.clone(),
                 tls_base_url: tls_base_url.clone(),
+                cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             crate::admin::AdminListenerConfig {
                 rate_limit_per_second: config.admin_rate_limit_per_second,

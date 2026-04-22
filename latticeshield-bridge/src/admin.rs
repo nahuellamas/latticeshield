@@ -5,6 +5,7 @@
 //! el control plane firma ClientResponse con su clave admin ML-DSA-65.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,8 @@ pub struct AdminServices {
     pub rotate_tx: Arc<watch::Sender<u64>>,
     pub prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub tls_base_url: String,
+    /// Contador global de seq de comandos — persiste entre conexiones para prevenir replay.
+    pub cmd_seq: Arc<AtomicU64>,
 }
 
 /// Configuracion de runtime del listener admin.
@@ -152,12 +155,13 @@ async fn handle_admin_connection(
         }
     };
 
-    // Sequence number check (per-connection, starts at 0)
-    let last_seen_seq = 0u64;
+    // Sequence number check — global, persiste entre conexiones para prevenir replay.
+    let last_seen_seq = services.cmd_seq.load(Ordering::SeqCst);
     if !is_seq_valid(cmd_frame.seq, last_seen_seq) {
         warn!(%peer, seq=%cmd_frame.seq, last_seen=%last_seen_seq, "admin: sequence violation");
         return Ok(());
     }
+    services.cmd_seq.fetch_max(cmd_frame.seq, Ordering::SeqCst);
 
     // Dispatch command
     let response = match cmd_frame.cmd {

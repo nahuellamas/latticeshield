@@ -12,7 +12,7 @@ use ml_kem::{kem::Encapsulate, EncodedSizeUser, KemCore, MlKem768};
 use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::WasmError;
 use crate::signing::{Signature, VerifyingKey, SIGNATURE_LEN, VERIFYING_KEY_LEN};
@@ -49,7 +49,7 @@ struct ClientHello {
 pub fn generate_client_response(
     server_hello_signed: &[u8],
     server_vk_bytes: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), WasmError> {
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), WasmError> {
     // Validar longitudes de entrada
     if server_hello_signed.len() != SERVER_HELLO_SIGNED_LEN {
         return Err(WasmError::HandshakeError(format!(
@@ -76,7 +76,10 @@ pub fn generate_client_response(
     // Ejecutar lado cliente del handshake
     let (cr_bytes, session_key_bytes) = client_respond(&hello)?;
 
-    Ok((cr_bytes.to_vec(), session_key_bytes.to_vec()))
+    Ok((
+        cr_bytes.to_vec(),
+        Zeroizing::new(session_key_bytes.to_vec()),
+    ))
 }
 
 // ── Implementacion interna ────────────────────────────────────────────────────
@@ -160,7 +163,7 @@ fn derive_session_key(
     kem_secret: &[u8],
     nonce: &[u8; NONCE_LEN],
 ) -> Result<[u8; SESSION_KEY_LEN], WasmError> {
-    let mut ikm = Vec::with_capacity(x25519_secret.len() + kem_secret.len());
+    let mut ikm = Zeroizing::new(Vec::with_capacity(x25519_secret.len() + kem_secret.len()));
     ikm.extend_from_slice(x25519_secret);
     ikm.extend_from_slice(kem_secret);
 
@@ -168,8 +171,6 @@ fn derive_session_key(
     let mut okm = Zeroizing::new([0u8; SESSION_KEY_LEN]);
     hkdf.expand(HKDF_INFO, okm.as_mut())
         .map_err(|_| WasmError::HandshakeError("HKDF expansion failed".to_string()))?;
-
-    ikm.zeroize();
 
     let result = *okm; // copia los bytes; okm (Zeroizing) se dropea aqui y zeroza el original
     Ok(result)

@@ -10,7 +10,7 @@
 
 use libcrux_ml_dsa::ml_dsa_65;
 use rand_core::{OsRng, RngCore};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::WasmError;
 
@@ -110,10 +110,10 @@ impl Signature {
 
 /// Genera un par de claves ML-DSA-65 usando `OsRng` (getrandom/js en WASM).
 pub fn generate_keypair(rng: &mut impl rand_core::CryptoRngCore) -> (SigningKey, VerifyingKey) {
-    let mut seed = [0u8; libcrux_ml_dsa::KEY_GENERATION_RANDOMNESS_SIZE];
-    rng.fill_bytes(&mut seed);
+    let mut seed = Zeroizing::new([0u8; libcrux_ml_dsa::KEY_GENERATION_RANDOMNESS_SIZE]);
+    rng.fill_bytes(seed.as_mut());
 
-    let kp = ml_dsa_65::portable::generate_key_pair(seed);
+    let kp = ml_dsa_65::portable::generate_key_pair(*seed);
 
     let sk_bytes: &[u8; SIGNING_KEY_LEN] = kp.signing_key.as_ref();
     let vk_bytes: &[u8; VERIFYING_KEY_LEN] = kp.verification_key.as_ref();

@@ -25,7 +25,7 @@ use rand_core::CryptoRngCore;
 use sha2::Sha256;
 use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::signing::{sign, verify, Signature, SigningKey, VerifyingKey, SIGNATURE_LEN};
 
@@ -366,7 +366,7 @@ fn derive_session_key(
     kem_secret: &[u8],
     nonce: &[u8; 32],
 ) -> Result<SessionKey, HandshakeError> {
-    let mut ikm = Vec::with_capacity(x25519_secret.len() + kem_secret.len());
+    let mut ikm = Zeroizing::new(Vec::with_capacity(x25519_secret.len() + kem_secret.len()));
     ikm.extend_from_slice(x25519_secret);
     ikm.extend_from_slice(kem_secret);
 
@@ -374,8 +374,6 @@ fn derive_session_key(
     let mut okm = [0u8; SESSION_KEY_LEN];
     hkdf.expand(HKDF_INFO, &mut okm)
         .map_err(|_| HandshakeError::Hkdf)?;
-
-    ikm.zeroize();
 
     Ok(SessionKey(okm))
 }
