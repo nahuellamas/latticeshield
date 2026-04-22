@@ -655,4 +655,51 @@ mod tests {
             "recv_seq must be 2 after reading 3 frames (seq 0,1,2)"
         );
     }
+
+    #[tokio::test]
+    async fn out_of_order_recv_seq_nonzero_rejected() {
+        // Distincto de replay_frame_rejected (que cubre el bootstrap seq=0).
+        // Este test cubre el caso general: recv_seq ya avanzó a 2, y llega seq=1 → Replay.
+        let mut writer = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+        let mut reader = EncryptedChannel::new(&TEST_KEY, TEST_FRAME_SIZE);
+
+        // Escribir 3 frames en buffers separados para poder reenviar uno individualmente.
+        let mut wire0 = Vec::new();
+        let mut wire1 = Vec::new();
+        let mut wire2 = Vec::new();
+        writer.write_frame(&mut wire0, b"msg-0").await.unwrap(); // seq=0
+        writer.write_frame(&mut wire1, b"msg-1").await.unwrap(); // seq=1
+        writer.write_frame(&mut wire2, b"msg-2").await.unwrap(); // seq=2
+
+        // Leer los 3 en orden — recv_seq debe quedar en 2
+        reader
+            .read_frame(&mut std::io::Cursor::new(&wire0))
+            .await
+            .unwrap();
+        reader
+            .read_frame(&mut std::io::Cursor::new(&wire1))
+            .await
+            .unwrap();
+        reader
+            .read_frame(&mut std::io::Cursor::new(&wire2))
+            .await
+            .unwrap();
+        assert_eq!(reader.recv_seq, 2);
+
+        // Reenviar seq=1 — 1 <= 2 → Replay { received: 1, last_seen: 2 }
+        let err = reader
+            .read_frame(&mut std::io::Cursor::new(wire1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrameError::Replay {
+                    received: 1,
+                    last_seen: 2
+                }
+            ),
+            "expected Replay{{received:1, last_seen:2}}, got: {err:?}"
+        );
+    }
 }

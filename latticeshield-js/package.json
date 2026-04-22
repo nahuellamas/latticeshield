@@ -20,6 +20,7 @@
   ],
   "scripts": {
     "build": "vite build",
+    "postbuild": "node scripts/sri.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
