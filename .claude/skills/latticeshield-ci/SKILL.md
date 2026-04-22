@@ -13,6 +13,8 @@ metadata:
 
 - After editing `.rs` files → lint check needed
 - After editing `Cargo.toml`, `Cargo.lock`, or `deny.toml` → deny check needed
+- After editing `latticeshield-js/**/*.ts` or `latticeshield-js/tsconfig.json` → typecheck needed
+- After editing `latticeshield-js/**/*.ts` or `latticeshield-js/vitest.config.ts` → JS tests needed
 - When a CI job fails and you need to reproduce it locally
 - Before committing to avoid pushing broken CI
 
@@ -38,6 +40,9 @@ Use the output to decide which checks to run. **Never run all checks blindly.**
 | `**/*.rs` | lint (fmt + clippy) |
 | `Cargo.toml`, `Cargo.lock`, `deny.toml` | deny |
 | Both of the above | lint + deny |
+| `latticeshield-js/**/*.ts`, `latticeshield-js/tsconfig.json` | typecheck |
+| `latticeshield-js/**/*.ts`, `latticeshield-js/vitest.config.ts` | js-test |
+| Both TypeScript entries | typecheck + js-test |
 | Nothing relevant | Skip — tell the user nothing needs to run |
 
 ### Step 3 — Run only what's needed
@@ -58,6 +63,18 @@ If the change spans the whole workspace, run without `-p`.
 
 ```bash
 ~/.cargo/bin/cargo deny check
+```
+
+#### Typecheck (triggered by `latticeshield-js/**/*.ts` or `tsconfig.json` changes)
+
+```bash
+cd latticeshield-js && npm run typecheck
+```
+
+#### JS Test (triggered by `latticeshield-js/**/*.ts` or `vitest.config.ts` changes)
+
+```bash
+cd latticeshield-js && npm test
 ```
 
 ### Step 4 — Report
@@ -83,6 +100,12 @@ git diff --name-only HEAD
 
 # Deny
 ~/.cargo/bin/cargo deny check
+
+# TypeScript — typecheck
+cd latticeshield-js && npm run typecheck
+
+# TypeScript — tests
+cd latticeshield-js && npm test
 ```
 
 ## Rules

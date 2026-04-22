@@ -3309,3 +3309,128 @@ Tres fixes de seguridad aplicados en la misma Mes:
 **Total workspace**: 406 tests Rust, todos passing.
 
 ---
+
+# Mes 23 — Browser SDK Hardening
+
+## Objetivo
+
+Cuatro mejoras de polish y hardening sobre lo entregado en Mes 22:
+
+1. **SRI hash automático** — el hash SHA-384 del `.wasm` se genera solo al buildear
+2. **CI TypeScript** — el skill `latticeshield-ci` ahora cubre `latticeshield-js`
+3. **Test out-of-order recv_seq** — cobertura explícita del caso general de replay
+4. **Spec de verificación de heartbeats** — diseño del cloud-side para Mes 23 de latticeshield-cloud
+
+---
+
+## 1. SRI Hash automático (`latticeshield-js`)
+
+### El problema
+
+El archivo `latticeshield_wasm_bg.wasm` se sirve desde un CDN. Un browser que carga un archivo desde un CDN no puede saber si alguien lo modificó en el camino. SRI (Subresource Integrity) cierra ese gap: el HTML incluye un hash del archivo, y el browser rechaza el archivo si no coincide.
+
+Antes de este cambio, el hash había que calcularlo a mano cada vez que se recompilaba el WASM.
+
+### El cambio
+
+Nuevo archivo `latticeshield-js/scripts/sri.mjs`:
+
+```javascript
+// Lee el .wasm, computa SHA-384, escribe <wasm>.sha384 junto al archivo
+const bytes = readFileSync(wasmPath);
+const hash = createHash('sha384').update(bytes).digest('base64');
+writeFileSync(outPath, `sha384-${hash}`, 'utf8');
+```
+
+`package.json` agrega `"postbuild": "node scripts/sri.mjs"`. npm ejecuta `postbuild` automáticamente después de cada `npm run build`.
+
+El archivo `.sha384` queda junto al `.wasm` en `latticeshield-wasm/pkg/` y está ignorado por git (el `pkg/.gitignore` ya tiene `*`). Se regenera en cada build — nunca queda stale.
+
+**Uso en HTML:**
+
+```html
+<script type="module"
+  src="https://cdn.example.com/latticeshield_wasm_bg.wasm"
+  integrity="sha384-20uP8zanRwFb..."
+  crossorigin="anonymous">
+</script>
+```
+
+---
+
+## 2. CI TypeScript (`latticeshield-ci` skill)
+
+### El problema
+
+El skill `latticeshield-ci` detecta qué archivos cambiaron y corre solo los checks relevantes. Antes de este cambio, solo cubría Rust: si modificabas `latticeshield-js/**/*.ts`, el skill no corría nada.
+
+### El cambio
+
+Nueva tabla de decisión en `SKILL.md`:
+
+| Archivos cambiados | Check |
+|---|---|
+| `latticeshield-js/**/*.ts`, `tsconfig.json` | `npm run typecheck` |
+| `latticeshield-js/**/*.ts`, `vitest.config.ts` | `npm test` |
+
+Nuevos comandos documentados:
+
+```bash
+cd latticeshield-js && npm run typecheck   # tsc --noEmit
+cd latticeshield-js && npm test            # vitest run (62 tests)
+```
+
+---
+
+## 3. Test out-of-order `recv_seq` — caso general
+
+### El problema
+
+`replay_frame_rejected` (Mes 17) solo cubre el caso bootstrap: `seq=0` repetido cuando `recv_seq=0` y `recv_initialized=true`. La lógica de validación `wire_seq <= recv_seq` también cubre el caso general (recv_seq ya avanzó), pero no había un test dedicado para ese camino.
+
+### El test
+
+```rust
+#[tokio::test]
+async fn out_of_order_recv_seq_nonzero_rejected() {
+    // Lee seq=0,1,2 en orden → recv_seq=2
+    // Reenvía seq=1 → Replay { received: 1, last_seen: 2 }
+    ...
+    assert!(matches!(err, FrameError::Replay { received: 1, last_seen: 2 }));
+}
+```
+
+Tres frames se escriben en buffers separados para poder reenviar uno individualmente sin depender del orden del writer.
+
+**Diferencia con el test bootstrap:**
+
+| Test | Estado inicial | Frame reenviado | Error esperado |
+|---|---|---|---|
+| `replay_frame_rejected` | `recv_seq=0`, `recv_initialized=true` | `seq=0` | `Replay { received: 0, last_seen: 0 }` |
+| `out_of_order_recv_seq_nonzero_rejected` | `recv_seq=2`, `recv_initialized=true` | `seq=1` | `Replay { received: 1, last_seen: 2 }` |
+
+---
+
+## 4. Spec: verificación de heartbeats en cloud
+
+El bridge firma cada heartbeat con ML-DSA-65 antes de enviarlo. El cloud hoy no verifica esa firma — cualquiera con acceso al `agent_id` puede inyectar heartbeats falsos.
+
+La spec (`latticeshield-cloud/specs/heartbeat-signature-verification.md`) documenta:
+
+- **Payload firmado**: canonical JSON de `SignableHeartbeatPayload` — los 5 campos en el orden exacto de declaración del struct Rust (que es lo que produce `serde_json::to_vec`)
+- **Algoritmo**: ML-DSA-65 usando `@noble/post-quantum`
+- **VK**: viene de `bridges.server_vk` (registrado en `/api/v1/agents/register`), NUNCA del body del heartbeat
+- **Replay protection adicional**: validar `|timestamp_unix - now| <= 300s` (la firma válida no garantiza frescura)
+- **Códigos HTTP**: 200 ok, 400 timestamp/longitud, 401 firma inválida, 404 bridge no encontrado
+
+**Gotcha crítico documentado**: `JSON.stringify` en JavaScript preserva el orden de inserción de propiedades en objetos literales (ES2015+). El objeto `signable` debe construirse con los campos en el orden exacto del struct Rust. No usar `Object.fromEntries(body)` ni spread — ambos pueden reordenar.
+
+---
+
+## Tests
+
+**+1 test en `latticeshield-crypto/src/channel.rs`**: `out_of_order_recv_seq_nonzero_rejected`
+
+**Total workspace**: 407 tests Rust, todos passing.
+
+---
