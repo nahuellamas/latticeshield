@@ -1,8 +1,18 @@
 [advisories]
+# libcrux-ml-dsa =0.0.8 — monitor for 0.1.0 stable release.
+# RUSTSEC-2026-0125 / RUSTSEC-2026-0126: AVX2 backend soundness issues in libcrux-ml-dsa 0.0.8.
+# See IACR eprint 2026/192. We use the portable backend (no AVX2 code path active).
+# These advisories do NOT affect latticeshield. Ignored with rationale; upgrade to 0.0.9+ when stable.
 ignore = [
     # RUSTSEC-2025-0134: rustls-pemfile is unmaintained — no safe upgrade available.
     # Used only for TLS cert/key loading at startup; not in the hot crypto path.
     { id = "RUSTSEC-2025-0134" },
+    # RUSTSEC-2026-0125: libcrux-ml-dsa 0.0.8 AVX2 signature verification edge case.
+    # We use the portable backend only — AVX2 code path is never activated.
+    { id = "RUSTSEC-2026-0125" },
+    # RUSTSEC-2026-0126: libcrux-ml-dsa 0.0.8 AVX2 intermediate value reduction notice.
+    # We use the portable backend only — AVX2 code path is never activated.
+    { id = "RUSTSEC-2026-0126" },
 ]
 
 [licenses]

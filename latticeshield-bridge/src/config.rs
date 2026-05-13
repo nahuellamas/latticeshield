@@ -650,6 +650,12 @@ impl Config {
             );
         }
         let client_auth_enabled = require_client_auth && self.auth.client_vk_path.is_some();
+        if !client_auth_enabled {
+            tracing::warn!(
+                "client_auth_enabled=false: mutual authentication is disabled; \
+                 any client can connect without a verifying key"
+            );
+        }
         let client_vk_path = self.auth.client_vk_path;
 
         // ── Admin PQC listener validation ────────────────────────────────────

@@ -24,6 +24,7 @@ import {
   parseKeyRotateFrame,
   processKeyRotate,
   importSessionKey,
+  MAX_U64,
 } from '../src/framing.js';
 import type { SessionKey } from '../src/framing.js';
 import { FRAME_DATA, FRAME_KEY_ROTATE, KEY_ROTATE_FRAME_LEN } from '../src/types.js';
@@ -122,6 +123,67 @@ describe('seqToAad', () => {
     const aad = seqToAad(1n);
     expect(aad[7]).toBe(1);
     expect(aad[0]).toBe(0);
+  });
+});
+
+// ── seqToNonce / seqToAad overflow guards (SEC-H14-1) ────────────────────────
+
+describe('seqToNonce overflow guard', () => {
+  it('seq=0n is accepted (lower boundary)', () => {
+    expect(() => seqToNonce(0n)).not.toThrow();
+    expect(seqToNonce(0n).length).toBe(12);
+  });
+
+  it('seq=MAX_U64 is accepted (upper boundary)', () => {
+    expect(() => seqToNonce(MAX_U64)).not.toThrow();
+    // MAX_U64 = 0xFFFFFFFFFFFFFFFF — last 8 bytes of nonce are all 0xFF
+    const nonce = seqToNonce(MAX_U64);
+    for (let i = 4; i < 12; i++) {
+      expect(nonce[i]).toBe(0xff);
+    }
+  });
+
+  it('seq=MAX_U64 + 1n throws RangeError', () => {
+    expect(() => seqToNonce(MAX_U64 + 1n)).toThrow(RangeError);
+  });
+
+  it('seq=-1n throws RangeError', () => {
+    expect(() => seqToNonce(-1n)).toThrow(RangeError);
+  });
+});
+
+describe('seqToAad overflow guard', () => {
+  it('seq=0n is accepted (lower boundary)', () => {
+    expect(() => seqToAad(0n)).not.toThrow();
+    expect(seqToAad(0n).length).toBe(8);
+  });
+
+  it('seq=MAX_U64 is accepted (upper boundary)', () => {
+    expect(() => seqToAad(MAX_U64)).not.toThrow();
+    const aad = seqToAad(MAX_U64);
+    for (let i = 0; i < 8; i++) {
+      expect(aad[i]).toBe(0xff);
+    }
+  });
+
+  it('seq=MAX_U64 + 1n throws RangeError', () => {
+    expect(() => seqToAad(MAX_U64 + 1n)).toThrow(RangeError);
+  });
+
+  it('seq=-1n throws RangeError', () => {
+    expect(() => seqToAad(-1n)).toThrow(RangeError);
+  });
+});
+
+describe('encodeFrame propagates RangeError from seqToNonce', () => {
+  it('encodeFrame with seq=-1n throws RangeError', async () => {
+    const key = await importSessionKey(new Uint8Array(32).fill(0xaa));
+    await expect(encodeFrame(key, -1n, new Uint8Array(4))).rejects.toThrow(RangeError);
+  });
+
+  it('encodeFrame with seq=MAX_U64+1n throws RangeError', async () => {
+    const key = await importSessionKey(new Uint8Array(32).fill(0xaa));
+    await expect(encodeFrame(key, MAX_U64 + 1n, new Uint8Array(4))).rejects.toThrow(RangeError);
   });
 });
 

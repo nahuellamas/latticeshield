@@ -28,20 +28,41 @@ export async function fetchVK(baseUrl: string, token: string): Promise<Uint8Arra
     throw new Error(`fetchVK: server returned ${response.status} ${response.statusText}`);
   }
 
-  const text = (await response.text()).trim();
+  const text = await response.text();
 
-  // Response is hex-encoded (64 hex chars per byte = 1952 * 2 = 3904 chars for VK)
-  if (!/^[0-9a-fA-F]+$/.test(text)) {
-    throw new Error('fetchVK: response is not valid hex');
+  // Response is JSON: { "server_vk": "<3904 hex chars>", "fingerprint": "..." }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error('fetchVK: response is not valid JSON');
   }
 
-  if (text.length % 2 !== 0) {
-    throw new Error('fetchVK: hex response has odd length');
+  if (typeof json !== 'object' || json === null || !('server_vk' in json)) {
+    throw new Error('fetchVK: missing server_vk field');
   }
 
-  const bytes = new Uint8Array(text.length / 2);
-  for (let i = 0; i < text.length; i += 2) {
-    bytes[i / 2] = parseInt(text.slice(i, i + 2), 16);
+  const rawServerVk = (json as Record<string, unknown>)['server_vk'];
+  if (typeof rawServerVk !== 'string') {
+    throw new Error('fetchVK: missing server_vk field');
+  }
+
+  const hex: string = rawServerVk;
+
+  // Validate hex encoding and exact VK length (1952 bytes = 3904 hex chars)
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error('fetchVK: server_vk is not valid hex');
+  }
+
+  if (hex.length !== 3904) {
+    throw new Error(
+      `fetchVK: server_vk has wrong length: expected 3904 hex chars (1952 bytes), got ${hex.length}`,
+    );
+  }
+
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
   }
 
   return bytes;

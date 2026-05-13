@@ -20,6 +20,11 @@
 
 import { FRAME_DATA, FRAME_KEY_ROTATE, KEY_ROTATE_FRAME_LEN } from "./types";
 
+// ── u64 range constant ────────────────────────────────────────────────────────
+
+/** Maximum value of a u64: 2^64 - 1. Used for overflow guards in seqToNonce/seqToAad. */
+export const MAX_U64 = (1n << 64n) - 1n;
+
 // ── Session key type ──────────────────────────────────────────────────────────
 
 /**
@@ -52,6 +57,9 @@ export interface SessionKey {
  * birthday problem that random nonces would introduce with AES-GCM.
  */
 export function seqToNonce(seq: bigint): Uint8Array {
+  if (seq < 0n || seq > MAX_U64) {
+    throw new RangeError(`seq out of u64 range: ${seq}`);
+  }
   const nonce = new Uint8Array(12);
   const view = new DataView(nonce.buffer);
   // Offset 4: seq as 8B big-endian in the last 8 bytes of the 12B nonce
@@ -63,6 +71,9 @@ export function seqToNonce(seq: bigint): Uint8Array {
  * Encodes seq as an 8-byte big-endian Uint8Array — used as AEAD AAD.
  */
 export function seqToAad(seq: bigint): Uint8Array {
+  if (seq < 0n || seq > MAX_U64) {
+    throw new RangeError(`seq out of u64 range: ${seq}`);
+  }
   const aad = new Uint8Array(8);
   const view = new DataView(aad.buffer);
   view.setBigUint64(0, seq, false);
