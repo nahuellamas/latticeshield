@@ -17,3 +17,6 @@ latticeshield-js/.vite/
 .engram/
 .atl/
 latticeshield-wasm/pkg/
+
+# Internal development notes
+docs.md
