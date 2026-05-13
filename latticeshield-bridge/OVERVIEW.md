@@ -22,10 +22,12 @@ latticeshield-bridge is the server half of the system. It depends on latticeshie
 
 ## What Changed in This Release
 
-- Pre-built binaries are now published automatically to GitHub Releases on every version tag. You no longer need to compile the bridge from source — download the right binary for your platform and it is ready to run.
-- A ready-to-use systemd unit file (`contrib/systemd/latticeshield-bridge.service`) is now included. It runs the bridge as a dedicated low-privilege user with filesystem write access restricted to only the config and log directories, preventing a compromised process from touching the rest of the system.
-- A ready-to-use launchd plist (`contrib/launchd/com.latticeshield.bridge.plist`) is now included for macOS deployments, with automatic restart and log file routing configured.
-- The bridge binary no longer pulls in OpenSSL indirectly through its Prometheus dependency. The metrics exporter now activates only the HTTP listener feature it actually uses, removing an unused code path that added unnecessary dependencies.
+- The bridge now checks that every WebSocket origin entry in the config is a real URL with a scheme. If any entry is malformed the bridge refuses to start and tells you exactly which entry is wrong — you find out immediately on restart, not during the first real connection.
+- Two origins that point to the same place are now always treated as the same: for example, `https://app.example.com` and `https://app.example.com:443` are equivalent. Before this change they would be treated as different, silently rejecting valid connections.
+- The list of one-time download tokens for the server identity card is now capped at 1000 active entries. If that limit is ever reached, new requests get a clear "too many requests" response instead of the bridge quietly consuming more and more memory. The cap is adjustable via the `LATTICE_VK_TOKEN_MAX` environment variable.
+- The connection timer that protects against slow clients who never finish the opening handshake now only covers the handshake itself. Before this change the same timer covered the entire session, which meant long-lived transfers could be cut off unexpectedly. Transfers can now run as long as needed.
+- When the bridge starts with client authentication turned off, it now logs a warning that says so clearly. Before this change, running in open-access mode was completely silent.
+- The bridge now logs its signing context (`latticeshield-v1`) at startup alongside the version number, so operators can confirm which cryptographic protocol version is running.
 
 ---
-*Last updated: 2026-03-26 — latticeshield-mes19-ci-release*
+*Last updated: 2026-05-13 — latticeshield-mes24-security-hardening*

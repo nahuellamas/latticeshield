@@ -18,8 +18,9 @@ latticeshield-crypto is the foundation that all other crates depend on. lattices
 
 ## What Changed in This Release
 
-- The "rotate encryption keys" instruction exchanged mid-session is now itself encrypted. Before this release, the rotation secret — a short code used to agree on the new key — traveled in the clear inside the channel. A passive observer on the wire could have read it. Now the rotation secret is wrapped in the same mathematical lock that protects all other messages, so it cannot be read without already holding the session key.
-- Removed an internal component (an anti-replay filter for one-time entry tickets) that was built for a feature — instant reconnection without a full handshake — that was never implemented. The component had no callers and provided no security benefit in practice. Removing it reduces the code that must be audited and maintained.
+- Every digital signature the bridge produces now carries a label that says "this signature belongs to LatticeShield version 1." This is called domain separation — it means a signature made by LatticeShield cannot be mistaken for, or accepted by, a different system that happens to use the same type of signature math with no label. Before this change the label was empty, which left a gap where signatures from different systems or products could theoretically be confused. The label is `latticeshield-v1`. This is a breaking change — bridges and clients must be upgraded together (version 0.3.0).
+- A regression test now checks that the label bytes are exactly `latticeshield-v1`. If someone accidentally changes the label in a future edit, the test fails immediately and visibly before any release goes out.
+- A second test confirms that a signature made with the old empty label is correctly rejected by the new verifier. The incompatibility between versions 0.2.x and 0.3.x is real and intentional, and this test proves it.
 
 ---
-*Last updated: 2026-03-26 — latticeshield-mes18-security*
+*Last updated: 2026-05-13 — latticeshield-mes24-security-hardening*

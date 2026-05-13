@@ -12,6 +12,12 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Mes 24 — Security Hardening (2026-05-13)
+
+Closes 9 pending security audit findings. Introduces ML-DSA-65 domain separation
+(`latticeshield-v1` context), WebSocket origin normalization, VK token store DoS
+protection, and fixes a broken key-fetch function in the JS SDK. Version bump to 0.3.0.
+
 ### WebSocket Browser SDK (2026-03-28)
 
 Browsers can now connect directly to the LatticeShield PQC channel — no native agent, no plugin. The bridge listens on a new WebSocket port (`:8446` by default) and speaks the same hybrid ML-KEM-768 + X25519 + AES-256-GCM handshake that the Rust client agent uses. A TypeScript npm package, `@latticeshield/js`, handles the full session lifecycle: it spawns a Web Worker, loads the `latticeshield-wasm` WASM module inside that worker (so crypto keys never touch the main thread), performs the handshake, and exposes a clean `PQCSession` class and a `usePQCSession` React hook.
