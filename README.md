@@ -10,6 +10,8 @@
 
 A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cryptography (PQC) layer — **X25519 + ML-KEM-768** — as a transparent encryption layer between clients and backend services, with no FFI, no OpenSSL, no `oqs-rs`.
 
+**[→ Quickstart — get running in 10 minutes](QUICKSTART.md)**
+
 ## What's New
 
 ### v0.3.0 — Security Hardening (2026-05-13)
