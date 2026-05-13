@@ -40,6 +40,7 @@ npm test
 ## Pull Request Guidelines
 
 - **One concern per PR** — a fix is a fix, a feature is a feature. Don't mix them.
+- **Size limit** — PRs must stay under 400 changed lines (excluding tests and generated files). Larger changes must be split into a chain of smaller PRs, each reviewable on its own. PRs over 400 lines will be asked to split before review.
 - **Tests required** — every change to `latticeshield-crypto` or `latticeshield-bridge` must include tests. No exceptions.
 - **No unsafe Rust** — the codebase has zero `unsafe` blocks. Keep it that way unless there is an extraordinary reason.
 - **No new FFI dependencies** — LatticeShield is intentionally pure Rust with no OpenSSL, no oqs-rs, no C bindings. New crypto dependencies must be pure Rust.
