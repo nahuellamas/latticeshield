@@ -12,3 +12,8 @@ latticeshield-js/node_modules/
 latticeshield-js/.vite/
 .DS_Store
 .gga
+
+# AI tooling — internal, not for contributors
+.engram/
+.atl/
+latticeshield-wasm/pkg/
