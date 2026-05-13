@@ -30,7 +30,8 @@ pub const CLIENT_RESPONSE_LEN: usize = X25519_KEY_LEN + MLKEM768_CT_LEN; // 1120
 pub const SESSION_KEY_LEN: usize = 32;
 
 const HKDF_INFO: &[u8] = b"latticeshield-v1-session-key";
-const EMPTY_CONTEXT: &[u8] = b"";
+/// Separador de dominio ML-DSA-65 per FIPS 204 §5.2. Debe coincidir con el bridge.
+const SIGNING_CONTEXT: &[u8] = b"latticeshield-v1";
 
 // ── Structs internos ──────────────────────────────────────────────────────────
 
@@ -97,7 +98,7 @@ fn parse_server_hello_signed(
     let vk_inner = ml_dsa_65::MLDSA65VerificationKey::new(*vk.to_bytes());
     let sig_inner = ml_dsa_65::MLDSA65Signature::new(*sig.to_bytes());
 
-    ml_dsa_65::portable::verify(&vk_inner, hello_bytes, EMPTY_CONTEXT, &sig_inner)
+    ml_dsa_65::portable::verify(&vk_inner, hello_bytes, SIGNING_CONTEXT, &sig_inner)
         .map_err(|_| WasmError::HandshakeError("server authentication failed".to_string()))?;
 
     parse_server_hello(hello_bytes)

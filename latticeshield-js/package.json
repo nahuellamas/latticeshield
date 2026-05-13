@@ -1,6 +1,6 @@
 {
   "name": "@latticeshield/js",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Browser SDK for LatticeShield PQC bridge — PQCSession + usePQCSession React hook",
   "type": "module",
   "license": "UNLICENSED",

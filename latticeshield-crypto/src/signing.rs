@@ -21,8 +21,13 @@ pub const VERIFYING_KEY_LEN: usize = 1952;
 /// Tamanio de una firma serializada.
 pub const SIGNATURE_LEN: usize = 3309;
 
-/// Contexto vacio — no requerido por el protocolo OTA de LatticeShield.
-const EMPTY_CONTEXT: &[u8] = b"";
+/// Separador de dominio ML-DSA-65 per FIPS 204 §5.2.
+///
+/// Un valor no vacio garantiza que las firmas producidas por LatticeShield
+/// no pueden verificarse con ninguna otra implementacion que use `b""` como
+/// contexto (el default de libcrux). Esto aísla el dominio criptografico y
+/// previene reutilizacion de firmas entre versiones o productos distintos.
+const SIGNING_CONTEXT: &[u8] = b"latticeshield-v1";
 
 // ── Errores ───────────────────────────────────────────────────────────────────
 
@@ -186,7 +191,7 @@ pub fn sign(
     rng.fill_bytes(&mut randomness);
 
     let sk = ml_dsa_65::MLDSA65SigningKey::new(*key.0);
-    let sig = ml_dsa_65::portable::sign(&sk, msg, EMPTY_CONTEXT, randomness)
+    let sig = ml_dsa_65::portable::sign(&sk, msg, SIGNING_CONTEXT, randomness)
         .map_err(|_| SigningError::Signing)?;
 
     let sig_bytes: &[u8; SIGNATURE_LEN] = sig.as_ref();
@@ -200,7 +205,8 @@ pub fn verify(key: &VerifyingKey, msg: &[u8], sig: &Signature) -> Result<(), Sig
     let vk = ml_dsa_65::MLDSA65VerificationKey::new(key.0);
     let s = ml_dsa_65::MLDSA65Signature::new(sig.0);
 
-    ml_dsa_65::portable::verify(&vk, msg, EMPTY_CONTEXT, &s).map_err(|_| SigningError::Verification)
+    ml_dsa_65::portable::verify(&vk, msg, SIGNING_CONTEXT, &s)
+        .map_err(|_| SigningError::Verification)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -335,5 +341,28 @@ mod tests {
         assert!(SigningKey::from_bytes(&[0u8; 10]).is_err());
         assert!(VerifyingKey::from_bytes(&[0u8; 10]).is_err());
         assert!(Signature::from_bytes(&[0u8; 10]).is_err());
+    }
+
+    // ── Task 3.2 — domain-separation regression ──────────────────────────────
+
+    #[test]
+    fn signing_context_mismatch_is_rejected() {
+        // A signature produced with b"latticeshield-v1" MUST NOT verify with b""
+        // and vice-versa.  This guards against silent context drift between crate
+        // versions or products that default to the empty context.
+        let (sk, vk) = generate_keypair(&mut OsRng);
+        let msg = b"test message for context mismatch";
+
+        // Sign via the public API (uses SIGNING_CONTEXT = b"latticeshield-v1")
+        let sig = sign(&sk, msg, &mut OsRng).expect("sign must succeed");
+
+        // Attempt to verify using libcrux directly with b"" (old / empty context)
+        let raw_vk = ml_dsa_65::MLDSA65VerificationKey::new(*vk.to_bytes());
+        let raw_sig = ml_dsa_65::MLDSA65Signature::new(*sig.to_bytes());
+        let result = ml_dsa_65::portable::verify(&raw_vk, msg, b"", &raw_sig);
+        assert!(
+            result.is_err(),
+            "old-context verify (b\"\") must fail against new-context signature (b\"latticeshield-v1\")"
+        );
     }
 }

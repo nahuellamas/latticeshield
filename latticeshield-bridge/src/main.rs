@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
+                ml_dsa_context = "latticeshield-v1",
                 listen = %config.listen_addr,
                 backend = %config.backend_addr,
                 metrics = %config.metrics_addr,

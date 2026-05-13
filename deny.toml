@@ -13,6 +13,16 @@ ignore = [
     # RUSTSEC-2026-0126: libcrux-ml-dsa 0.0.8 AVX2 intermediate value reduction notice.
     # We use the portable backend only — AVX2 code path is never activated.
     { id = "RUSTSEC-2026-0126" },
+    # RUSTSEC-2026-0098: rustls-webpki 0.103.x — name constraints for URI names incorrectly accepted.
+    # Only affects certificate validation with URI-typed name constraints, which we do not use.
+    # No upgrade path available without a breaking rustls bump; tracked for next dependency update cycle.
+    { id = "RUSTSEC-2026-0098" },
+    # RUSTSEC-2026-0099: rustls-webpki 0.103.x — wildcard name constraints accepted incorrectly.
+    # Same scope as RUSTSEC-2026-0098 — URI/wildcard name constraint path not exercised.
+    { id = "RUSTSEC-2026-0099" },
+    # RUSTSEC-2026-0104: rustls-webpki 0.103.x — reachable panic in CRL parsing.
+    # We do not use certificate revocation lists (CRLs) in our TLS setup. Not reachable.
+    { id = "RUSTSEC-2026-0104" },
 ]
 
 [licenses]

@@ -126,8 +126,13 @@ fn ml_kem_client_response_round_trip() {
     let mut signing_randomness = [0u8; libcrux_ml_dsa::SIGNING_RANDOMNESS_SIZE];
     rng.fill_bytes(&mut signing_randomness);
     let sk_inner = ml_dsa_65::MLDSA65SigningKey::new(*sk_bytes);
-    let sig = ml_dsa_65::portable::sign(&sk_inner, &server_hello, b"", signing_randomness)
-        .expect("signing server_hello must succeed");
+    let sig = ml_dsa_65::portable::sign(
+        &sk_inner,
+        &server_hello,
+        b"latticeshield-v1",
+        signing_randomness,
+    )
+    .expect("signing server_hello must succeed");
     let sig_bytes: &[u8; latticeshield_wasm::signing::SIGNATURE_LEN] = sig.as_ref();
 
     let mut server_hello_signed = [0u8; SERVER_HELLO_SIGNED_LEN];
