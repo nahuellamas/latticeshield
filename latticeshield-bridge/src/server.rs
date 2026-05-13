@@ -156,6 +156,7 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                 prometheus_handle: metrics_handle.clone(),
                 tls_base_url: tls_base_url.clone(),
                 cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                vk_share_max_tokens: config.vk_share_max_tokens,
             },
             crate::admin::AdminListenerConfig {
                 rate_limit_per_second: config.admin_rate_limit_per_second,
@@ -661,16 +662,22 @@ fn spawn_ws_listener(
                 tracing::debug!(%peer, "WS upgrade complete");
 
                 // ── Wrap as AsyncRead + AsyncWrite and run PQC session ────
+                // The handshake timeout is now applied INSIDE session::handle,
+                // scoped to the handshake phase only (SEC-H12-1). The relay loop
+                // runs without a session-level upper bound.
                 let ws_io = ws::WsStream::new(ws_stream);
-                let handle_fut = session::handle(ws_io, peer, ctx, cfg, session_shutdown_rx);
-                match tokio::time::timeout(handshake_timeout, handle_fut).await {
-                    Ok(Ok(())) => tracing::debug!(%peer, "WS session complete"),
-                    Ok(Err(e)) => tracing::warn!(%peer, "WS session error: {e:#}"),
-                    Err(_) => tracing::warn!(
-                        %peer,
-                        "WS session timed out after {}s",
-                        handshake_timeout.as_secs()
-                    ),
+                match session::handle_with_handshake_timeout(
+                    ws_io,
+                    peer,
+                    ctx,
+                    cfg,
+                    session_shutdown_rx,
+                    handshake_timeout,
+                )
+                .await
+                {
+                    Ok(()) => tracing::debug!(%peer, "WS session complete"),
+                    Err(e) => tracing::warn!(%peer, "WS session error: {e:#}"),
                 }
             });
         }

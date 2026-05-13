@@ -66,6 +66,8 @@ pub struct AdminServices {
     pub tls_base_url: String,
     /// Contador global de seq de comandos — persiste entre conexiones para prevenir replay.
     pub cmd_seq: Arc<AtomicU64>,
+    /// Maximum allowed tokens in the vk-share store (SEC-H10-1b).
+    pub vk_share_max_tokens: usize,
 }
 
 /// Configuracion de runtime del listener admin.
@@ -171,6 +173,7 @@ async fn handle_admin_connection(
             &services.vk_store,
             &services.identity,
             &services.tls_base_url,
+            services.vk_share_max_tokens,
         ),
     };
 
@@ -202,12 +205,22 @@ fn handle_get_vk_token(
     vk_store: &VkShareStore,
     identity: &ServerIdentity,
     tls_base_url: &str,
+    max_tokens: usize,
 ) -> AdminResponse {
     let vk_bytes = identity.verifying_key.to_bytes();
     let ttl = std::time::Duration::from_secs(crate::vk_share::DEFAULT_TOKEN_TTL_SECS);
-    let (token, _fingerprint) = crate::vk_share::create_token(vk_store, vk_bytes, ttl);
-    let url = format!("{}/vk/{}", tls_base_url, token);
-    AdminResponse::VkToken { token, url }
+    match crate::vk_share::create_token(vk_store, vk_bytes, ttl, max_tokens) {
+        Ok((token, _fingerprint)) => {
+            let url = format!("{}/vk/{}", tls_base_url, token);
+            AdminResponse::VkToken { token, url }
+        }
+        Err(crate::vk_share::VkShareError::TooManyTokens) => {
+            tracing::warn!("admin: vk-share token store full (cap={max_tokens})");
+            AdminResponse::Error {
+                message: "vk share token store full".to_string(),
+            }
+        }
+    }
 }
 
 // ── Listener ─────────────────────────────────────────────────────────────────

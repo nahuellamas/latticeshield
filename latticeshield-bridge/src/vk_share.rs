@@ -12,6 +12,16 @@ use std::time::{Duration, Instant};
 /// Default token TTL: 10 minutes (600 seconds) as per spec REQ-2.3.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 600;
 
+/// Default maximum number of tokens in the store (SEC-H10-1c).
+pub const DEFAULT_TOKEN_MAX: usize = 1000;
+
+/// Error returned when `create_token()` cannot insert due to capacity constraints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VkShareError {
+    /// The token store is at capacity (expired tokens were already evicted).
+    TooManyTokens,
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// A single token entry in the store.
@@ -48,23 +58,43 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Creates a one-time download token for the given VK bytes.
 ///
-/// Inserts the token into the store with the given TTL.
-/// Returns `(token, fingerprint)` — token is UUID v4, fingerprint is SHA-256 hex.
-pub fn create_token(store: &VkShareStore, vk_bytes: &[u8], ttl: Duration) -> (String, String) {
+/// Before inserting:
+/// 1. Evicts all expired entries from the store (SEC-H10-1a).
+/// 2. Checks if `store.len() >= max_tokens`; returns `Err(TooManyTokens)` if so (SEC-H10-1b).
+///
+/// Returns `Ok((token, fingerprint))` on success — token is UUID v4, fingerprint is SHA-256 hex.
+/// Returns `Err(VkShareError::TooManyTokens)` when the cap is reached after eviction.
+pub fn create_token(
+    store: &VkShareStore,
+    vk_bytes: &[u8],
+    ttl: Duration,
+    max_tokens: usize,
+) -> Result<(String, String), VkShareError> {
     let token = uuid::Uuid::new_v4().to_string();
     let vk_hex = hex_encode(vk_bytes);
     let fingerprint = sha256_hex(vk_bytes);
+
+    let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Step 1: evict all expired entries (SEC-H10-1a)
+    let now = Instant::now();
+    guard.retain(|_, v| v.expires_at > now);
+
+    // Step 2: enforce cap after eviction (SEC-H10-1b)
+    if guard.len() >= max_tokens {
+        return Err(VkShareError::TooManyTokens);
+    }
+
+    // Step 3: insert the new token
     let entry = VkShareEntry {
         vk_hex,
         fingerprint: fingerprint.clone(),
-        expires_at: Instant::now() + ttl,
+        expires_at: now + ttl,
         used: false,
     };
-    store
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(token.clone(), entry);
-    (token, fingerprint)
+    guard.insert(token.clone(), entry);
+
+    Ok((token, fingerprint))
 }
 
 /// Produces a raw HTTP/1.1 response for `GET /vk/:token`.
@@ -137,7 +167,13 @@ mod tests {
     fn create_token_returns_uuid_v4() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         let parsed = uuid::Uuid::parse_str(&token).expect("token must be a valid UUID");
         assert_eq!(parsed.get_version_num(), 4, "token must be UUID v4");
     }
@@ -146,7 +182,13 @@ mod tests {
     fn create_token_fingerprint_is_sha256_hex() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (_, fingerprint) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (_, fingerprint) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         assert_eq!(fingerprint.len(), 64, "fingerprint must be 64 hex chars");
         assert!(
             fingerprint
@@ -160,7 +202,13 @@ mod tests {
     fn create_token_inserted_in_store() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         assert!(
             store.lock().unwrap().contains_key(&token),
             "token must be present in store after create"
@@ -171,7 +219,13 @@ mod tests {
     fn vk_response_valid_token_returns_200() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         let response = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response).unwrap();
         assert!(
@@ -184,7 +238,13 @@ mod tests {
     fn vk_response_marks_token_used() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         let _ = vk_response(&token, &store, dummy_peer());
         let guard = store.lock().unwrap();
         let entry = guard
@@ -197,7 +257,13 @@ mod tests {
     fn vk_response_second_use_returns_410() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         let _ = vk_response(&token, &store, dummy_peer());
         let response2 = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response2).unwrap();
@@ -212,7 +278,13 @@ mod tests {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
         // TTL of 1 nanosecond — will be expired by the time we check
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_nanos(1));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_nanos(1),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(5));
         let response = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response).unwrap();
@@ -237,7 +309,13 @@ mod tests {
     fn vk_response_body_contains_correct_fields() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, expected_fp) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, expected_fp) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         let response = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response).unwrap();
         // Extract body (after the blank line between headers and body)
@@ -292,7 +370,13 @@ mod tests {
 
         // create_token must not panic — should recover via unwrap_or_else and insert the token
         let vk_bytes = dummy_vk_bytes();
-        let (token, _fingerprint) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _fingerprint) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
 
         // Token was actually inserted — recover from poison to inspect
         let guard = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -308,7 +392,13 @@ mod tests {
         let vk_bytes = dummy_vk_bytes();
 
         // Insert a token normally before poisoning
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
 
         // Poison the mutex
         let store_clone = Arc::clone(&store);
@@ -334,7 +424,13 @@ mod tests {
     fn vk_response_body_contains_only_vk_and_fingerprint_fields() {
         let store = new_store();
         let vk_bytes = dummy_vk_bytes();
-        let (token, _) = create_token(&store, &vk_bytes, Duration::from_secs(300));
+        let (token, _) = create_token(
+            &store,
+            &vk_bytes,
+            Duration::from_secs(300),
+            DEFAULT_TOKEN_MAX,
+        )
+        .unwrap();
         let response = vk_response(&token, &store, dummy_peer());
         let response_str = String::from_utf8(response).unwrap();
         let body_start = response_str
@@ -356,5 +452,94 @@ mod tests {
             "response must contain ONLY server_vk and fingerprint, got keys: {:?}",
             obj.keys().collect::<Vec<_>>()
         );
+    }
+
+    // ── H10: VK-share token cap + eviction tests ──────────────────────────────
+
+    #[test]
+    fn create_token_under_cap_succeeds() {
+        let store = new_store();
+        let vk_bytes = dummy_vk_bytes();
+        let result = create_token(&store, &vk_bytes, Duration::from_secs(300), 5);
+        assert!(result.is_ok(), "create_token under cap must succeed");
+    }
+
+    #[test]
+    fn create_token_at_cap_returns_too_many_tokens() {
+        let store = new_store();
+        let vk_bytes = dummy_vk_bytes();
+        let cap = 3;
+
+        // Fill up to cap
+        for _ in 0..cap {
+            create_token(&store, &vk_bytes, Duration::from_secs(300), cap).unwrap();
+        }
+
+        // Next insert must fail
+        let err = create_token(&store, &vk_bytes, Duration::from_secs(300), cap).unwrap_err();
+        assert_eq!(
+            err,
+            VkShareError::TooManyTokens,
+            "insert at cap must return TooManyTokens"
+        );
+    }
+
+    #[test]
+    fn create_token_evicts_expired_entries_before_cap_check() {
+        // Insert cap entries that have already expired, then insert one more.
+        // Eviction should purge the expired entries so the new insert succeeds.
+        let store = new_store();
+        let vk_bytes = dummy_vk_bytes();
+        let cap = 5;
+
+        // Insert `cap` tokens with 1 ns TTL (effectively instant expiry)
+        for _ in 0..cap {
+            create_token(&store, &vk_bytes, Duration::from_nanos(1), cap).unwrap();
+        }
+
+        // Wait long enough for the tokens to expire
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Now the store is "full" but all tokens are expired.
+        // A new insert must succeed after eviction.
+        let result = create_token(&store, &vk_bytes, Duration::from_secs(300), cap);
+        assert!(
+            result.is_ok(),
+            "create_token must succeed when all existing tokens are expired (evict-then-insert)"
+        );
+    }
+
+    #[test]
+    fn create_token_cap_enforced_after_eviction_with_live_tokens() {
+        // Insert cap tokens that will NOT expire, then try one more.
+        // After eviction (nothing to evict) the cap check must fire.
+        let store = new_store();
+        let vk_bytes = dummy_vk_bytes();
+        let cap = 4;
+
+        for _ in 0..cap {
+            create_token(&store, &vk_bytes, Duration::from_secs(300), cap).unwrap();
+        }
+
+        // Try to insert another — none expired, so cap still enforced.
+        let err = create_token(&store, &vk_bytes, Duration::from_secs(300), cap).unwrap_err();
+        assert_eq!(err, VkShareError::TooManyTokens);
+    }
+
+    #[test]
+    fn create_token_custom_cap_respected() {
+        let store = new_store();
+        let vk_bytes = dummy_vk_bytes();
+        let custom_cap = 2;
+
+        // Insert up to custom cap
+        for _ in 0..custom_cap {
+            create_token(&store, &vk_bytes, Duration::from_secs(300), custom_cap).unwrap();
+        }
+
+        // One more must fail
+        let err =
+            create_token(&store, &vk_bytes, Duration::from_secs(300), custom_cap).unwrap_err();
+        assert_eq!(err, VkShareError::TooManyTokens);
     }
 }

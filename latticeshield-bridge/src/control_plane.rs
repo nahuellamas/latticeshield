@@ -323,6 +323,7 @@ mod tests {
             ws_allowed_origins: Vec::new(),
             ws_handshake_timeout_secs: 10,
             ws_max_connections_per_ip: 100,
+            vk_share_max_tokens: 1000,
         }
     }
 

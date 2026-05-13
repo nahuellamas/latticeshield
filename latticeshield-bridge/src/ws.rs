@@ -21,6 +21,105 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::warn;
 
+// ── NormalizedOrigin ──────────────────────────────────────────────────────────
+
+/// A normalized `Origin` value in canonical `scheme://host:port` form.
+///
+/// Parsing rules (RFC 6454 / H7 spec):
+/// - Scheme must be `https` or `http` (lowercased). Anything else is rejected.
+/// - Host is lowercased.
+/// - Port is always stored explicitly (default: https→443, http→80).
+/// - Path, query, and fragment must be absent or just `/`. Non-trivial paths are rejected.
+///
+/// Note: WebSocket upgrade requests carry an `Origin` header using `https://` or `http://`
+/// regardless of whether the transport is `wss://` — this is correct per RFC 6454.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedOrigin {
+    normalized: String, // "scheme://host:port"
+}
+
+impl NormalizedOrigin {
+    /// Parse a string into a `NormalizedOrigin`.
+    ///
+    /// Returns `Err(String)` with a human-readable message when:
+    /// - The string is not a valid URL.
+    /// - The scheme is not `https` or `http`.
+    /// - The host is missing.
+    /// - A path other than `/` or fragment/query is present.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let url = url::Url::parse(s).map_err(|e| format!("invalid origin URL {:?}: {e}", s))?;
+
+        // Scheme must be https or http (case-insensitive input; url crate lowercases it)
+        let scheme = url.scheme();
+        if scheme != "https" && scheme != "http" {
+            return Err(format!(
+                "invalid origin {:?}: scheme must be 'https' or 'http', got '{scheme}'",
+                s
+            ));
+        }
+
+        // Host must be present
+        let host = url
+            .host_str()
+            .ok_or_else(|| format!("invalid origin {:?}: missing host", s))?
+            .to_lowercase();
+
+        // Path must be absent or just "/"
+        let path = url.path();
+        if !path.is_empty() && path != "/" {
+            return Err(format!(
+                "invalid origin {:?}: path component '{path}' must be absent (only '/' is allowed)",
+                s
+            ));
+        }
+
+        // Query and fragment must be absent
+        if url.query().is_some() {
+            return Err(format!(
+                "invalid origin {:?}: query component must be absent",
+                s
+            ));
+        }
+        if url.fragment().is_some() {
+            return Err(format!(
+                "invalid origin {:?}: fragment component must be absent",
+                s
+            ));
+        }
+
+        // Port: use explicit port or default for scheme
+        let port = match url.port() {
+            Some(p) => p,
+            None => {
+                if scheme == "https" {
+                    443
+                } else {
+                    80
+                }
+            }
+        };
+
+        let normalized = format!("{scheme}://{host}:{port}");
+        Ok(Self { normalized })
+    }
+
+    /// Return the normalized canonical string (`scheme://host:port`).
+    pub fn as_str(&self) -> &str {
+        &self.normalized
+    }
+
+    /// Check whether an incoming `Origin` header string matches this normalized origin.
+    ///
+    /// The header value is parsed with the same normalization rules. Returns `false`
+    /// if the header cannot be parsed.
+    pub fn matches_header(&self, header: &str) -> bool {
+        match Self::parse(header) {
+            Ok(parsed) => parsed.normalized == self.normalized,
+            Err(_) => false,
+        }
+    }
+}
+
 /// Shared per-IP connection counter.
 pub type IpCounterMap = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
@@ -171,9 +270,11 @@ where
 /// Tungstenite server callback that validates the `Origin` header.
 ///
 /// If `allowed_origins` is empty, all origins are accepted (development mode).
-/// If non-empty, only requests whose `Origin` matches one of the listed values pass.
+/// If non-empty, only requests whose `Origin` normalizes to one of the allowed
+/// values pass. Both the allowlist and incoming header are normalized using
+/// `NormalizedOrigin` before comparison (SEC-H7-1, SEC-H7-2).
 pub struct OriginCheck {
-    pub allowed_origins: Vec<String>,
+    pub allowed_origins: Vec<NormalizedOrigin>,
 }
 
 impl Callback for OriginCheck {
@@ -181,15 +282,32 @@ impl Callback for OriginCheck {
         if self.allowed_origins.is_empty() {
             return Ok(response);
         }
-        let origin = request
+
+        let origin_header = request
             .headers()
             .get("Origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if self.allowed_origins.iter().any(|o| o == origin) {
+            .and_then(|v| v.to_str().ok());
+
+        let origin_str = match origin_header {
+            Some(s) => s,
+            None => {
+                warn!("WS: origin rejected: missing Origin header");
+                let mut err_response = ErrorResponse::new(None);
+                *err_response.status_mut() = StatusCode::FORBIDDEN;
+                return Err(err_response);
+            }
+        };
+
+        // Parse incoming header with normalized form and compare
+        let matches = self
+            .allowed_origins
+            .iter()
+            .any(|o| o.matches_header(origin_str));
+
+        if matches {
             Ok(response)
         } else {
-            warn!("WS: origin rejected: {:?}", origin);
+            warn!("WS: origin rejected: {:?}", origin_str);
             let mut err_response = ErrorResponse::new(None);
             *err_response.status_mut() = StatusCode::FORBIDDEN;
             Err(err_response)
@@ -227,6 +345,114 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ── NormalizedOrigin unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn normalized_origin_valid_https() {
+        let o = NormalizedOrigin::parse("https://example.com").unwrap();
+        assert_eq!(o.as_str(), "https://example.com:443");
+    }
+
+    #[test]
+    fn normalized_origin_explicit_port_same_as_default() {
+        // https://example.com and https://example.com:443 must be equal
+        let a = NormalizedOrigin::parse("https://example.com").unwrap();
+        let b = NormalizedOrigin::parse("https://example.com:443").unwrap();
+        assert_eq!(a, b, "default-port omission must normalize to same form");
+    }
+
+    #[test]
+    fn normalized_origin_http_default_port() {
+        let o = NormalizedOrigin::parse("http://localhost:8080").unwrap();
+        assert_eq!(o.as_str(), "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalized_origin_http_default_80() {
+        let o = NormalizedOrigin::parse("http://example.com").unwrap();
+        assert_eq!(o.as_str(), "http://example.com:80");
+    }
+
+    #[test]
+    fn normalized_origin_rejects_bare_hostname() {
+        // No scheme — must fail at parse time (SEC-H7-1d)
+        let err = NormalizedOrigin::parse("example.com").unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "bare hostname (no scheme) must produce a parse error"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_rejects_wrong_scheme() {
+        let err = NormalizedOrigin::parse("ftp://example.com").unwrap_err();
+        assert!(
+            err.contains("scheme"),
+            "wrong scheme must produce a scheme-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_rejects_trailing_path() {
+        let err = NormalizedOrigin::parse("https://example.com/foo").unwrap_err();
+        assert!(
+            err.contains("path"),
+            "trailing path must produce a path-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_rejects_query_string() {
+        let err = NormalizedOrigin::parse("https://example.com?x=1").unwrap_err();
+        assert!(
+            err.contains("query"),
+            "query component must produce an error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_host_case_insensitive() {
+        // SEC-H7-1b: scheme and host must be case-insensitive
+        let a = NormalizedOrigin::parse("https://FOO.COM").unwrap();
+        let b = NormalizedOrigin::parse("https://foo.com").unwrap();
+        assert_eq!(
+            a, b,
+            "host comparison must be case-insensitive (both normalize to lowercase)"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_matches_header_with_default_port() {
+        // Config entry without explicit port must match header with explicit default port
+        let allowed = NormalizedOrigin::parse("https://foo.com").unwrap();
+        assert!(
+            allowed.matches_header("https://foo.com:443"),
+            "https://foo.com should match https://foo.com:443"
+        );
+        assert!(
+            allowed.matches_header("https://foo.com"),
+            "https://foo.com should match itself"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_matches_header_rejects_different_host() {
+        let allowed = NormalizedOrigin::parse("https://good.com").unwrap();
+        assert!(
+            !allowed.matches_header("https://evil.com"),
+            "different host must not match"
+        );
+    }
+
+    #[test]
+    fn normalized_origin_matches_header_rejects_unparseable() {
+        let allowed = NormalizedOrigin::parse("https://good.com").unwrap();
+        assert!(
+            !allowed.matches_header("%%%invalid%%%"),
+            "unparseable header must not match"
+        );
+    }
 
     // ── IpCountGuard unit tests ───────────────────────────────────────────────
 

@@ -78,6 +78,7 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         ws_allowed_origins: Vec::new(),
         ws_handshake_timeout_secs: 10,
         ws_max_connections_per_ip: 100,
+        vk_share_max_tokens: 1000,
     }
 }
 
@@ -1058,6 +1059,7 @@ async fn admin_channel_get_metrics_full_handshake() {
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
             cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vk_share_max_tokens: 1000,
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
@@ -1151,6 +1153,7 @@ async fn admin_channel_wrong_client_sk_rejected() {
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
             cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vk_share_max_tokens: 1000,
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
@@ -1229,6 +1232,7 @@ async fn admin_channel_rotate_full_handshake() {
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
             cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vk_share_max_tokens: 1000,
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,
@@ -1312,6 +1316,7 @@ async fn admin_channel_get_vk_token_full_handshake() {
             prometheus_handle,
             tls_base_url: "https://127.0.0.1:8440".to_string(),
             cmd_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vk_share_max_tokens: 1000,
         },
         crate::admin::AdminListenerConfig {
             rate_limit_per_second: 100,

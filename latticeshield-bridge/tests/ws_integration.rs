@@ -88,6 +88,7 @@ fn make_config(backend_port: u16) -> ValidConfig {
         ws_allowed_origins: vec![],
         ws_handshake_timeout_secs: 5,
         ws_max_connections_per_ip: 10,
+        vk_share_max_tokens: 1000,
     }
 }
 
@@ -229,11 +230,12 @@ async fn ws_full_pqc_handshake_session_key_derived() {
 /// Verifies OriginCheck::on_request returns Err with 403 for non-whitelisted origins.
 #[test]
 fn origin_check_rejects_unknown_origin() {
+    use latticeshield_bridge::ws::NormalizedOrigin;
     use tokio_tungstenite::tungstenite::handshake::server::Callback;
     use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest};
 
     let check = OriginCheck {
-        allowed_origins: vec!["https://allowed.example.com".to_string()],
+        allowed_origins: vec![NormalizedOrigin::parse("https://allowed.example.com").unwrap()],
     };
 
     // Build a minimal HTTP upgrade request with a different origin.
@@ -258,10 +260,11 @@ fn origin_check_rejects_unknown_origin() {
 /// Verifies OriginCheck::on_request accepts a whitelisted origin.
 #[test]
 fn origin_check_accepts_allowed_origin() {
+    use latticeshield_bridge::ws::NormalizedOrigin;
     use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest};
 
     let check = OriginCheck {
-        allowed_origins: vec!["https://allowed.example.com".to_string()],
+        allowed_origins: vec![NormalizedOrigin::parse("https://allowed.example.com").unwrap()],
     };
 
     let mut req = HttpRequest::new(());
@@ -282,7 +285,7 @@ fn origin_check_empty_list_accepts_any() {
     use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest};
 
     let check = OriginCheck {
-        allowed_origins: vec![],
+        allowed_origins: Vec::new(),
     };
 
     let mut req = HttpRequest::new(());
@@ -297,6 +300,64 @@ fn origin_check_empty_list_accepts_any() {
     assert!(
         result.is_ok(),
         "empty allowed list should accept any origin"
+    );
+}
+
+// ── 8.2b  NormalizedOrigin matching integration (H7) ─────────────────────────
+
+/// Verifies that an allowed origin with implicit port matches an explicit default-port header (H7).
+#[test]
+fn origin_check_accepts_default_port_equivalent() {
+    use latticeshield_bridge::ws::NormalizedOrigin;
+    use tokio_tungstenite::tungstenite::handshake::server::Callback;
+    use tokio_tungstenite::tungstenite::http::{HeaderValue, Request as HttpRequest};
+
+    // Config entry without explicit port
+    let check = OriginCheck {
+        allowed_origins: vec![NormalizedOrigin::parse("https://app.example.com").unwrap()],
+    };
+
+    // Header has explicit :443 — must match the normalized entry
+    let mut req = HttpRequest::new(());
+    req.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://app.example.com:443"),
+    );
+    let ws_request = Request::from(req);
+    let ok_response = Response::new(());
+
+    let result = check.on_request(&ws_request, ok_response);
+    assert!(
+        result.is_ok(),
+        "https://app.example.com:443 must match allowed https://app.example.com (default port)"
+    );
+}
+
+/// Verifies that a missing Origin header is rejected when allowed_origins is non-empty (H7).
+#[test]
+fn origin_check_rejects_missing_origin_header() {
+    use latticeshield_bridge::ws::NormalizedOrigin;
+    use tokio_tungstenite::tungstenite::handshake::server::Callback;
+    use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
+
+    let check = OriginCheck {
+        allowed_origins: vec![NormalizedOrigin::parse("https://app.example.com").unwrap()],
+    };
+
+    // No Origin header at all
+    let req = HttpRequest::new(());
+    let ws_request = Request::from(req);
+    let ok_response = Response::new(());
+
+    let result = check.on_request(&ws_request, ok_response);
+    assert!(
+        result.is_err(),
+        "missing Origin header must be rejected when allowed_origins is non-empty"
+    );
+    assert_eq!(
+        result.unwrap_err().status(),
+        StatusCode::FORBIDDEN,
+        "missing Origin must return 403"
     );
 }
 

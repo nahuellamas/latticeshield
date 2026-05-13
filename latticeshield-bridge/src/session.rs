@@ -26,7 +26,7 @@ use rand_core::{OsRng, RngCore};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::watch,
-    time::MissedTickBehavior,
+    time::{self, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
 
@@ -48,7 +48,26 @@ pub async fn handle<T>(
     peer: SocketAddr,
     ctx: SessionContext,
     config: ValidConfig,
+    shutdown_rx: tokio::sync::watch::Receiver<()>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let handshake_timeout = std::time::Duration::from_secs(config.ws_handshake_timeout_secs);
+    handle_with_handshake_timeout(client, peer, ctx, config, shutdown_rx, handshake_timeout).await
+}
+
+/// Inner implementation that accepts an explicit `handshake_timeout` (SEC-H12-1).
+///
+/// The timeout is applied ONLY around the PQC handshake phase (write ServerHello +
+/// read ClientResponse). The relay loop runs without a session-level upper bound.
+pub async fn handle_with_handshake_timeout<T>(
+    client: T,
+    peer: SocketAddr,
+    ctx: SessionContext,
+    config: ValidConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    handshake_timeout: std::time::Duration,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -65,53 +84,74 @@ where
     // for both the handshake phase and the relay loop below.
     let (mut client_r, mut client_w) = tokio::io::split(client);
 
-    let t_handshake = Instant::now();
-    let server = ServerHandshake::new(&mut OsRng);
+    // Wrap ONLY the handshake (ServerHello send + ClientResponse read) in a timeout.
+    // The relay loop is intentionally NOT wrapped (SEC-H12-1c).
+    let t_handshake_start = Instant::now();
+    let handshake_result = time::timeout(handshake_timeout, async {
+        let server = ServerHandshake::new(&mut OsRng);
 
-    // Firma el ServerHello con la clave de largo plazo — VK pre-shared en el cliente
-    let hello_bytes = server
-        .server_hello_signed_bytes(&ctx.identity.signing_key, &mut OsRng)
-        .context("firma del ServerHello")?;
+        // Firma el ServerHello con la clave de largo plazo — VK pre-shared en el cliente
+        let hello_bytes = server
+            .server_hello_signed_bytes(&ctx.identity.signing_key, &mut OsRng)
+            .context("firma del ServerHello")?;
 
-    client_w
-        .write_all(&hello_bytes)
-        .await
-        .context("envio ServerHello firmado")?;
-    client_w
-        .flush()
-        .await
-        .context("flush ServerHello firmado")?;
-    debug!(%peer, "ServerHello firmado enviado ({} bytes)", SERVER_HELLO_SIGNED_LEN);
+        client_w
+            .write_all(&hello_bytes)
+            .await
+            .context("envio ServerHello firmado")?;
+        client_w
+            .flush()
+            .await
+            .context("flush ServerHello firmado")?;
+        debug!(%peer, "ServerHello firmado enviado ({} bytes)", SERVER_HELLO_SIGNED_LEN);
 
-    let session_key = match &ctx.client_auth {
-        Some(client_identity) => {
-            let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
-            client_r
-                .read_exact(&mut buf)
-                .await
-                .context("lectura ClientResponse firmado")?;
-            debug!(%peer, "ClientResponse firmado recibido ({} bytes)", CLIENT_RESPONSE_SIGNED_LEN);
-            server
-                .complete_from_wire_signed(&buf, &client_identity.verifying_key)
-                .map_err(|e| {
-                    warn!(%peer, "autenticacion del cliente fallida: {e}");
-                    anyhow::anyhow!("client authentication failed: {e}")
-                })?
+        let session_key = match &ctx.client_auth {
+            Some(client_identity) => {
+                let mut buf = [0u8; CLIENT_RESPONSE_SIGNED_LEN];
+                client_r
+                    .read_exact(&mut buf)
+                    .await
+                    .context("lectura ClientResponse firmado")?;
+                debug!(%peer, "ClientResponse firmado recibido ({} bytes)", CLIENT_RESPONSE_SIGNED_LEN);
+                server
+                    .complete_from_wire_signed(&buf, &client_identity.verifying_key)
+                    .map_err(|e| {
+                        warn!(%peer, "autenticacion del cliente fallida: {e}");
+                        anyhow::anyhow!("client authentication failed: {e}")
+                    })?
+            }
+            None => {
+                let mut buf = [0u8; CLIENT_RESPONSE_LEN];
+                client_r
+                    .read_exact(&mut buf)
+                    .await
+                    .context("lectura ClientResponse")?;
+                debug!(%peer, "ClientResponse recibido ({} bytes)", CLIENT_RESPONSE_LEN);
+                server
+                    .complete_from_wire(&buf)
+                    .context("handshake PQC fallido")?
+            }
+        };
+
+        Ok::<_, anyhow::Error>(session_key)
+    })
+    .await;
+
+    let session_key = match handshake_result {
+        Err(_elapsed) => {
+            warn!(
+                %peer,
+                "handshake timeout after {}s — closing connection",
+                handshake_timeout.as_secs()
+            );
+            return Ok(());
         }
-        None => {
-            let mut buf = [0u8; CLIENT_RESPONSE_LEN];
-            client_r
-                .read_exact(&mut buf)
-                .await
-                .context("lectura ClientResponse")?;
-            debug!(%peer, "ClientResponse recibido ({} bytes)", CLIENT_RESPONSE_LEN);
-            server
-                .complete_from_wire(&buf)
-                .context("handshake PQC fallido")?
-        }
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(key)) => key,
     };
+
     metrics::histogram!(crate::metrics::HANDSHAKE_DURATION)
-        .record(t_handshake.elapsed().as_secs_f64());
+        .record(t_handshake_start.elapsed().as_secs_f64());
     info!(%peer, "handshake PQC completado — canal cifrado activo");
 
     // ── 2. Canal cifrado ─────────────────────────────────────────────────────

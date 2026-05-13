@@ -421,9 +421,12 @@ pub struct ValidConfig {
     pub ws_listen_addr: SocketAddr,
     pub ws_cert_path: PathBuf, // only meaningful when ws_enabled = true
     pub ws_key_path: PathBuf,  // only meaningful when ws_enabled = true
-    pub ws_allowed_origins: Vec<String>,
+    pub ws_allowed_origins: Vec<crate::ws::NormalizedOrigin>,
     pub ws_handshake_timeout_secs: u64,
     pub ws_max_connections_per_ip: u32,
+    /// Maximum number of active VK-share tokens in the in-memory store.
+    /// Controlled by env var `LATTICE_VK_TOKEN_MAX` (default 1000).
+    pub vk_share_max_tokens: usize,
 }
 
 impl std::fmt::Debug for ValidConfig {
@@ -478,9 +481,17 @@ impl std::fmt::Debug for ValidConfig {
             .field("ws_listen_addr", &self.ws_listen_addr)
             .field("ws_cert_path", &self.ws_cert_path)
             .field("ws_key_path", &self.ws_key_path)
-            .field("ws_allowed_origins", &self.ws_allowed_origins)
+            .field(
+                "ws_allowed_origins",
+                &self
+                    .ws_allowed_origins
+                    .iter()
+                    .map(|o| o.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .field("ws_handshake_timeout_secs", &self.ws_handshake_timeout_secs)
             .field("ws_max_connections_per_ip", &self.ws_max_connections_per_ip)
+            .field("vk_share_max_tokens", &self.vk_share_max_tokens)
             .finish()
     }
 }
@@ -761,6 +772,41 @@ impl Config {
             }
         }
 
+        // ── Parse ws_allowed_origins into NormalizedOrigin ───────────────────
+        let ws_allowed_origins: Vec<crate::ws::NormalizedOrigin> = self
+            .websocket
+            .allowed_origins
+            .iter()
+            .map(|s| {
+                crate::ws::NormalizedOrigin::parse(s).map_err(|e| {
+                    anyhow::anyhow!("invalid websocket.allowed_origins entry {:?}: {}", s, e)
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // ── VK-share token cap (SEC-H10-1c) ──────────────────────────────────
+        let vk_share_max_tokens = match std::env::var("LATTICE_VK_TOKEN_MAX") {
+            Ok(val) if !val.is_empty() => match val.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                Ok(_) => {
+                    tracing::warn!(
+                        "LATTICE_VK_TOKEN_MAX=0 is invalid — using default {}",
+                        crate::vk_share::DEFAULT_TOKEN_MAX
+                    );
+                    crate::vk_share::DEFAULT_TOKEN_MAX
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "LATTICE_VK_TOKEN_MAX={:?} is not a valid usize — using default {}",
+                        val,
+                        crate::vk_share::DEFAULT_TOKEN_MAX
+                    );
+                    crate::vk_share::DEFAULT_TOKEN_MAX
+                }
+            },
+            _ => crate::vk_share::DEFAULT_TOKEN_MAX,
+        };
+
         // ── Graceful shutdown timeout ────────────────────────────────────────
         let shutdown_timeout_secs = std::env::var("SHUTDOWN_TIMEOUT_SECS")
             .ok()
@@ -805,9 +851,10 @@ impl Config {
             ws_listen_addr,
             ws_cert_path: self.websocket.cert_path.unwrap_or_default(),
             ws_key_path: self.websocket.key_path.unwrap_or_default(),
-            ws_allowed_origins: self.websocket.allowed_origins,
+            ws_allowed_origins,
             ws_handshake_timeout_secs: self.websocket.handshake_timeout_secs,
             ws_max_connections_per_ip: self.websocket.max_connections_per_ip,
+            vk_share_max_tokens,
         })
     }
 }
@@ -1464,6 +1511,7 @@ handshake_timeout_secs = 30
             ws_allowed_origins: Vec::new(),
             ws_handshake_timeout_secs: 10,
             ws_max_connections_per_ip: 100,
+            vk_share_max_tokens: 1000,
         };
 
         let debug_str = format!("{cfg:?}");
@@ -1509,9 +1557,10 @@ max_connections_per_ip = 50
         assert_eq!(cfg.ws_listen_addr.to_string(), "127.0.0.1:8446");
         assert_eq!(cfg.ws_cert_path, PathBuf::from("./keys/ws.crt"));
         assert_eq!(cfg.ws_key_path, PathBuf::from("./keys/ws.key"));
+        assert_eq!(cfg.ws_allowed_origins.len(), 1);
         assert_eq!(
-            cfg.ws_allowed_origins,
-            vec!["https://app.example.com".to_string()]
+            cfg.ws_allowed_origins[0].as_str(),
+            "https://app.example.com:443"
         );
         assert_eq!(cfg.ws_handshake_timeout_secs, 20);
         assert_eq!(cfg.ws_max_connections_per_ip, 50);
