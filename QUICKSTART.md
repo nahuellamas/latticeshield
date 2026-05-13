@@ -2,10 +2,17 @@
 
 Get LatticeShield running between two servers in under 10 minutes.
 
+LatticeShield protects any TCP connection between two machines. The typical setup is:
+
+- **Backend server** — runs `latticeshield-bridge` next to your API (e.g. a Node.js server, a Rust service, a database proxy)
+- **Client server** — runs `latticeshield-client` next to whatever needs to talk to that API (e.g. a frontend server, another microservice, a worker)
+
+The two machines could be a frontend + backend, two microservices, two cloud VMs, or a local dev machine talking to a staging API. What matters is that they can reach each other over the network.
+
 ## What you need
 
 - Two Linux or macOS machines (or VMs) that can reach each other over the network
-- A backend service already running on the **backend server** (e.g. an API on `127.0.0.1:8080`)
+- A service already running on the **backend machine** that listens on a local port (e.g. an API on `127.0.0.1:8080`)
 
 ---
 
