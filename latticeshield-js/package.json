@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "description": "Browser SDK for LatticeShield PQC bridge — PQCSession + usePQCSession React hook",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "private": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
