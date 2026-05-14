@@ -59,7 +59,7 @@ require_client_auth = false  # set to true once you have a client VK
 ## Step 4 — Start the bridge
 
 ```sh
-latticeshield-bridge --config config.toml
+latticeshield-bridge run --config config.toml
 ```
 
 You should see:
@@ -91,7 +91,7 @@ scp backend-server:./keys/server.vk ./keys/server.vk
 Create `client.toml` on the frontend server:
 
 ```toml
-[server]
+[client]
 listen_addr  = "127.0.0.1:9090"
 bridge_addr  = "<backend-server-ip>:8443"
 server_vk_path = "./keys/server.vk"
