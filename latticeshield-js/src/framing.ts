@@ -51,8 +51,10 @@ export interface SessionKey {
 /**
  * Derives a deterministic 12-byte AES-GCM nonce from a u64 sequence number.
  *
- * Layout: [0x00 0x00 0x00 0x00][seq as 8B big-endian]
+ * Layout: [seq as 8B big-endian (bytes 0-7)][0x00 0x00 0x00 0x00 (epoch=0, bytes 8-11)]
  *
+ * Matches the Rust EncryptedChannel wire format: nonce[0..8] = seq_be, nonce[8..12] = epoch_be.
+ * epoch is always 0 on session start; the JS SDK does not track epoch across KEY_ROTATE.
  * This matches EC-7 (deterministic nonce derived from seq) and avoids the
  * birthday problem that random nonces would introduce with AES-GCM.
  */
@@ -62,8 +64,8 @@ export function seqToNonce(seq: bigint): Uint8Array {
   }
   const nonce = new Uint8Array(12);
   const view = new DataView(nonce.buffer);
-  // Offset 4: seq as 8B big-endian in the last 8 bytes of the 12B nonce
-  view.setBigUint64(4, seq, false);
+  // Bytes 0-7: seq as 8B big-endian (matches Rust nonce layout)
+  view.setBigUint64(0, seq, false);
   return nonce;
 }
 

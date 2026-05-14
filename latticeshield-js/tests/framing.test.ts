@@ -64,40 +64,39 @@ describe('seqToNonce', () => {
     expect(Array.from(nonce)).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
   });
 
-  it('seq=1 is at offset 4..12 in big-endian', () => {
+  it('seq=1 is at offset 0..8 in big-endian (matches Rust layout)', () => {
     const nonce = seqToNonce(1n);
-    // First 4 bytes: 0x00 0x00 0x00 0x00
+    // Bytes 0-7: seq big-endian → 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x01
     expect(nonce[0]).toBe(0);
-    expect(nonce[1]).toBe(0);
-    expect(nonce[2]).toBe(0);
-    expect(nonce[3]).toBe(0);
-    // Bytes 4..11: 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x01
-    expect(nonce[4]).toBe(0);
-    expect(nonce[11]).toBe(1);
+    expect(nonce[6]).toBe(0);
+    expect(nonce[7]).toBe(1);
+    // Bytes 8-11: epoch=0
+    expect(nonce[8]).toBe(0);
+    expect(nonce[11]).toBe(0);
   });
 
   it('seq=0x0102030405060708n encodes correctly', () => {
     const nonce = seqToNonce(0x0102030405060708n);
-    // Prefix: 4 zero bytes
-    expect(nonce[0]).toBe(0);
-    expect(nonce[3]).toBe(0);
-    // Bytes 4..11: 01 02 03 04 05 06 07 08
-    expect(nonce[4]).toBe(0x01);
-    expect(nonce[5]).toBe(0x02);
-    expect(nonce[6]).toBe(0x03);
-    expect(nonce[7]).toBe(0x04);
-    expect(nonce[8]).toBe(0x05);
-    expect(nonce[9]).toBe(0x06);
-    expect(nonce[10]).toBe(0x07);
-    expect(nonce[11]).toBe(0x08);
+    // Bytes 0-7: seq big-endian → 01 02 03 04 05 06 07 08
+    expect(nonce[0]).toBe(0x01);
+    expect(nonce[1]).toBe(0x02);
+    expect(nonce[2]).toBe(0x03);
+    expect(nonce[3]).toBe(0x04);
+    expect(nonce[4]).toBe(0x05);
+    expect(nonce[5]).toBe(0x06);
+    expect(nonce[6]).toBe(0x07);
+    expect(nonce[7]).toBe(0x08);
+    // Bytes 8-11: epoch=0
+    expect(nonce[8]).toBe(0);
+    expect(nonce[11]).toBe(0);
   });
 
   it('seq=Number.MAX_SAFE_INTEGER as BigInt encodes without precision loss', () => {
     const maxSafe = BigInt(Number.MAX_SAFE_INTEGER); // 2^53 - 1
     const nonce = seqToNonce(maxSafe);
-    // 2^53 - 1 = 0x001FFFFFFFFFFFFF
+    // 2^53 - 1 = 0x001FFFFFFFFFFFFF — seq at bytes 0-7
     const view = new DataView(nonce.buffer);
-    const readBack = view.getBigUint64(4, false);
+    const readBack = view.getBigUint64(0, false);
     expect(readBack).toBe(maxSafe);
   });
 
@@ -136,10 +135,13 @@ describe('seqToNonce overflow guard', () => {
 
   it('seq=MAX_U64 is accepted (upper boundary)', () => {
     expect(() => seqToNonce(MAX_U64)).not.toThrow();
-    // MAX_U64 = 0xFFFFFFFFFFFFFFFF — last 8 bytes of nonce are all 0xFF
+    // MAX_U64 = 0xFFFFFFFFFFFFFFFF — bytes 0-7 all 0xFF, bytes 8-11 (epoch) all 0x00
     const nonce = seqToNonce(MAX_U64);
-    for (let i = 4; i < 12; i++) {
+    for (let i = 0; i < 8; i++) {
       expect(nonce[i]).toBe(0xff);
+    }
+    for (let i = 8; i < 12; i++) {
+      expect(nonce[i]).toBe(0x00);
     }
   });
 

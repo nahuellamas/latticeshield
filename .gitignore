@@ -17,6 +17,7 @@ latticeshield-js/.vite/
 # AI tooling — internal, not for contributors
 .engram/
 .atl/
+.mcp.json
 latticeshield-wasm/pkg/
 
 # Internal development notes
