@@ -24,3 +24,6 @@ latticeshield-wasm/pkg/
 # Internal development notes
 docs.md
 .claude
+
+# Local E2E test harness (requires running bridge + backend)
+e2e/
