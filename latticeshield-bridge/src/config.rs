@@ -43,6 +43,12 @@ pub struct ServerConfig {
     pub backend_addr: String,
     #[serde(default = "default_max_frame_size")]
     pub max_frame_size: usize,
+    /// Maximum seconds to wait for the PQC TCP handshake to complete.
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Maximum concurrent PQC TCP connections per source IP.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +57,8 @@ impl Default for ServerConfig {
             listen_addr: default_listen_addr(),
             backend_addr: default_backend_addr(),
             max_frame_size: default_max_frame_size(),
+            handshake_timeout_secs: default_handshake_timeout_secs(),
+            max_connections_per_ip: default_max_connections_per_ip(),
         }
     }
 }
@@ -171,6 +179,13 @@ fn default_ws_handshake_timeout_secs() -> u64 {
 }
 fn default_ws_max_connections_per_ip() -> u32 {
     100
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    10
+}
+fn default_max_connections_per_ip() -> u32 {
+    50
 }
 
 // ── AdminConfig ────────────────────────────────────────────────────────────────
@@ -385,6 +400,8 @@ pub struct ValidConfig {
     pub backend_addr: SocketAddr,
     pub metrics_addr: SocketAddr,
     pub max_frame_size: usize,
+    pub handshake_timeout_secs: u64,
+    pub max_connections_per_ip: u32,
     pub signing_key_path: PathBuf,
     pub log_level: String,
     pub control_plane_enabled: bool,
@@ -436,6 +453,8 @@ impl std::fmt::Debug for ValidConfig {
             .field("backend_addr", &self.backend_addr)
             .field("metrics_addr", &self.metrics_addr)
             .field("max_frame_size", &self.max_frame_size)
+            .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("max_connections_per_ip", &self.max_connections_per_ip)
             .field("signing_key_path", &self.signing_key_path)
             .field("log_level", &self.log_level)
             .field("control_plane_enabled", &self.control_plane_enabled)
@@ -535,6 +554,17 @@ impl Config {
                 "server.max_frame_size must be between 1024 and 16777216 (16 MiB), got {}",
                 self.server.max_frame_size
             );
+        }
+
+        if self.server.handshake_timeout_secs < 1 {
+            anyhow::bail!(
+                "server.handshake_timeout_secs must be at least 1, got {}",
+                self.server.handshake_timeout_secs
+            );
+        }
+
+        if self.server.max_connections_per_ip == 0 {
+            anyhow::bail!("server.max_connections_per_ip must be at least 1");
         }
 
         if self.crypto.signing_key_path.as_os_str().is_empty() {
@@ -819,6 +849,8 @@ impl Config {
             backend_addr,
             metrics_addr,
             max_frame_size: self.server.max_frame_size,
+            handshake_timeout_secs: self.server.handshake_timeout_secs,
+            max_connections_per_ip: self.server.max_connections_per_ip,
             signing_key_path: self.crypto.signing_key_path,
             log_level: self.logging.level,
             control_plane_enabled,
@@ -1478,6 +1510,8 @@ handshake_timeout_secs = 30
             backend_addr: "127.0.0.1:8080".parse().unwrap(),
             metrics_addr: "127.0.0.1:8444".parse().unwrap(),
             max_frame_size: 65536,
+            handshake_timeout_secs: 10,
+            max_connections_per_ip: 50,
             signing_key_path: PathBuf::from("./keys/server.sk"),
             log_level: "info".to_string(),
             control_plane_enabled: false,
@@ -1631,6 +1665,55 @@ max_connections_per_ip = 50
         // enabled=false with colliding addr and no cert → no error
         let f = write_toml("[websocket]\nenabled = false\nlisten_addr = \"0.0.0.0:8443\"\n");
         Config::load(f.path()).unwrap();
+    }
+
+    // ── handshake_timeout_secs + max_connections_per_ip tests (SEC-OBS3/OBS4) ──
+
+    #[test]
+    fn tcp_handshake_timeout_default_is_10() {
+        let f = write_toml("[server]\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.handshake_timeout_secs, 10,
+            "server.handshake_timeout_secs default must be 10"
+        );
+    }
+
+    #[test]
+    fn tcp_handshake_timeout_custom_accepted() {
+        let f = write_toml("[server]\nhandshake_timeout_secs = 30\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(cfg.handshake_timeout_secs, 30);
+    }
+
+    #[test]
+    fn tcp_handshake_timeout_zero_rejected() {
+        let f = write_toml("[server]\nhandshake_timeout_secs = 0\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("handshake_timeout_secs"),
+            "error should reference handshake_timeout_secs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn tcp_max_connections_per_ip_default_is_50() {
+        let f = write_toml("[server]\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.max_connections_per_ip, 50,
+            "server.max_connections_per_ip default must be 50"
+        );
+    }
+
+    #[test]
+    fn tcp_max_connections_per_ip_zero_rejected() {
+        let f = write_toml("[server]\nmax_connections_per_ip = 0\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("max_connections_per_ip"),
+            "error should reference max_connections_per_ip, got: {err}"
+        );
     }
 
     // ── shutdown_timeout env-var tests ────────────────────────────────────────

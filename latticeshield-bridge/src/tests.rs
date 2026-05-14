@@ -45,6 +45,8 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         backend_addr,
         metrics_addr: "127.0.0.1:0".parse().unwrap(),
         max_frame_size: MAX_FRAME,
+        handshake_timeout_secs: 10,
+        max_connections_per_ip: 50,
         signing_key_path: std::path::PathBuf::from("./keys/server.sk"),
         log_level: "info".to_string(),
         control_plane_enabled: false,

@@ -55,6 +55,8 @@ fn make_config(backend_port: u16) -> ValidConfig {
         backend_addr: format!("127.0.0.1:{backend_port}").parse().unwrap(),
         metrics_addr: "127.0.0.1:9000".parse().unwrap(),
         max_frame_size: 65536,
+        handshake_timeout_secs: 10,
+        max_connections_per_ip: 50,
         signing_key_path: dummy_path.clone(),
         log_level: "error".to_string(),
         control_plane_enabled: false,

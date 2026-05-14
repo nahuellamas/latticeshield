@@ -290,6 +290,8 @@ mod tests {
             backend_addr: "127.0.0.1:8080".parse().unwrap(),
             metrics_addr: "127.0.0.1:8444".parse().unwrap(),
             max_frame_size: 65536,
+            handshake_timeout_secs: 10,
+            max_connections_per_ip: 50,
             signing_key_path: std::path::PathBuf::from("./keys/server.sk"),
             log_level: "info".to_string(),
             control_plane_enabled: true,

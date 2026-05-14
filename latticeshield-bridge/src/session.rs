@@ -53,7 +53,7 @@ pub async fn handle<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let handshake_timeout = std::time::Duration::from_secs(config.ws_handshake_timeout_secs);
+    let handshake_timeout = std::time::Duration::from_secs(config.handshake_timeout_secs);
     handle_with_handshake_timeout(client, peer, ctx, config, shutdown_rx, handshake_timeout).await
 }
 

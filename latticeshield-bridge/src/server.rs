@@ -7,7 +7,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{extract::State, http::header::CONTENT_TYPE, response::IntoResponse, routing::get};
+use axum::{
+    extract::State,
+    http::header::{
+        CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS,
+        X_FRAME_OPTIONS,
+    },
+    response::IntoResponse,
+    routing::get,
+};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -188,6 +196,11 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "LatticeShield escuchando");
     info!(backend = %config.backend_addr, "backend configurado");
+    info!(
+        timeout_secs = config.handshake_timeout_secs,
+        max_per_ip = config.max_connections_per_ip,
+        "PQC TCP listener limits"
+    );
 
     // ── Control plane heartbeat task (non-blocking, optional) ────────────────
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<BridgeCommand>(32);
@@ -230,6 +243,9 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
     };
 
     // ── 5.4: Main PQC accept loop with shutdown select ──────────────────────
+    let tcp_ip_counter: ws::IpCounterMap =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let tcp_max_per_ip = config.max_connections_per_ip as usize;
     let mut session_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut shutdown_rx_pqc = shutdown_rx.clone();
     loop {
@@ -242,6 +258,21 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                         continue;
                     }
                 };
+
+                // ── Per-IP connection cap (SEC-OBS3-2) ────────────────────
+                let peer_ip = peer.ip();
+                {
+                    let mut map = tcp_ip_counter.lock().unwrap_or_else(|e| e.into_inner());
+                    let count = map.entry(peer_ip).or_insert(0);
+                    if *count >= tcp_max_per_ip {
+                        warn!(%peer, "PQC: connection rejected — IP rate limit ({tcp_max_per_ip}) exceeded");
+                        drop(socket);
+                        continue;
+                    }
+                    *count += 1;
+                }
+                let ip_counter_for_task = Arc::clone(&tcp_ip_counter);
+
                 let ctx = session::SessionContext {
                     identity: Arc::clone(&identity),
                     client_auth: client_vk.clone(),
@@ -252,6 +283,10 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
                 let session_shutdown_rx = shutdown_rx.clone();
 
                 let handle = tokio::spawn(async move {
+                    let _ip_guard = ws::IpCountGuard {
+                        ip: peer_ip,
+                        map: ip_counter_for_task,
+                    };
                     if let Err(e) = session::handle(socket, peer, ctx, cfg, session_shutdown_rx).await {
                         error!(%peer, "sesion error: {e:#}");
                     }
@@ -711,7 +746,13 @@ fn spawn_metrics_server(
 
 async fn metrics_handler(State(state): State<MetricsAppState>) -> impl IntoResponse {
     (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [
+            (CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
+            (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (X_FRAME_OPTIONS, "DENY"),
+            (CACHE_CONTROL, "no-store"),
+            (CONTENT_SECURITY_POLICY, "default-src 'none'"),
+        ],
         state.prometheus_handle.render(),
     )
 }
@@ -1030,6 +1071,58 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             3,
             "key_rotations_total should be 3 after 3 Rotates"
+        );
+    }
+
+    // ── OBS-2: metrics security headers ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_response_has_security_headers() {
+        let state = make_test_state();
+        let app = metrics_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "X-Content-Type-Options must be nosniff"
+        );
+        assert_eq!(
+            headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+            Some("DENY"),
+            "X-Frame-Options must be DENY"
+        );
+        assert_eq!(
+            headers.get("cache-control").map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "Cache-Control must be no-store"
+        );
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            Some("default-src 'none'"),
+            "Content-Security-Policy must be default-src 'none'"
+        );
+        // Content-Type must remain unchanged
+        assert!(
+            headers
+                .get("content-type")
+                .map(|v| v.to_str().unwrap())
+                .unwrap_or("")
+                .starts_with("text/plain"),
+            "Content-Type must remain text/plain"
         );
     }
 }
