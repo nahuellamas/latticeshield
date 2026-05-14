@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
-  <img src="https://img.shields.io/badge/tests-445_passing-brightgreen?style=for-the-badge" alt="445 tests passing">
+  <img src="https://img.shields.io/badge/tests-456_passing-brightgreen?style=for-the-badge" alt="456 tests passing">
   <img src="https://img.shields.io/badge/no_FFI-pure_Rust-blue?style=for-the-badge" alt="No FFI — pure Rust">
   <img src="https://img.shields.io/badge/PQC-ML--KEM--768_%2B_ML--DSA--65-blueviolet?style=for-the-badge" alt="PQC: ML-KEM-768 + ML-DSA-65">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge" alt="Apache-2.0">
@@ -13,6 +13,17 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 **[→ Quickstart — get running in 10 minutes](QUICKSTART.md)**
 
 ## What's New
+
+### Operational Security Hardening (2026-05-13)
+
+Three targeted hardening fixes based on live infrastructure testing. The `/metrics` endpoint now
+returns four HTTP security response headers (`X-Content-Type-Options`, `X-Frame-Options`,
+`Cache-Control: no-store`, `Content-Security-Policy`) as a defense-in-depth measure.
+The TCP PQC accept loop now enforces a per-IP connection cap (configurable via
+`[server].max_connections_per_ip`, default 50) to prevent CPU exhaustion from
+ML-DSA-65 signature generation under connection floods. The PQC TCP handshake timeout
+is now configured by a dedicated `[server].handshake_timeout_secs` field instead of
+reusing the WebSocket field — eliminating a long-standing source of operator confusion.
 
 ### v0.3.0 — Security Hardening (2026-05-13)
 
@@ -45,7 +56,7 @@ LatticeShield now ships pre-built binaries for Linux (x86_64 and arm64) and macO
 curl -fsSL https://raw.githubusercontent.com/nahuellamas/latticeshield/main/install.sh | bash
 ```
 
-The script detects your platform, downloads the right binary, verifies its SHA-256 checksum against the release manifest, and installs it to `/usr/local/bin`. Every pull request and push to main now runs an automated check — formatting, linting, dependency audit, and all 445 tests — before code can be merged. Ready-to-use service files for systemd (Linux) and launchd (macOS) are included under `contrib/` so you can run the bridge as a hardened system service in two commands.
+The script detects your platform, downloads the right binary, verifies its SHA-256 checksum against the release manifest, and installs it to `/usr/local/bin`. Every pull request and push to main now runs an automated check — formatting, linting, dependency audit, and all 456 tests — before code can be merged. Ready-to-use service files for systemd (Linux) and launchd (macOS) are included under `contrib/` so you can run the bridge as a hardened system service in two commands.
 
 ### Security Enforcement — Client Auth, Encrypted Key Rotation, and Dead Code Removal (2026-03-26)
 
@@ -296,9 +307,9 @@ cargo build --release
 
 ## Tests
 
-445 unit + integration tests across all four crates — all passing.
+456 unit + integration tests across all four crates — all passing.
 
-### latticeshield-crypto (44 tests)
+### latticeshield-crypto (45 tests)
 
 | Module | Tests |
 |---|---|
@@ -306,22 +317,22 @@ cargo build --release
 | `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
 | `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, encrypted KEY_ROTATE wire format (61B: GCM nonce + encrypted nonce + tag), tampered KEY_ROTATE AEAD failure, error types, `rotate_key` HKDF ratchet (deterministic, chained), seq monotonic increment, replay rejection, post-rotation seq reset, tampered-seq AEAD failure, sequential receive, out-of-order recv_seq rejection (recv_seq ≠ 0) |
 
-### latticeshield-bridge (202 tests)
+### latticeshield-bridge (354 tests)
 
 | Module | Tests |
 |---|---|
-| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, auth config, admin config (enabled/disabled/field validation/port collision), port collision detection |
+| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, auth config, admin config (enabled/disabled/field validation/port collision), port collision detection, `handshake_timeout_secs` and `max_connections_per_ip` validation |
 | `tls` | `build_server_config`, `build_acceptor`, cert/key loading, self-signed generation (feature-gated) |
 | `http_relay` | HTTP head parsing (complete/partial/oversized), GET forwarding, POST with body, backend down → 502 |
 | `quic` | `build_endpoint`, `relay_stream` end-to-end, backend down → error, normal connection close |
 | `identity` | ServerIdentity: generate_and_save (files, permissions, sizes), load roundtrip, error paths. ClientVerifyingIdentity: load roundtrip, wrong size rejected |
-| `metrics` | Prometheus families, HTTP `/metrics` endpoint, session/byte counters, connection gauge, key rotations counter |
+| `metrics` | Prometheus families, HTTP `/metrics` endpoint (security headers: X-Content-Type-Options, X-Frame-Options, Cache-Control, CSP), session/byte counters, connection gauge, key rotations counter |
 | `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
 | `admin` | Mutual ML-DSA-65 handshake (full round-trip), wrong client key rejected, `get-metrics` / `rotate` / `get-vk-token` command dispatch |
 | `server` | BridgeCommand dispatch: Rotate increments rotate_tx + key_rotations_total, Unknown ignored, multiple Rotates accumulate correctly |
 | `session` (integration) | Full PQC handshake + relay, mutual auth (with/without client auth, wrong VK rejection), tampered response rejection, key uniqueness, POST `/rotate`, time-based and byte-threshold key rotation |
 
-### latticeshield-client (92 tests)
+### latticeshield-client (49 tests)
 
 | Module | Tests |
 |---|---|
@@ -371,6 +382,7 @@ cargo build --release
 | 22 | Browser SDK — WebSocket listener (`:8446`, opt-in via `[websocket]` config) transporting the existing PQC wire protocol; `@latticeshield/js` TypeScript npm package with `PQCSession` class, `usePQCSession` React hook, Web Worker isolation for WASM + crypto.subtle, framing v3 (BigInt seq, deterministic nonce, AES-256-GCM); security fixes EC-7/EC-8/EC-9 |
 | 23 | Browser SDK Hardening — SRI hash auto-generated by `npm run build` (`latticeshield_bg.wasm.sha384`); TypeScript CI coverage added; out-of-order `recv_seq` test (general case, recv_seq ≠ 0) added to `channel.rs` |
 | 24 | Security Hardening (v0.3.0) — ML-DSA-65 domain separation (`latticeshield-v1` context), WebSocket origin normalization, VK token store DoS protection (cap 1000 + eviction + HTTP 429), handshake-scoped timeout, broken key-fetch fixed in JS SDK, seq overflow guard in framing |
+| 25 | Operational Security Hardening — `/metrics` security response headers, per-IP TCP connection cap (`[server].max_connections_per_ip`, default 50), dedicated `[server].handshake_timeout_secs` decoupled from WebSocket timeout |
 
 ## License
 

@@ -3,6 +3,7 @@
 Cargo.lock
 .env
 /etc/latticeshield/keys/
+keys-test/
 *.pem
 *.key
 *.crt
