@@ -51,3 +51,18 @@ export const CLIENT_RESPONSE_LEN = 1120 as const;
 export const KEY_ROTATE_FRAME_LEN = 61 as const;
 /** Size of a pre-shared ML-DSA-65 verifying key (bytes) */
 export const VERIFYING_KEY_LEN = 1952 as const;
+
+// ── Error classes ─────────────────────────────────────────────────────────────
+
+/**
+ * Thrown / rejected when an operation is attempted on a closed PQCSession,
+ * or when in-flight operations are drained on unexpected close.
+ * Use `err instanceof SessionClosedError` or `err.code === 'SESSION_CLOSED'` to discriminate.
+ */
+export class SessionClosedError extends Error {
+  readonly code = 'SESSION_CLOSED' as const;
+  constructor(message = 'PQCSession closed') {
+    super(message);
+    this.name = 'SessionClosedError';
+  }
+}

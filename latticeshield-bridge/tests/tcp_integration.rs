@@ -189,7 +189,10 @@ async fn do_pqc_handshake(
     let mut buf = [0u8; CLIENT_RESPONSE_LEN];
     buf.copy_from_slice(&serialize_client_response(&response));
 
-    stream.write_all(&buf).await.expect("should send CLIENT_RESPONSE");
+    stream
+        .write_all(&buf)
+        .await
+        .expect("should send CLIENT_RESPONSE");
     stream.flush().await.expect("flush");
 
     // Stream is kept alive — session enters relay phase, IP counter stays non-zero.
@@ -231,8 +234,7 @@ async fn tcp_per_ip_cap_rejects_third_connection() {
         .expect("TCP connect should succeed — bridge drops after accept(), not before");
 
     let mut buf = [0u8; SERVER_HELLO_SIGNED_LEN];
-    let result =
-        tokio::time::timeout(Duration::from_secs(2), stream3.read(&mut buf)).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), stream3.read(&mut buf)).await;
 
     match result {
         Ok(Ok(0)) | Ok(Err(_)) => {

@@ -14,7 +14,12 @@ import type {
   WorkerOutMessage,
   SessionState,
 } from './types.js';
-import { SERVER_HELLO_SIGNED_LEN, CLIENT_RESPONSE_LEN, FRAME_KEY_ROTATE } from './types.js';
+import {
+  SERVER_HELLO_SIGNED_LEN,
+  CLIENT_RESPONSE_LEN,
+  FRAME_KEY_ROTATE,
+  SessionClosedError,
+} from './types.js';
 
 type EventMap = {
   message: (data: Uint8Array) => void;
@@ -37,6 +42,19 @@ interface ResolvedOptions {
 
 export class PQCSession {
   private readonly options: ResolvedOptions;
+
+  // Private copy of the VK — never transferred; each handshake sends a fresh slice
+  // (ADR-2: constructor stores _vkCopy; performHandshake sends _vkCopy.slice())
+  private _vkCopy: Uint8Array;
+
+  // Set to true synchronously inside close() BEFORE calling ws?.close(),
+  // so the resulting 'close' WS event does not re-trigger the unexpected-close path (ADR-4)
+  private _intentionalClose = false;
+
+  // Stable bound references for WS event listeners — required so removeEventListener works (ADR-3)
+  private readonly _onWsClose = this.handleWsClose.bind(this);
+  private readonly _onWsError = this.handleWsError.bind(this);
+  private readonly _boundOnFrameMessage = this.onFrameMessage.bind(this);
 
   private worker: Worker | null = null;
   private ws: WebSocket | null = null;
@@ -70,6 +88,9 @@ export class PQCSession {
       strict: options.strict ?? false,
       workerUrl: options.workerUrl,
     };
+
+    // ADR-2: defensive copy so the original Uint8Array can never be detached by a caller
+    this._vkCopy = options.serverVkBytes.slice();
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -77,8 +98,13 @@ export class PQCSession {
   /**
    * Opens the WebSocket, performs the PQC handshake, and resolves when the
    * session is ready to send/receive encrypted frames.
+   *
+   * May be called from state 'idle' or 'closed' (reconnect scenario).
    */
   async connect(): Promise<void> {
+    // ADR: reset flag FIRST so any previous intentional close doesn't bleed into this connect
+    this._intentionalClose = false;
+
     if (this.state !== 'idle' && this.state !== 'closed') {
       throw new Error(`connect() called in state "${this.state}"`);
     }
@@ -136,13 +162,31 @@ export class PQCSession {
     });
   }
 
-  /** Closes the WebSocket and terminates the Worker. */
+  /**
+   * Closes the WebSocket and terminates the Worker.
+   * Idempotent — calling close() on an already-closed session is a no-op.
+   * Path C from design (ADR-4).
+   */
   close(): void {
+    if (this.state === 'closed') return; // idempotent
+
+    // Set flag synchronously BEFORE ws?.close() so the resulting 'close' WS event
+    // is recognised as intentional by handleWsClose (ADR-4)
+    this._intentionalClose = true;
     this.state = 'closed';
-    this.ws?.close();
+
+    this.drainPending(new SessionClosedError());
+
+    this.ws?.close(1000, 'client requested');
     this.worker?.terminate();
+
+    this.ws?.removeEventListener('close', this._onWsClose);
+    this.ws?.removeEventListener('error', this._onWsError);
+    this.ws?.removeEventListener('message', this._boundOnFrameMessage);
+
     this.ws = null;
     this.worker = null;
+
     this.emit('close');
   }
 
@@ -290,14 +334,15 @@ export class PQCSession {
 
         if (data.length === SERVER_HELLO_SIGNED_LEN) {
           // Got server_hello_signed — send to Worker for WASM processing
+          // ADR-2: send _vkCopy.slice() — fresh copy each time, _vkCopy stays intact
           const initMsg: WorkerInMessage = {
             type: 'INIT',
             serverHelloSigned: data,
-            serverVkBytes: this.options.serverVkBytes,
+            serverVkBytes: this._vkCopy.slice(),
           };
           this.worker!.postMessage(initMsg, [
             data.buffer,
-            this.options.serverVkBytes.buffer,
+            initMsg.serverVkBytes.buffer,
           ]);
 
           // One-shot listener for Worker INIT response
@@ -319,9 +364,16 @@ export class PQCSession {
               }
               ws.send(wMsg.clientResponse);
 
-              // Handshake complete — install ongoing frame handler
+              // Handshake complete — remove handshake-scoped message/error/close listeners
               ws.removeEventListener('message', onMessage);
-              ws.addEventListener('message', this.onFrameMessage.bind(this));
+              ws.removeEventListener('error', onError);
+              ws.removeEventListener('close', onClose);
+              ws.removeEventListener('open', onOpen);
+
+              // Install permanent post-handshake listeners (ADR-3: stable bound refs)
+              ws.addEventListener('message', this._boundOnFrameMessage);
+              ws.addEventListener('close', this._onWsClose);
+              ws.addEventListener('error', this._onWsError);
 
               resolve();
             } else if (wMsg.type === 'INIT_ERR') {
@@ -359,6 +411,64 @@ export class PQCSession {
       ws.addEventListener('error', onError);
       ws.addEventListener('close', onClose);
     });
+  }
+
+  // ── Internal: Unexpected close handler (Path B, ADR-4) ────────────────────
+
+  /**
+   * Handles an unexpected WebSocket 'close' event (network drop, bridge crash).
+   * Strict order per ADR-4: state → drain → terminate → cleanup → null → emit.
+   */
+  private handleWsClose(_ev: CloseEvent): void {
+    if (this.state === 'closed') return;    // guard #1: already closed (idempotence)
+    if (this._intentionalClose) return;    // guard #2: close() is in flight; it owns cleanup
+
+    this.state = 'closed';                               // (1) block new public ops
+    this.drainPending(new SessionClosedError());         // (2) reject in-flight promises
+
+    this.worker?.terminate();                            // (3) destroy key material
+
+    const ws = this.ws;
+    if (ws) {
+      ws.removeEventListener('close', this._onWsClose);
+      ws.removeEventListener('error', this._onWsError);
+      ws.removeEventListener('message', this._boundOnFrameMessage);
+    }
+
+    this.ws = null;                                      // (4) nullify refs
+    this.worker = null;
+
+    this.emit('close');                                  // (5) last — triggers hook reconnect
+  }
+
+  /**
+   * Handles a WebSocket 'error' event post-handshake.
+   * Only forwards to the session's error bus — cleanup is handled by the
+   * following 'close' event which always fires after 'error'.
+   */
+  private handleWsError(_ev: Event): void {
+    // Do not emit if already closed — avoid spurious errors after intentional close
+    if (this.state !== 'closed') {
+      this.emit('error', new Error('WebSocket error'));
+    }
+  }
+
+  // ── Internal: Drain helper (ADR-4) ────────────────────────────────────────
+
+  /**
+   * Rejects all pending encrypt and decrypt operations with the given error,
+   * clears both Maps, and resumes any sendQueue waiters (which will then fail
+   * the subsequent state guard in send()/encryptAndSend()).
+   */
+  private drainPending(err: Error): void {
+    for (const op of this.pendingEncrypt.values()) op.reject(err);
+    for (const op of this.pendingDecrypt.values()) op.reject(err);
+    this.pendingEncrypt.clear();
+    this.pendingDecrypt.clear();
+    // sendQueue contains resume() continuations from send() waiting on key rotation.
+    // Resuming them with state='closed' causes send()/encryptAndSend() to throw early.
+    const queue = this.sendQueue.splice(0);
+    for (const resume of queue) resume();
   }
 
   // ── Internal: Frame routing ────────────────────────────────────────────────

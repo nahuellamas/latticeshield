@@ -11,6 +11,7 @@ export type { UsePQCSessionOptions, UsePQCSessionResult } from './hooks/usePQCSe
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 export type { PQCSessionOptions, PQCSessionStatus, SessionState } from './types.js';
+export { SessionClosedError } from './types.js';
 
 // ── Wire format constants ─────────────────────────────────────────────────────
 export {
