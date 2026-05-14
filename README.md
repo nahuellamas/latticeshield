@@ -14,6 +14,16 @@ A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cr
 
 ## What's New
 
+### Browser SDK — Auto-Reconnect (2026-05-14)
+
+The browser JavaScript SDK (`@latticeshield/js`) now automatically reconnects after an
+unexpected WebSocket drop — network interruption, bridge restart, or idle timeout. The
+`usePQCSession` hook retries up to three times with exponential backoff (2s, 4s, 8s).
+Two bugs blocked this from working: the session was not detecting unexpected closes, and
+the server verification key was being silently zeroed out after the first handshake (making
+every reconnect attempt fail). Both are fixed. No API changes — existing code that uses
+`usePQCSession` picks up automatic reconnect with no modifications.
+
 ### Operational Security Hardening (2026-05-13)
 
 Three targeted hardening fixes based on live infrastructure testing. The `/metrics` endpoint now
