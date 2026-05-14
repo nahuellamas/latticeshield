@@ -18,6 +18,7 @@ latticeshield-js/.vite/
 .engram/
 .atl/
 .mcp.json
+.playwright-mcp
 latticeshield-wasm/pkg/
 
 # Internal development notes
