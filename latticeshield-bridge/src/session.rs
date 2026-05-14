@@ -66,7 +66,7 @@ pub async fn handle_with_handshake_timeout<T>(
     peer: SocketAddr,
     ctx: SessionContext,
     config: ValidConfig,
-    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    _shutdown_rx: tokio::sync::watch::Receiver<()>,
     handshake_timeout: std::time::Duration,
 ) -> anyhow::Result<()>
 where
@@ -247,12 +247,6 @@ where
                 // result.is_ok() = sender sigue activo → rotar.
                 // result.is_err() = sender caido (shutdown) → no rotar.
                 result.is_ok()
-            }
-
-            // ── Graceful shutdown signal ─────────────────────────────────────
-            _ = shutdown_rx.changed() => {
-                info!(%peer, "session: shutdown signal, stopping relay");
-                break;
             }
         };
 
