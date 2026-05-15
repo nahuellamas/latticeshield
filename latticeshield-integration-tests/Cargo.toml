@@ -1,0 +1,39 @@
+[package]
+name        = "latticeshield-integration-tests"
+version     = "0.1.0"
+edition     = "2021"
+publish     = false
+
+# All runtime deps are [dev-dependencies] — this crate has no library users.
+[dev-dependencies]
+latticeshield-bridge  = { path = "../latticeshield-bridge", features = ["test-helpers"] }
+latticeshield-client  = { path = "../latticeshield-client" }
+latticeshield-crypto  = { path = "../latticeshield-crypto" }
+
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+anyhow       = "1"
+tracing      = "0.1"
+rand_core    = { version = "0.6", features = ["getrandom"] }
+
+# HTTP backend / client
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+hyper        = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util   = { version = "0.1", features = ["tokio"] }
+
+# gRPC backend / client
+tonic        = { version = "0.12", features = ["transport"] }
+prost        = "0.13"
+
+# Docker-backed tests
+testcontainers         = "0.21"
+testcontainers-modules = { version = "0.9", features = ["postgres", "redis"] }
+tokio-postgres         = "0.7"
+redis                  = { version = "0.27", features = ["tokio-comp"] }
+
+# TLS cert generation for gRPC (needed by tonic transport)
+rcgen        = "0.13"
+
+[build-dependencies]
+tonic-build  = "0.12"

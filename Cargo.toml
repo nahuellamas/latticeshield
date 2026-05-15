@@ -5,6 +5,7 @@ members = [
     "latticeshield-client",
     "latticeshield-cli",
     "latticeshield-wasm",
+    "latticeshield-integration-tests",
 ]
 resolver = "2"
 

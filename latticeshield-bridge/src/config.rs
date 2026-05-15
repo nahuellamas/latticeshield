@@ -891,6 +891,63 @@ impl Config {
     }
 }
 
+// ── Test helpers (available under cfg(test) or the test-helpers feature) ───────
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ValidConfig {
+    /// Build a `ValidConfig` with sane test defaults.
+    ///
+    /// - `backend_port`: port of the mock backend on 127.0.0.1
+    /// - All optional listeners (TLS, QUIC, WebSocket, admin, control-plane) disabled
+    /// - `client_auth_enabled = false` (no client VK required)
+    /// - `shutdown_timeout = 1s` for fast test teardown
+    pub fn for_test(backend_port: u16) -> Self {
+        let dummy = std::path::PathBuf::from("/dev/null");
+        ValidConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            backend_addr: format!("127.0.0.1:{backend_port}").parse().unwrap(),
+            metrics_addr: "127.0.0.1:0".parse().unwrap(),
+            max_frame_size: 65536,
+            handshake_timeout_secs: 10,
+            max_connections_per_ip: 1000,
+            signing_key_path: dummy.clone(),
+            log_level: "error".to_string(),
+            control_plane_enabled: false,
+            control_plane_endpoint: String::new(),
+            control_plane_agent_name: String::new(),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            key_rotation_enabled: false,
+            max_bytes_per_key: u64::MAX,
+            key_rotation_interval: std::time::Duration::from_secs(3600),
+            tls_enabled: false,
+            tls_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            tls_cert_path: dummy.clone(),
+            tls_key_path: dummy.clone(),
+            quic_enabled: false,
+            quic_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            quic_cert_path: dummy.clone(),
+            quic_key_path: dummy.clone(),
+            client_auth_enabled: false,
+            client_vk_path: None,
+            admin_enabled: false,
+            admin_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            admin_control_plane_vk_path: None,
+            admin_rate_limit_per_second: 5,
+            admin_handshake_timeout_secs: 10,
+            control_plane_install_token: None,
+            shutdown_timeout: std::time::Duration::from_secs(1),
+            ws_enabled: false,
+            ws_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ws_cert_path: dummy.clone(),
+            ws_key_path: dummy,
+            ws_allowed_origins: Vec::new(),
+            ws_handshake_timeout_secs: 10,
+            ws_max_connections_per_ip: 100,
+            vk_share_max_tokens: 100,
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

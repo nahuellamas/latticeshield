@@ -50,8 +50,9 @@ version  = "0.13"
 optional = true
 
 [features]
-default    = []
-tls-keygen = ["dep:rcgen"]
+default      = []
+tls-keygen   = ["dep:rcgen"]
+test-helpers = []
 
 [dev-dependencies]
 tempfile   = "3"

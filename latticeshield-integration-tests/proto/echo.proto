@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package echo;
+
+service Echo {
+    rpc Echo(EchoReq) returns (EchoResp);
+    rpc Stream(StreamReq) returns (stream Chunk);
+}
+
+message EchoReq {
+    string message = 1;
+}
+
+message EchoResp {
+    string message = 1;
+}
+
+message StreamReq {
+    uint32 count = 1;
+}
+
+message Chunk {
+    uint32 seq = 1;
+    string data = 2;
+}
