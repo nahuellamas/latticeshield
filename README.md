@@ -18,6 +18,7 @@ Add post-quantum encryption to any TCP service **without changing your applicati
 
 ## Table of Contents
 
+- [FAQ](#faq)
 - [Why post-quantum now?](#why-post-quantum-now)
 - [How it works](#how-it-works)
 - [Quickstart](#quickstart)
@@ -46,6 +47,26 @@ Add post-quantum encryption to any TCP service **without changing your applicati
 - [What's New](#whats-new)
 - [Contributing](#contributing)
 - [License](#license)
+
+---
+
+## FAQ
+
+**Why not WireGuard?**
+
+WireGuard uses Curve25519, which is broken by Shor's algorithm on a quantum computer. It also requires a kernel module or TUN device — root access, kernel version constraints, and firewall rules. LatticeShield runs entirely in userspace, needs no root, and drops in front of any TCP service without touching the OS network stack.
+
+**Why not TLS 1.3 with post-quantum extensions?**
+
+You can — Cloudflare, Chrome, and some servers already negotiate X25519Kyber768 in TLS 1.3. But that only protects the key exchange, not the server identity (still ECDSA or RSA). LatticeShield replaces both: key exchange (X25519 + ML-KEM-768) and server authentication (ML-DSA-65). It also works for raw TCP, not just HTTPS.
+
+**Why not Cloudflare or a CDN that already does PQC?**
+
+Because your traffic goes through their infrastructure and their keys. LatticeShield is self-hosted — you generate the keys, you run the bridge, no third party touches your plaintext. The threat model includes your CDN provider.
+
+**Is this production-ready?**
+
+The cryptographic primitives use audited upstream crates (`libcrux-ml-dsa`, `ml-kem`, `x25519-dalek`). The protocol design and integration code are self-reviewed — no third-party audit has been performed. Treat it as production-capable but deploy with that in mind: run it behind a firewall, monitor `/metrics`, and keep `server.sk` off the internet.
 
 ---
 
