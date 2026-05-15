@@ -113,6 +113,13 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn init_crypto() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
     /// Helper: generate a self-signed cert/key using rcgen (from dev-deps).
     /// Returns (cert_file, key_file) as NamedTempFile so they stay on disk during test.
     fn make_self_signed_files() -> (NamedTempFile, NamedTempFile) {
@@ -129,6 +136,7 @@ mod tests {
 
     #[test]
     fn build_acceptor_valid_self_signed_ok() {
+        init_crypto();
         let (cert_f, key_f) = make_self_signed_files();
         build_acceptor(cert_f.path(), key_f.path()).unwrap();
     }
@@ -169,6 +177,7 @@ mod tests {
 
     #[test]
     fn build_server_config_valid_cert_ok() {
+        init_crypto();
         let (cert_f, key_f) = make_self_signed_files();
         let result = build_server_config(cert_f.path(), key_f.path());
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
@@ -216,6 +225,7 @@ mod tests {
     #[cfg(feature = "tls-keygen")]
     #[test]
     fn generate_self_signed_cert_is_valid_pem_for_acceptor() {
+        init_crypto();
         let dir = tempfile::tempdir().unwrap();
         generate_self_signed(dir.path()).unwrap();
         build_acceptor(&dir.path().join("tls.crt"), &dir.path().join("tls.key")).unwrap();

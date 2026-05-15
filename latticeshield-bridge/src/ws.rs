@@ -346,6 +346,13 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn init_crypto() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
     // ── NormalizedOrigin unit tests ───────────────────────────────────────────
 
     #[test]
@@ -602,6 +609,7 @@ mod tests {
 
     #[test]
     fn build_acceptor_with_valid_self_signed_ok() {
+        init_crypto();
         use crate::tls;
         let (cert_f, key_f) = make_self_signed_files();
         tls::build_acceptor(cert_f.path(), key_f.path()).unwrap();
