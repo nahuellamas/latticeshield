@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use latticeshield_crypto::{
     client_respond, parse_server_hello_signed, serialize_client_response_signed, EncryptedChannel,
@@ -30,8 +30,13 @@ struct CommandFrame {
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
 enum AdminResponse {
-    VkToken { token: String, url: String },
-    Error { message: String },
+    VkToken {
+        token: String,
+        url: String,
+    },
+    Error {
+        message: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -106,8 +111,8 @@ const ADMIN_TIMEOUT_SECS: u64 = 10;
 
 async fn cmd_vk_share(
     admin_addr: &str,
-    bridge_vk_path: &PathBuf,
-    admin_sk_path: &PathBuf,
+    bridge_vk_path: &Path,
+    admin_sk_path: &Path,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
