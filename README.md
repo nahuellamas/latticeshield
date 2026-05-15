@@ -2,400 +2,603 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
-  <img src="https://img.shields.io/badge/tests-456_passing-brightgreen?style=for-the-badge" alt="456 tests passing">
+  <img src="https://img.shields.io/badge/tests-550_passing-brightgreen?style=for-the-badge" alt="550 tests passing">
   <img src="https://img.shields.io/badge/no_FFI-pure_Rust-blue?style=for-the-badge" alt="No FFI — pure Rust">
   <img src="https://img.shields.io/badge/PQC-ML--KEM--768_%2B_ML--DSA--65-blueviolet?style=for-the-badge" alt="PQC: ML-KEM-768 + ML-DSA-65">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge" alt="Apache-2.0">
 </p>
 
-A quantum-safe reverse proxy written in pure Rust. Adds a hybrid post-quantum cryptography (PQC) layer — **X25519 + ML-KEM-768** — as a transparent encryption layer between clients and backend services, with no FFI, no OpenSSL, no `oqs-rs`.
+> A quantum-safe reverse proxy written in **pure Rust** — no FFI, no OpenSSL, no `oqs-rs`.
 
-**[→ Quickstart — get running in 10 minutes](QUICKSTART.md)**
+Add post-quantum encryption to any TCP service **without changing your application code**. LatticeShield runs as a sidecar: your clients connect to the bridge, traffic is encrypted in transit with a hybrid **X25519 + ML-KEM-768 + AES-256-GCM** channel, decrypted at the bridge, and forwarded to your backend over localhost. The bridge also authenticates itself to clients with **ML-DSA-65** signatures so clients can cryptographically verify they are talking to the real server.
 
-## What's New
+**[→ Get running in 10 minutes](QUICKSTART.md)**
 
-### Browser SDK — Auto-Reconnect (2026-05-14)
+---
 
-The browser JavaScript SDK (`@latticeshield/js`) now automatically reconnects after an
-unexpected WebSocket drop — network interruption, bridge restart, or idle timeout. The
-`usePQCSession` hook retries up to three times with exponential backoff (2s, 4s, 8s).
-Two bugs blocked this from working: the session was not detecting unexpected closes, and
-the server verification key was being silently zeroed out after the first handshake (making
-every reconnect attempt fail). Both are fixed. No API changes — existing code that uses
-`usePQCSession` picks up automatic reconnect with no modifications.
+## Table of Contents
 
-### Operational Security Hardening (2026-05-13)
+- [Why post-quantum now?](#why-post-quantum-now)
+- [How it works](#how-it-works)
+- [Quickstart](#quickstart)
+- [Listeners & ports](#listeners--ports)
+- [Configuration reference](#configuration-reference)
+  - [\[server\]](#server)
+  - [\[crypto\]](#crypto)
+  - [\[auth\]](#auth)
+  - [\[tls\]](#tls)
+  - [\[quic\]](#quic)
+  - [\[websocket\]](#websocket)
+  - [\[admin\]](#admin)
+  - [\[control\_plane\]](#control_plane)
+  - [\[key\_rotation\]](#key_rotation)
+  - [\[logging\]](#logging)
+  - [\[metrics\]](#metrics)
+  - [Environment variables](#environment-variables)
+- [CLI reference](#cli-reference)
+- [Browser SDK](#browser-sdk-latticeshieldjs)
+- [VK-share](#vk-share)
+- [Security design](#security-design)
+- [Prometheus metrics](#prometheus-metrics)
+- [Workspace structure](#workspace-structure)
+- [Building from source](#building-from-source)
+- [Tests](#tests)
+- [What's New](#whats-new)
+- [Contributing](#contributing)
+- [License](#license)
 
-Three targeted hardening fixes based on live infrastructure testing. The `/metrics` endpoint now
-returns four HTTP security response headers (`X-Content-Type-Options`, `X-Frame-Options`,
-`Cache-Control: no-store`, `Content-Security-Policy`) as a defense-in-depth measure.
-The TCP PQC accept loop now enforces a per-IP connection cap (configurable via
-`[server].max_connections_per_ip`, default 50) to prevent CPU exhaustion from
-ML-DSA-65 signature generation under connection floods. The PQC TCP handshake timeout
-is now configured by a dedicated `[server].handshake_timeout_secs` field instead of
-reusing the WebSocket field — eliminating a long-standing source of operator confusion.
+---
 
-### v0.3.0 — Security Hardening (2026-05-13)
+## Why post-quantum now?
 
-Closes 9 pending security audit findings. Introduces ML-DSA-65 domain separation
-(`latticeshield-v1` context), WebSocket origin normalization, VK token store DoS
-protection, and fixes a broken key-fetch function in the JS SDK. Version bump to 0.3.0.
+NIST finalized three post-quantum cryptography standards in 2024 (FIPS 203 ML-KEM, FIPS 204 ML-DSA, FIPS 205 SLH-DSA). Classical ECDH and RSA are broken by Shor's algorithm on a sufficiently large quantum computer. "Harvest now, decrypt later" attacks are already happening: adversaries collect encrypted traffic today intending to decrypt it once quantum hardware matures.
 
-### WebSocket Browser SDK (2026-03-28)
+LatticeShield uses a **hybrid model** (X25519 + ML-KEM-768) so sessions are protected by both classical and post-quantum algorithms simultaneously. Breaking the session requires breaking both — classical cryptography keeps you safe today; post-quantum keeps your historical traffic safe when quantum hardware arrives.
 
-Browsers can now connect directly to the LatticeShield PQC channel — no native agent, no plugin. The bridge listens on a new WebSocket port (`:8446` by default) and speaks the same hybrid ML-KEM-768 + X25519 + AES-256-GCM handshake that the Rust client agent uses. A TypeScript npm package, `@latticeshield/js`, handles the full session lifecycle: it spawns a Web Worker, loads the `latticeshield-wasm` WASM module inside that worker (so crypto keys never touch the main thread), performs the handshake, and exposes a clean `PQCSession` class and a `usePQCSession` React hook.
+---
 
-Enable the WebSocket listener by adding a `[websocket]` section to the bridge config:
+## How it works
 
-```toml
-[websocket]
-enabled = true
-listen_addr = "0.0.0.0:8446"
-cert_path = "/path/to/cert.pem"
-key_path  = "/path/to/key.pem"
-allowed_origins = ["https://your-app.example.com"]
+```
+┌───────────────┐    encrypted (PQC)    ┌──────────────────┐    plain TCP    ┌─────────────┐
+│    Client     │ ─────────────────────▶│  LatticeShield   │────────────────▶│   Backend   │
+│  (your app)   │◀───────────────────── │     Bridge       │◀────────────────│   Service   │
+└───────────────┘                       └──────────────────┘                 └─────────────┘
+                    wss:// / TCP / TLS / QUIC                  127.0.0.1:8080
 ```
 
-See [`latticeshield-js/README.md`](latticeshield-js/README.md) for install instructions, CSP guidance (`wasm-unsafe-eval`), and the full API reference.
+| What the bridge guarantees | What it does NOT change |
+|---|---|
+| Traffic between client and bridge is quantum-safe encrypted | Your backend receives plain unencrypted TCP — no code changes needed |
+| The server is cryptographically authenticated (ML-DSA-65) | Your existing HTTP, gRPC, or custom protocol passes through unchanged |
+| Clients can optionally prove their identity too (mutual auth) | The bridge is transparent — it relays bytes, not HTTP |
+| Every session uses fresh ephemeral keys (perfect forward secrecy) | No kernel modules, no eBPF, no sidecars that need root |
 
-### CI/Release Pipeline and One-Command Install (2026-03-26)
+---
 
-LatticeShield now ships pre-built binaries for Linux (x86_64 and arm64) and macOS (Intel and Apple Silicon). Install with a single command — no Rust, no compiler, no manual file copying required:
+## Quickstart
+
+The idea is simple: your app keeps running exactly as it is. The bridge sits in front of it, handles all the encryption, and forwards plain bytes to your app over localhost. Clients talk to the bridge on `:8443`; your app keeps talking plain TCP on `:8080`. Nothing changes on either side.
+
+### 1. Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nahuellamas/latticeshield/main/install.sh | bash
 ```
 
-The script detects your platform, downloads the right binary, verifies its SHA-256 checksum against the release manifest, and installs it to `/usr/local/bin`. Every pull request and push to main now runs an automated check — formatting, linting, dependency audit, and all 456 tests — before code can be merged. Ready-to-use service files for systemd (Linux) and launchd (macOS) are included under `contrib/` so you can run the bridge as a hardened system service in two commands.
+Downloads the pre-built binary for your platform (Linux x86_64/arm64 or macOS Intel/Apple Silicon).
 
-### Security Enforcement — Client Auth, Encrypted Key Rotation, and Dead Code Removal (2026-03-26)
+### 2. Generate a keypair
 
-The bridge now requires that every connecting client prove its identity before the session is accepted. Before this release, client verification was optional and off by default, meaning the bridge would accept connections from anyone who knew the server's address. Now the bridge refuses to start unless it is either given a key to check clients against, or explicitly told that open access is intentional — via `require_client_auth = false` in the config file. We also closed a gap where the secret used to agree on a new encryption key mid-session traveled in the clear inside the channel; that secret is now itself encrypted with the same lock that protects all other traffic. Finally, we removed an unused internal component (an anti-replay filter for one-time entry tickets that were never implemented) that added complexity without providing any real security benefit.
-
-### Replay-proof DATA frames — Framing v3 (2026-03-25)
-
-Every encrypted data frame now carries a sequence number that the receiver must see strictly increasing. If an attacker records a frame and replays it later, the bridge rejects it immediately — the sequence number would not be greater than the last accepted one. The sequence number is mathematically tied to the encrypted content (using the same authentication tag that protects the data), so tampering with it is also detectable. This closes the last theoretical replay gap in the encrypted channel.
-
-### Pre-production Hardening (2026-03-25)
-
-The bridge now shuts down cleanly when the operating system asks it to stop. Before this release, a `systemctl restart` or a Kubernetes rolling update would cut all active connections mid-transfer. Now the bridge stops accepting new connections, waits for in-flight sessions to finish (up to 30 seconds by default, configurable via `SHUTDOWN_TIMEOUT_SECS`), and only then exits — so no connection is dropped abruptly. We also fixed a bug where a single internal error could cascade into a full crash of the key-distribution endpoint, and stabilized a test that was occasionally failing on slow machines.
-
-### Hybrid Post-Quantum TLS and Cloud Command Wiring (2026-03-24)
-
-The bridge now uses post-quantum-safe encryption when talking to the cloud management server. Before this release, status updates and registration requests traveled over standard TLS, which a future quantum computer could break. Now the bridge negotiates a hybrid key exchange (that means: two independent mathematical locks — one classical, one quantum-resistant — must both be broken to read the data). Additionally, when the cloud sends a "rotate keys" instruction inside a status-update response, the bridge now actually performs the rotation across all active client sessions instead of just logging it. Operators can see rotation events in their monitoring dashboards.
-
-### Signed Heartbeats and Cloud Onboarding Token (2026-03-20)
-
-The bridge now proves its identity to the cloud management server on every status update it sends. Before this release, any process that knew the bridge's ID could send fake status updates — there was no way for the server to tell real updates from imposters. Now every update carries a digital signature (that means: a mathematical proof, like a wax seal, that only this specific bridge can produce). The cloud can verify that seal without storing any secret. Operators can also configure a one-time onboarding token (a short secret code the cloud issues when you register a new bridge) so that only bridges holding that code can claim an agent slot — the token never appears in any log file, no matter the log level.
-
-### Admin Post-Quantum Channel on `:8445` (2026-03-20)
-
-The bridge now exposes an optional dedicated admin channel for the control plane. When enabled, it listens on `:8445` (TCP) and requires **mutual ML-DSA-65 authentication** — both sides must prove their identity using post-quantum digital signatures before any data flows. This replaces the classical bearer-token approach for admin traffic and gives the control plane a cryptographically strong proof that it is talking to the real bridge, and vice versa. The channel is disabled by default and does not open any port unless explicitly enabled in the config file.
-
-### Secure Key Distribution via vk-share (2026-03-19)
-
-The bridge can now hand out its digital ID card — the proof that it is a trusted server — to new client operators without requiring manual file transfers. An admin runs `latticeshield vk-share` to create a one-time download link with a 10-minute expiry, shares that link with the client operator, and the client operator uses it to fetch the key over a standard secure web connection. The link stops working after one use or after 10 minutes, whichever comes first.
-
-### Connection Pool in the Client Agent (2026-03-16)
-
-We added a connection pool so that the client agent no longer waits to open a fresh connection to the server every time a request arrives. Now a small number of connections are kept ready in the background, so requests start faster and the agent handles more simultaneous traffic without slowing down. Old configuration files continue to work with no changes.
-
-### Unified `latticeshield` Command (2026-03-12)
-
-We added a single `latticeshield` command so that you can generate all your security keys — for the server, the client, and TLS certificates — without needing to know which internal program to call. Previously, key generation was split across two different programs; now everything lives under one roof with a guided welcome screen.
-
-## Deployment Model
-
-LatticeShield follows a **sidecar model**: each component runs on a different server, and the PQC channel protects the entire network path between them.
-
-```
-Customer frontend server              Customer backend server
-[latticeshield-client]  ──── PQC ────  [latticeshield-bridge :8443]
-        |                                         |
-  User application                        127.0.0.1:8080 (local)
-  (plain TCP :9090)                               |
-                                           [Customer API]
+```sh
+latticeshield-bridge keygen ./keys
 ```
 
-- `latticeshield-bridge` runs on the **backend server**, next to the API it protects. `backend_addr` should always point to `127.0.0.1` (or a private-network address) — the local TCP connection never leaves the machine.
-- `latticeshield-client` runs on the **frontend / client server**. It accepts plain TCP from the user application and forwards it through the PQC channel.
-- The PQC channel (ML-KEM-768 + X25519 + ML-DSA-65 + AES-256-GCM) protects the entire network path between the two servers. No plaintext ever traverses the public internet.
+This creates two files: `server.sk` (private, mode 0600) and `server.vk` (public, 1952 bytes). The bridge uses `server.sk` to sign a hello message at the start of every session. Clients use `server.vk` to verify that signature — this is the only thing that stops an impostor from pretending to be your bridge. Treat `server.sk` like a password: never commit it, never copy it over HTTP.
 
-**What the PQC channel guarantees:**
+### 3. Write a config
 
-| Guarantee | Mechanism |
-|---|---|
-| Nobody in the middle can read the data | AES-256-GCM encrypted channel, session key derived via HKDF from hybrid KEM |
-| Nobody can impersonate the server | ML-DSA-65 signed ServerHello, verified against a pre-shared VerifyingKey |
-| Harvest-now-decrypt-later attacks are defeated | Hybrid ML-KEM-768 + X25519: an attacker must break both algorithms to recover the session key |
+```sh
+cat > config.toml << 'EOF'
+[server]
+listen_addr      = "0.0.0.0:8443"    # clients connect here
+backend_addr     = "127.0.0.1:8080"  # your app is already here
 
-## Why
-
-Classical key exchange (ECDH, RSA) is vulnerable to future quantum computers via Shor's algorithm. LatticeShield implements the hybrid model recommended by NIST and IETF: combine a classical algorithm (X25519) with a post-quantum one (ML-KEM-768, formerly Kyber). If either is broken, the session remains secure.
-
-## Architecture
-
-```
-User Application (plain TCP)
-  |
-  | plain TCP (:9090)
-  |
-latticeshield-client          Standard HTTPS client (curl, browser)
-  |                              |
-  | PQC handshake (:8443)        | HTTPS / TLS (:8440)
-  |                              |
-  +------------------------------+
-                 |
-        latticeshield-bridge
-                 |
-                 | plain TCP
-                 |
-          Backend Service
+[crypto]
+signing_key_path = "./keys/server.sk"
+EOF
 ```
 
-`latticeshield-client` is the local proxy agent: it accepts plain TCP from the user application, performs the PQC handshake with the bridge, and relays data through an AES-256-GCM encrypted channel. User applications need zero changes.
+`backend_addr` is wherever your app is listening right now. The bridge decrypts client traffic and forwards raw bytes to your app — no code changes, no new dependencies on the backend side.
 
-`latticeshield-bridge` runs three independent listeners:
+### 4. Start the bridge
 
-| Port | Protocol | Client |
-|------|----------|--------|
-| `:8443` | Custom PQC (X25519 + ML-KEM-768 + AES-256-GCM) | `latticeshield-client` agent |
-| `:8440` | Standard TLS / HTTPS (rustls 0.23) | curl, browsers, any HTTPS client |
-| `:8441` | QUIC / UDP (quinn 0.11) | QUIC-capable clients |
-| `:8444` | Plain HTTP (Prometheus metrics) | Monitoring systems |
-| `:8445` | Admin PQC channel — mutual ML-DSA-65 auth (opt-in) | Control plane (cloud admin) |
-
-Backends require no changes — the proxy is transparent.
-
-## Cryptographic Design
-
-### Hybrid Handshake
-
-The handshake follows [draft-ietf-tls-hybrid-design](https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/):
-
-1. Server generates ephemeral X25519 keypair + ML-KEM-768 keypair.
-2. Server sends `ClientHello`: X25519 public key, ML-KEM encapsulation key, random nonce.
-3. Client performs X25519 DH + ML-KEM encapsulation. Sends back X25519 public key + ML-KEM ciphertext.
-4. Both sides derive the session key:
-
-```
-SessionKey = HKDF-SHA256(
-  ikm  = x25519_shared_secret || kem_shared_secret,
-  salt = nonce,
-  info = "latticeshield-v1-session-key"
-)
+```sh
+latticeshield-bridge run --config config.toml
 ```
 
-Security property: an attacker must break **both** X25519 (classically hard) and ML-KEM-768 (quantum-hard) to compromise the session.
+The bridge is now accepting connections on `:8443`. Every client gets a fresh quantum-safe encrypted channel. Your app on `:8080` sees nothing different — just bytes arriving from localhost.
 
-### Key Zeroization
+### 5. Distribute the verifying key to clients
 
-`SessionKey` implements `ZeroizeOnDrop` — the 32-byte key material is wiped from memory as soon as it goes out of scope.
+```sh
+# Option A — copy to a specific host
+scp ./keys/server.vk client-host:./keys/server.vk
 
-### Anti-Replay (DATA frames)
+# Option B — bake into a Docker image
+COPY keys/server.vk /etc/latticeshield/server.vk
 
-Every DATA frame carries an 8-byte monotonic sequence number authenticated as AEAD AAD. The receiver requires each incoming `seq` to be strictly greater than the last accepted value. Replayed frames are rejected with `FrameError::Replay`; any tampering with the sequence number produces an AEAD authentication failure. Counters reset to zero on every `rotate_key()` call (new epoch, new counter).
-
-## Workspace Structure
-
-```
-latticeshield/
-├── Cargo.toml                   # Workspace root — all dependencies centralized
-├── deny.toml                    # cargo-deny: blocks oqs-rs, openssl, unsafe advisories
-├── latticeshield-crypto/        # Cryptographic engine (shared by bridge + client)
-│   └── src/
-│       ├── lib.rs
-│       ├── handshake.rs         # Hybrid X25519 + ML-KEM-768 + HKDF-SHA256 + server auth
-│       ├── signing.rs           # ML-DSA-65 sign/verify (OTA + server authentication)
-│       └── channel.rs           # AES-256-GCM frame format + HKDF ratchet + monotonic seq (shared transport)
-├── latticeshield-bridge/        # Server-side proxy agent (also exposes [lib] for identity + tls)
-│   └── src/
-│       ├── main.rs              # Entry point — config load + server startup (deprecated keygen subcommands removed)
-│       ├── server.rs            # Three listeners: PQC + TLS + QUIC
-│       ├── session.rs           # PQC handshake (server) + AES-GCM relay + key rotation
-│       ├── tls.rs               # rustls ServerConfig, TlsAcceptor, self-signed cert gen
-│       ├── http_relay.rs        # HTTP/1.1 relay for TLS listener (httparse + tokio::io::copy)
-│       ├── quic.rs              # QUIC relay (quinn 0.11) — raw bidi stream → TCP
-│       ├── identity.rs          # ServerIdentity + ClientVerifyingIdentity: load/generate ML-DSA-65 keypairs
-│       ├── config.rs            # TOML config — BridgeConfig + ValidConfig + AuthConfig + AdminConfig
-│       ├── metrics.rs           # Prometheus /metrics endpoint + MetricsState
-│       ├── control_plane.rs     # Heartbeat to remote control plane
-│       └── admin.rs             # Admin PQC channel (:8445) — mutual ML-DSA-65 auth (opt-in)
-├── latticeshield-client/        # Client-side proxy agent
-│   └── src/
-│       ├── main.rs              # Entry point — tracing init, config load, server startup
-│       ├── server.rs            # TCP listener on listen_addr, connection pool construction + warmer spawn, tokio::spawn per connection, graceful shutdown
-│       ├── pool.rs              # Pre-warmed TCP connection pool — acquire(), warm_loop(), shutdown()
-│       ├── client_session.rs    # PQC handshake (client) + mutual auth signing + pool acquire + stale conn retry + AES-GCM relay
-│       ├── identity.rs          # load_verifying_key() + ClientIdentity (load/generate/zeroize) + SHA-256 fingerprint
-│       └── config.rs            # TOML config — ClientConfig + ValidClientConfig + ReconnectConfig + PoolConfig
-└── latticeshield-cli/           # Unified CLI — single entry point for all setup and key operations
-    └── src/
-        └── main.rs              # Binary `latticeshield` — keygen server/client/tls + vk-info + ASCII banner
+# Option C — browser clients: use VK-share (see below)
 ```
 
-## Configuration
+Every client needs `server.vk` before it can connect. Ship it out-of-band — SSH, config management, Docker image, whatever fits your deployment. Never fetch it over the same connection it protects; that would defeat the authentication entirely. A client that has the wrong VK (or no VK) will reject the handshake.
 
-### Admin PQC Channel (`[admin]`)
+> **Mutual client authentication** is on by default. The config above disables it implicitly since there is no `[auth]` section — the bridge will log a warning at startup. For production deployments with mutual auth see **[QUICKSTART.md](QUICKSTART.md)**.
 
-The admin channel is disabled by default. To enable it, add an `[admin]` section to the bridge config file:
+---
+
+## Listeners & ports
+
+| Protocol | Default port | Section | Enable |
+|---|---|---|---|
+| PQC TCP | `0.0.0.0:8443` | `[server]` | Always on |
+| TLS/HTTPS | `0.0.0.0:8440` | `[tls]` | `tls.enabled = true` |
+| QUIC (UDP) | `0.0.0.0:8441` | `[quic]` | `quic.enabled = true` |
+| WebSocket (WSS) | `0.0.0.0:8446` | `[websocket]` | `websocket.enabled = true` |
+| Prometheus metrics | `0.0.0.0:8444` | `[metrics]` | Always on (plain HTTP) |
+| Admin PQC | `0.0.0.0:8445` | `[admin]` | `admin.enabled = true` |
+
+All ports must be distinct. The bridge validates for collisions at startup and refuses to start if any two listeners share a port.
+
+---
+
+## Configuration reference
+
+Full example — every section shown with its defaults:
 
 ```toml
+[server]
+listen_addr             = "0.0.0.0:8443"
+backend_addr            = "127.0.0.1:8080"
+max_frame_size          = 65536
+handshake_timeout_secs  = 10
+max_connections_per_ip  = 50
+
+[crypto]
+signing_key_path        = "./keys/server.sk"
+
+[auth]
+client_vk_path          = "./keys/client.vk"   # omit to disable mutual auth
+# require_client_auth   = false                 # default: true
+
+[tls]
+enabled                 = false
+listen_addr             = "0.0.0.0:8440"
+cert_path               = "./keys/tls.crt"
+key_path                = "./keys/tls.key"
+
+[quic]
+enabled                 = false
+listen_addr             = "0.0.0.0:8441"
+cert_path               = "./keys/tls.crt"
+key_path                = "./keys/tls.key"
+
+[websocket]
+enabled                 = false
+listen_addr             = "0.0.0.0:8446"
+cert_path               = "./keys/tls.crt"
+key_path                = "./keys/tls.key"
+allowed_origins         = ["https://app.example.com"]
+handshake_timeout_secs  = 10
+max_connections_per_ip  = 100
+
 [admin]
-enabled = true
-listen_addr = "0.0.0.0:8445"
-control_plane_vk_path = "./keys/cp.vk"
-# Optional — defaults shown below
-rate_limit_per_second = 5
-handshake_timeout_secs = 10
+enabled                        = false
+listen_addr                    = "0.0.0.0:8445"
+control_plane_vk_path          = "./keys/admin.vk"
+rate_limit_per_second          = 5
+handshake_timeout_secs         = 10
+
+[control_plane]
+enabled                  = false
+endpoint                 = "https://cp.example.com"
+agent_name               = ""           # defaults to $HOSTNAME
+heartbeat_interval_secs  = 30
+install_token            = ""           # or set $INSTALL_TOKEN env var
+
+[key_rotation]
+enabled              = false
+max_bytes_per_key    = 10737418240     # 10 GiB
+max_seconds_per_key  = 86400           # 24 h
+
+[logging]
+level = "info"                          # trace | debug | info | warn | error
+
+[metrics]
+listen_addr             = "0.0.0.0:8444"
 ```
+
+### [server]
+
+| Field | Default | Validation | Description |
+|---|---|---|---|
+| `listen_addr` | `"0.0.0.0:8443"` | valid socket addr | Address the PQC TCP listener binds to |
+| `backend_addr` | `"127.0.0.1:8080"` | valid socket addr | Destination backend — receives plain TCP |
+| `max_frame_size` | `65536` | 1024–16 777 216 | Maximum AES-256-GCM frame size in bytes |
+| `handshake_timeout_secs` | `10` | ≥ 1 | Seconds allowed to complete the PQC handshake. Applies only to the handshake phase — relay has no timeout |
+| `max_connections_per_ip` | `50` | ≥ 1 | Per-source-IP connection cap. Excess connections are dropped immediately to prevent CPU exhaustion from ML-DSA-65 signature generation under flood |
+
+### [crypto]
+
+| Field | Default | Required | Description |
+|---|---|---|---|
+| `signing_key_path` | `"./keys/server.sk"` | yes | Path to the ML-DSA-65 signing key (binary, 4032 bytes). Generated by `keygen`. The file must have mode `0600` — the bridge refuses to load a key with looser permissions |
+
+The verifying key (`server.vk`) is loaded automatically from the same directory as `signing_key_path`. It is distributed to clients out-of-band — it is never transmitted over the wire. See [VK-share](#vk-share) for how to distribute the verifying key to browser clients automatically.
+
+### [auth]
+
+| Field | Default | Required | Description |
+|---|---|---|---|
+| `client_vk_path` | — | no | Path to the client's ML-DSA-65 verifying key (1952 bytes). When present, the bridge requires every client to prove its identity during the PQC handshake |
+| `require_client_auth` | `true` | — | When `client_vk_path` is omitted, set this to `false` explicitly to suppress the startup warning. Omitting this field while also omitting `client_vk_path` logs a `WARN` at startup |
+
+Omitting the `[auth]` section entirely disables mutual authentication. A `WARN` is emitted at startup to remind operators that client identity is not being verified.
+
+### [tls]
+
+| Field | Default | Required | Description |
+|---|---|---|---|
+| `enabled` | `false` | — | Activate the TLS/HTTPS relay listener |
+| `listen_addr` | `"0.0.0.0:8440"` | — | TCP address for the TLS listener |
+| `cert_path` | `"./keys/tls.crt"` | when enabled | PEM certificate |
+| `key_path` | `"./keys/tls.key"` | when enabled | PEM private key |
+
+Generate a self-signed cert for development: `latticeshield-bridge tls-keygen ./keys`
+
+### [quic]
+
+| Field | Default | Required | Description |
+|---|---|---|---|
+| `enabled` | `false` | — | Activate the QUIC (UDP) listener |
+| `listen_addr` | `"0.0.0.0:8441"` | — | UDP address for the QUIC endpoint |
+| `cert_path` | — | when enabled | PEM certificate (can reuse TLS cert) |
+| `key_path` | — | when enabled | PEM private key |
+
+Each QUIC bidirectional stream maps to one fresh TCP connection to the backend.
+
+### [websocket]
+
+| Field | Default | Required | Description |
+|---|---|---|---|
+| `enabled` | `false` | — | Activate the WSS listener for browser SDK clients |
+| `listen_addr` | `"0.0.0.0:8446"` | — | TCP address |
+| `cert_path` | — | when enabled | PEM certificate |
+| `key_path` | — | when enabled | PEM private key |
+| `allowed_origins` | `[]` | — | Array of allowed `Origin` headers e.g. `["https://app.example.com", "http://localhost:3000"]`. Empty array accepts all origins and emits a `WARN` log — use only in development |
+| `handshake_timeout_secs` | `10` | — | PQC handshake timeout for WebSocket connections |
+| `max_connections_per_ip` | `100` | — | Per-IP WebSocket connection cap |
+
+Origins are normalized per RFC 6454 (`scheme://host:port`). The comparison is exact after normalization — paths, query strings, and fragments are rejected.
+
+### [admin]
+
+The admin channel accepts a single PQC-authenticated TCP connection, reads one JSON command, responds, and closes. Mutual ML-DSA-65 authentication is mandatory.
+
+| Field | Default | Required | Description |
+|---|---|---|---|
+| `enabled` | `false` | — | Activate the admin listener |
+| `listen_addr` | `"0.0.0.0:8445"` | — | TCP address |
+| `control_plane_vk_path` | — | when enabled | ML-DSA-65 verifying key of the control plane |
+| `rate_limit_per_second` | `5` | — | Max admin commands per second |
+| `handshake_timeout_secs` | `10` | — | PQC handshake timeout |
+
+Generate an admin keypair: `latticeshield-bridge admin-keygen ./keys`  
+Place `admin.vk` in `control_plane_vk_path` on the bridge; keep `admin.sk` on the control plane.
+
+### [control_plane]
 
 | Field | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Set to `true` to open the admin listener |
-| `listen_addr` | `0.0.0.0:8445` | Address and port for the admin PQC channel |
-| `control_plane_vk_path` | *(required when enabled)* | Path to the control plane's ML-DSA-65 verifying key |
-| `rate_limit_per_second` | `5` | Max handshake attempts per second from a single IP |
-| `handshake_timeout_secs` | `10` | Seconds before an incomplete handshake is aborted |
+| `enabled` | `false` | Send periodic heartbeats to the control plane |
+| `endpoint` | `""` | Control plane URL e.g. `https://cp.example.com` |
+| `agent_name` | `""` | Bridge identifier. Defaults to `$HOSTNAME` if empty |
+| `heartbeat_interval_secs` | `30` | Seconds between heartbeats (floor: 5) |
+| `install_token` | `""` | Registration token. Also readable from `$INSTALL_TOKEN` |
 
-#### Generating the admin keypair
+Heartbeat failures are non-fatal — the bridge continues serving traffic if the control plane is unreachable.
+
+### [key_rotation]
+
+| Field | Default | Validation | Description |
+|---|---|---|---|
+| `enabled` | `false` | — | Enable automatic AES session key rotation |
+| `max_bytes_per_key` | `10737418240` | ≥ 1 MiB | Bytes encrypted before rotating (10 GiB default) |
+| `max_seconds_per_key` | `86400` | ≥ 60 | Seconds before forcing rotation (24 h default) |
+
+Key rotation uses HKDF-SHA256 ratcheting: the new key is derived from the current key + a random 32-byte nonce. The old key is zeroized immediately. Rotation can also be triggered manually via the admin channel (`Rotate` command).
+
+### [logging]
+
+| Field | Default | Description |
+|---|---|---|
+| `level` | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error`. Overridden by `$RUST_LOG` |
+
+### [metrics]
+
+| Field | Default | Description |
+|---|---|---|
+| `listen_addr` | `"0.0.0.0:8444"` | Address for the Prometheus metrics HTTP server. Always active — cannot be disabled |
+
+The endpoint responds on `GET /metrics` with Prometheus text format. It returns security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control: no-store`, and a strict CSP). Do not expose this port to the public internet without an authentication proxy in front of it.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `RUST_LOG` | — | Overrides `[logging].level`. Supports per-module filters e.g. `RUST_LOG=latticeshield_bridge=debug` |
+| `INSTALL_TOKEN` | — | Overrides `[control_plane].install_token` |
+| `SHUTDOWN_TIMEOUT_SECS` | `30` | Seconds to wait for active sessions to drain on SIGTERM/SIGINT before forcing shutdown |
+| `LATTICE_VK_TOKEN_MAX` | `1000` | Maximum entries in the in-memory VK-share token store |
+| `HOSTNAME` | — | Used as `agent_name` when `[control_plane].agent_name` is empty |
+
+---
+
+## CLI reference
 
 ```sh
-latticeshield-bridge admin-keygen ./keys
+# Start the bridge
+latticeshield-bridge run [--config <path>]          # default: ./config.toml
+
+# Generate ML-DSA-65 server keypair
+latticeshield-bridge keygen <dir>
+# → <dir>/server.sk  (permissions 0600)
+# → <dir>/server.vk  (permissions 0644)
+
+# Generate self-signed TLS certificate (development)
+latticeshield-bridge tls-keygen <dir>
+# → <dir>/tls.crt
+# → <dir>/tls.key
+
+# Generate admin channel ML-DSA-65 keypair
+latticeshield-bridge admin-keygen <dir>
+# → <dir>/admin.sk  (permissions 0600)
+# → <dir>/admin.vk  (permissions 0644)
 ```
 
-This writes `admin.sk` (0o600) and `admin.vk` (0o644) to `./keys`. The bridge loads `admin.sk` at startup to sign its side of the mutual handshake. The control plane must hold a copy of `admin.vk`, and the bridge must hold a copy of the control plane's `cp.vk` (set in `control_plane_vk_path`).
+---
 
-## Security Constraints
+## Browser SDK (`@latticeshield/js`)
+
+Browsers can connect to LatticeShield directly — no plugin, no native agent. The bridge WebSocket listener (`:8446`) speaks the same hybrid PQC handshake as the Rust client. All crypto runs inside a Web Worker backed by a WASM module so session keys never touch the main thread.
+
+```sh
+npm install @latticeshield/js
+```
+
+```ts
+import { PQCSession } from '@latticeshield/js';
+
+const session = new PQCSession({
+  bridgeUrl:      'wss://bridge.example.com:8446',
+  serverVkBytes:  SERVER_VK,   // Uint8Array(1952) — pin at build time
+});
+
+await session.connect();
+await session.send(new TextEncoder().encode('hello'));
+session.on('message', (data) => console.log(data));
+```
+
+**React hook** with automatic exponential-backoff reconnect (1 s × 2ⁿ, cap 30 s, 3 retries):
+
+```ts
+import { usePQCSession } from '@latticeshield/js';
+
+const { status, send, lastMessage, error } = usePQCSession({
+  bridgeUrl:     'wss://bridge.example.com:8446',
+  serverVkBytes: SERVER_VK,
+});
+```
+
+**CSP requirements:**
+```http
+Content-Security-Policy:
+  script-src  'self' 'wasm-unsafe-eval';
+  worker-src  'self' blob:;
+  connect-src 'self' wss://bridge.example.com:8446;
+```
+
+The `serverVkBytes` must be pinned at build time — never fetched at runtime. See [`latticeshield-js/README.md`](latticeshield-js/README.md) for the full API reference, SRI hashing, and VK distribution guide.
+
+---
+
+## VK-share
+
+Browser clients need the server verifying key (`server.vk`) before they can open a session. Hardcoding the 1952-byte key at build time is the most secure option, but LatticeShield also provides a **VK-share** mechanism for dynamic distribution: the bridge generates a short-lived one-time URL that a client can use to retrieve the key over HTTPS.
+
+### How it works
+
+1. A control-plane operator sends a `GetVkToken` command to the admin channel (`:8445`). The bridge returns a random token.
+2. The client fetches `GET https://bridge.example.com:8440/vk/<token>` — the TLS listener serves the raw verifying key bytes.
+3. The token is single-use and expires after 10 minutes. If the token is unknown or expired the bridge returns `404`. The token store is capped at 1000 entries; new requests return `429` when the cap is reached.
+
+### When to use VK-share
+
+VK-share is designed for scenarios where baking the key at build time is impractical — for example, a SaaS product where tenants each have their own bridge instance and the browser app discovers the correct key at runtime. For fixed deployments (your own infrastructure, your own clients), distributing `server.vk` out-of-band and pinning it at build time is simpler and has a smaller attack surface.
+
+### Requirements
+
+The TLS listener (`[tls]`) must be enabled — VK-share is served over HTTPS, not plain HTTP.
+
+```sh
+# Generate a token via the admin channel
+# (requires admin channel enabled and admin.sk on the control plane)
+latticeshield-admin get-vk-token --admin-addr 127.0.0.1:8445 --vk ./keys/admin.sk
+# → {"token":"a3f8..."}
+
+# Client fetches the verifying key
+curl https://bridge.example.com:8440/vk/a3f8...
+# → raw 1952-byte binary (application/octet-stream)
+```
+
+---
+
+## Security design
+
+### Cryptographic primitives
+
+| Role | Algorithm | Standard |
+|---|---|---|
+| Key encapsulation | ML-KEM-768 | NIST FIPS 203 |
+| Classical key exchange | X25519 | RFC 7748 |
+| Key derivation | HKDF-SHA256 | RFC 5869 |
+| Symmetric encryption | AES-256-GCM | NIST SP 800-38D |
+| Server/client signatures | ML-DSA-65 | NIST FIPS 204 |
+| Signing domain separator | `"latticeshield-v1"` | FIPS 204 §5.2 |
+
+All primitives are pure Rust — no C FFI, no OpenSSL, no `oqs-rs`.
+
+### Handshake flow (server-auth, no mutual auth)
+
+```
+Server                                     Client
+  │                                           │
+  │  server_hello_signed (4557 B)             │
+  │  = X25519_pub(32) + ML-KEM_EK(1184)       │
+  │    + nonce(32) + ML-DSA-65_sig(3309)      │
+  │ ─────────────────────────────────────────▶│
+  │                                           │  parse + verify ML-DSA-65 sig
+  │                                           │  encapsulate ML-KEM-768
+  │                                           │  X25519 DH
+  │                                           │  HKDF(x25519_secret || kem_secret, nonce)
+  │  client_response (1120 B)                 │
+  │  = X25519_pub(32) + ML-KEM_CT(1088)       │
+  │◀─────────────────────────────────────────│
+  │  decapsulate ML-KEM                       │
+  │  X25519 DH                                │
+  │  HKDF → same SessionKey ──────────────────┤
+  │                                           │
+  │◀════ AES-256-GCM encrypted relay ════════▶│
+```
+
+### Wire format constants
+
+| Constant | Bytes | Description |
+|---|---|---|
+| `SERVER_HELLO_SIGNED_LEN` | 4557 | Signed server hello (VK **not** on wire — pre-shared) |
+| `CLIENT_RESPONSE_LEN` | 1120 | Client key-exchange response |
+| `VERIFYING_KEY_LEN` | 1952 | ML-DSA-65 public key |
+| `SIGNING_KEY_LEN` | 4032 | ML-DSA-65 private key |
+| `SIGNATURE_LEN` | 3309 | ML-DSA-65 signature |
+| `KEY_ROTATE_FRAME_LEN` | 61 | Key rotation frame: tag(1)+nonce(12)+enc\_nonce(32)+tag(16) |
+
+### DATA frame (v3)
+
+```
+[0x01][4B len][8B seq u64-BE][12B AES-GCM nonce][ciphertext][16B GCM tag]
+```
+
+The `seq` field is included as AES-GCM AAD — tampering with the sequence number is detected as an authentication failure. Out-of-order or replayed frames are rejected immediately (`FrameError::Replay`).
+
+### Security constraints
 
 | Constraint | Reason |
 |---|---|
-| Pure Rust — no FFI | Eliminates entire class of memory-safety bugs at the boundary |
-| No `oqs-rs` | C FFI wrapper; rejected in favor of native Rust implementations |
-| No `openssl` | Legacy C library; rejected via `cargo-deny` |
-| `libcrux-ml-dsa 0.0.8` instead of `ml-dsa` | `ml-dsa 0.0.4` has RUSTSEC-2025-0144 (timing side-channel) + CVE-2026-24850. Using audited libcrux alternative until RustCrypto publishes `ml-dsa 0.1.0` stable. `0.0.8` fixes two correctness bugs in signature verification (γ₁ norm check + hint decoding panic) |
-| Pre-shared server VerifyingKey | Server's ML-DSA-65 VK is distributed out-of-band — never transmitted on the wire, preventing MITM key substitution |
-| Pre-shared client VerifyingKey | Client's ML-DSA-65 VK is pre-shared to the bridge (one authorized keypair per bridge). Bridge rejects any unsigned or wrongly-signed ClientResponse |
-| `require_client_auth = true` by default | Bridge refuses to start if `[auth].client_vk_path` is not set. Set `require_client_auth = false` in the `[auth]` section to allow unauthenticated clients (opt-out) |
-| Session-bound client signature | Client signs `ClientResponse bytes \|\| ServerHello bytes` — the signature covers the server's per-session nonce, making replay attacks across sessions impossible |
-| `mlock(2)` on SigningKey | Key material stored in heap-allocated `Box<[u8; 4032]>` and memory-locked via `libc::mlock` — never paged to swap |
+| Pure Rust, no FFI | Eliminates entire classes of memory unsafety in the crypto path |
+| VK pre-shared, not on wire | Prevents MITM substituting the verifying key on first connect |
+| `wss://` required for browser | Plain `ws://` would expose the PQC handshake to a network attacker |
+| `SigningKey` memory-locked | `mlock(2)` prevents the private key from being swapped to disk |
+| Signing context `"latticeshield-v1"` | Domain-separates signatures across versions and implementations |
+| Per-IP connection cap | Limits CPU cost of ML-DSA-65 verification under connection floods |
+| Handshake-only timeout | Relay has no timeout — streaming use-cases are not penalized |
 
-## Dependencies (key)
+---
 
-| Crate | Version | Purpose |
+## Prometheus metrics
+
+Exposed at `http://<metrics_addr>/metrics` (plain HTTP, no auth).
+
+| Metric | Type | Description |
 |---|---|---|
-| `ml-kem` | 0.2 | ML-KEM-768 (FIPS 203) — pure Rust |
-| `x25519-dalek` | 2 | X25519 ECDH — pure Rust |
-| `hkdf` + `sha2` | 0.12 / 0.10 | HKDF-SHA256 key derivation |
-| `aes-gcm` | 0.10 | AEAD encryption |
-| `tokio` | 1 | Async runtime |
-| `quinn` | 0.11 | QUIC transport |
-| `rustls` | 0.23 | TLS with post-quantum support (X25519MLKEM768) |
-| `reqwest` | 0.12 | HTTP client for control plane (rustls backend, hybrid PQ key exchange) |
-| `axum` | 0.7 | Control plane HTTP API |
-| `zeroize` | 1 | Secure key material cleanup |
+| `latticeshield_connections_total` | Counter | Total accepted connections |
+| `latticeshield_connections_active` | Gauge | Currently open sessions |
+| `latticeshield_handshake_duration_seconds` | Histogram | PQC handshake latency |
+| `latticeshield_bytes_transmitted_total` | Counter | Total encrypted bytes relayed |
+| `latticeshield_channel_errors_total` | Counter | AES-GCM / framing errors |
+| `latticeshield_key_rotations_total` | Counter | Session key rotation events |
 
-## Requirements
+The `/metrics` endpoint returns `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`, and a strict `Content-Security-Policy`.
 
-- Rust 1.75+ (edition 2021, resolver v2)
-- Tested with Rust 1.94.0
+---
 
-## Build
+## Workspace structure
 
-```sh
-cargo build
+```
+latticeshield/
+├── latticeshield-crypto/   # ML-KEM-768, X25519, ML-DSA-65, AES-256-GCM, HKDF
+├── latticeshield-bridge/   # Reverse proxy binary + all listeners + CLI
+├── latticeshield-wasm/     # latticeshield-crypto compiled to WASM (for browsers)
+└── latticeshield-js/       # @latticeshield/js npm package (PQCSession, usePQCSession)
 ```
 
-```sh
-cargo test
-```
+---
+
+## Building from source
 
 ```sh
-# Release — LTO enabled, binary stripped
-cargo build --release
+# Requires Rust 1.75+
+cargo build --release -p latticeshield-bridge
+
+# Build the browser WASM module (requires wasm-pack)
+wasm-pack build --target bundler latticeshield-wasm
+
+# Build the JS SDK
+cd latticeshield-js && npm install && npm run build
 ```
+
+---
 
 ## Tests
 
-456 unit + integration tests across all four crates — all passing.
+```sh
+cargo test --workspace      # 457 Rust tests
+cd latticeshield-js && npm test   # 93 TypeScript tests
+```
 
-### latticeshield-crypto (45 tests)
+| Crate / Package | Tests | Coverage highlights |
+|---|---|---|
+| `latticeshield-crypto` | 135 | Handshake vectors, anti-replay, key rotation, signing domain separation |
+| `latticeshield-bridge` | 209 + 47 + 45 | Config validation, integration (TCP, WebSocket, TLS), per-IP cap, admin channel |
+| `latticeshield-wasm` | 10 | WASM exports, WASM↔Rust wire format parity |
+| `latticeshield-js` | 93 | PQCSession lifecycle, VK copy, unexpected close, framing, nonce layout |
 
-| Module | Tests |
-|---|---|
-| `handshake` | Hybrid handshake, server auth (signed ServerHello, pre-shared VK, tamper detection), mutual auth (signed ClientResponse roundtrip, wrong VK, tampered CR, wrong ServerHello) |
-| `signing` | ML-DSA-65 keygen, sign, verify, hedged randomness, serialization round-trips |
-| `channel` | Frame format (DATA 0x01, KEY_ROTATE 0x02), read/write roundtrips, encrypted KEY_ROTATE wire format (61B: GCM nonce + encrypted nonce + tag), tampered KEY_ROTATE AEAD failure, error types, `rotate_key` HKDF ratchet (deterministic, chained), seq monotonic increment, replay rejection, post-rotation seq reset, tampered-seq AEAD failure, sequential receive, out-of-order recv_seq rejection (recv_seq ≠ 0) |
+---
 
-### latticeshield-bridge (354 tests)
+## What's New
 
-| Module | Tests |
-|---|---|
-| `config` | TOML load/defaults/validation, TLS config, QUIC config, control plane config, key rotation config, auth config, admin config (enabled/disabled/field validation/port collision), port collision detection, `handshake_timeout_secs` and `max_connections_per_ip` validation |
-| `tls` | `build_server_config`, `build_acceptor`, cert/key loading, self-signed generation (feature-gated) |
-| `http_relay` | HTTP head parsing (complete/partial/oversized), GET forwarding, POST with body, backend down → 502 |
-| `quic` | `build_endpoint`, `relay_stream` end-to-end, backend down → error, normal connection close |
-| `identity` | ServerIdentity: generate_and_save (files, permissions, sizes), load roundtrip, error paths. ClientVerifyingIdentity: load roundtrip, wrong size rejected |
-| `metrics` | Prometheus families, HTTP `/metrics` endpoint (security headers: X-Content-Type-Options, X-Frame-Options, Cache-Control, CSP), session/byte counters, connection gauge, key rotations counter |
-| `control_plane` | Registration success/failure, heartbeat URL, capabilities payload |
-| `admin` | Mutual ML-DSA-65 handshake (full round-trip), wrong client key rejected, `get-metrics` / `rotate` / `get-vk-token` command dispatch |
-| `server` | BridgeCommand dispatch: Rotate increments rotate_tx + key_rotations_total, Unknown ignored, multiple Rotates accumulate correctly |
-| `session` (integration) | Full PQC handshake + relay, mutual auth (with/without client auth, wrong VK rejection), tampered response rejection, key uniqueness, POST `/rotate`, time-based and byte-threshold key rotation |
+### v0.3.1 — Browser SDK Auto-Reconnect (2026-05-14)
 
-### latticeshield-client (49 tests)
+Fixed two bugs that made auto-reconnect permanently broken in `@latticeshield/js`. The server verification key was silently zeroed after the first handshake (Transferable buffer detachment), and unexpected WebSocket drops were not detected (no `close` event emitted). The `usePQCSession` React hook already had full reconnect logic — it now fires correctly. Also fixes a `seqToNonce` nonce layout mismatch (bytes 4–11 instead of 0–7) that caused decryption failures from the second frame onwards.
 
-| Module | Tests |
-|---|---|
-| `pool` | acquire from non-empty pool (no connect), acquire from empty pool (fresh connect fallback), acquire fails when bridge down, idle timeout eviction, partial eviction, max_size cap respected, warm_size=0 makes no connects, TCP_NODELAY set on warmed and fallback streams, shutdown drains connections with FIN, shutdown with empty pool |
-| `config` | TOML defaults, custom values, missing file, bad TOML, invalid addrs, out-of-range max_frame_size, empty vk_path, client_sk_path, reconnect section, pool section defaults, explicit pool values, warm_size > max_size rejected, max_size=0 rejected, idle_timeout_secs=0 rejected, warm_size=0 accepted |
-| `identity` | ServerVK: load roundtrip, wrong size, nonexistent file, fingerprint. ClientIdentity: load roundtrip, wrong permissions rejected, wrong size, generate_and_save (files, permissions 0o600/0o644) |
-| `client_session` | Bridge connect refused → EOF, tampered signature → Ok(()), stale pooled conn → fresh connect retry, stale and fresh both fail → Ok(()), auth failure does not retry, pool.acquire() error → user EOF |
-| `server` | Listener binds and accepts connections, shutdown stops warmer |
-| integration | Full PQC relay round-trip (client ↔ mock bridge ↔ echo backend), KEY_ROTATE survives relay, pool-enabled session flow |
+### v0.3.0 — Security Hardening (2026-05-13)
 
-### latticeshield-cli (7 tests)
+Closes 9 pending security audit findings. Introduces ML-DSA-65 domain separation (`latticeshield-v1` signing context), WebSocket origin normalization (RFC 6454), VK token store DoS protection (cap 1000, eviction, HTTP 429), `/metrics` security response headers, per-IP TCP connection cap, dedicated PQC handshake timeout, and fixes a broken key-fetch function in the JS SDK. Version bump 0.2.0 → 0.3.0 (breaking: signing context change).
 
-| Test | What it verifies |
-|---|---|
-| `keygen_server_creates_files` | `keygen server` produces `server.sk` (4032B, 0o600) and `server.vk` (1952B, 0o644) |
-| `keygen_client_creates_files` | `keygen client` produces `client.sk` (4032B, 0o600) and `client.vk` (1952B, 0o644) |
-| `keygen_tls_creates_files` | `keygen tls` produces `tls.crt` and `tls.key` |
-| `vk_info_server_vk` | `vk-info server.vk` prints File, Size (1952), SHA-256 (64 hex chars) |
-| `vk_info_client_vk` | `vk-info client.vk` prints File, Size (1952), SHA-256 |
-| `vk_info_nonexistent` | `vk-info` with missing file exits non-zero |
-| `help_shows_banner` | `--help` output includes "LatticeShield" |
+---
 
-## Roadmap
+## Contributing
 
-### Completed
+Pull requests are welcome. Before opening one:
 
-| Month | Milestone |
-|---|---|
-| 1–3 | Cryptographic engine — hybrid handshake (X25519 + ML-KEM-768), anti-replay, ML-DSA-65 OTA signing, Prometheus observability |
-| 4 | Server authentication — ML-DSA-65 signed ServerHello, pre-shared VK model, mlock on signing key |
-| 5 | Bridge server auth — `ServerIdentity` load/generate, `--keygen` subcommand, file permission enforcement |
-| 6 | Config file (TOML), control plane heartbeat, session key rotation |
-| 7 | TLS listener (rustls 0.23, `:8440`) + QUIC listener (quinn 0.11, `:8441`) — standard HTTPS/QUIC clients without agent |
-| 8–9 | Client agent — local PQC proxy, mutual ML-DSA-65 auth (signed ClientResponse), reconnect/backoff |
-| 10 | Unified CLI `latticeshield` — `keygen server/client/tls`, `vk-info`, ASCII banner |
-| 11 | Connection pool in client — proactive warming, lazy close, pure tokio |
-| 12 | `server_vk` in registration payload + `latticeshield vk-share` — one-time VK distribution link (10-min expiry, single-use) |
-| 13 | Admin PQC channel (`:8445`) — mutual ML-DSA-65 auth, opt-in `[admin]` config section, `admin-keygen` subcommand |
-| 14 | Cloud Integration Foundation — signed heartbeats (ML-DSA-65), `HeartbeatResponse` + `BridgeCommand` parsing, `install_token` for automated onboarding, token redaction in logs |
-| 15 | Hybrid TLS + Command Wiring — post-quantum-safe outbound HTTPS for bridge→cloud (reqwest + rustls, X25519MLKEM768), `BridgeCommand::Rotate` wired to actual key rotation |
-| 16 | Pre-production Hardening — graceful shutdown (SIGTERM/SIGINT drain with configurable timeout), Mutex poison recovery in `vk_share.rs`, flaky test eliminated in `control_plane` and `session` |
-| 17 | Sequence Numbers + Framing v3 — monotonic `seq` (u64 BE) field in DATA frames authenticated as AEAD AAD; receiver rejects replays; `FrameError` enum; `rotate_key()` resets both counters; closes G1/D4 |
-| 18 | Security Enforcement — `require_client_auth = true` by default with explicit opt-out via `[auth]` section (G2); KEY_ROTATE nonce encrypted with AES-256-GCM (61-byte wire format) instead of plaintext (G4); `AntiReplayFilter` dead code removed — 0-RTT tickets never implemented (G5); env-var race in `control_plane` tests eliminated |
-| 19 | CI/Release Pipeline — GitHub Actions CI gate (fmt + clippy + deny + test on every push/PR); release workflow cross-compiles 3 binaries × 4 targets (linux-x64/arm64, darwin-x64/arm64), merges per-target SHA-256 checksums into a single manifest, publishes to GitHub Releases on tag push; `install.sh` one-command install with platform detection + checksum verification + privilege-aware install; `contrib/systemd/` and `contrib/launchd/` service files with hardened configuration; `metrics-exporter-prometheus` and `latticeshield-cli reqwest` dep fixes to remove transitive native-tls/OpenSSL |
-| 20 | *(not shipped — scope deferred to later milestones)* |
-| 21 | WASM Spike — `latticeshield-wasm` crate validated on `wasm32-unknown-unknown`; `libcrux-ml-kem` confirmed WASM-compatible without SIMD; exports `wasm_generate_client_response` and `wasm_verify_server_hello` via wasm-bindgen; compiled with wasm-pack (`--target bundler`) |
-| 22 | Browser SDK — WebSocket listener (`:8446`, opt-in via `[websocket]` config) transporting the existing PQC wire protocol; `@latticeshield/js` TypeScript npm package with `PQCSession` class, `usePQCSession` React hook, Web Worker isolation for WASM + crypto.subtle, framing v3 (BigInt seq, deterministic nonce, AES-256-GCM); security fixes EC-7/EC-8/EC-9 |
-| 23 | Browser SDK Hardening — SRI hash auto-generated by `npm run build` (`latticeshield_bg.wasm.sha384`); TypeScript CI coverage added; out-of-order `recv_seq` test (general case, recv_seq ≠ 0) added to `channel.rs` |
-| 24 | Security Hardening (v0.3.0) — ML-DSA-65 domain separation (`latticeshield-v1` context), WebSocket origin normalization, VK token store DoS protection (cap 1000 + eviction + HTTP 429), handshake-scoped timeout, broken key-fetch fixed in JS SDK, seq overflow guard in framing |
-| 25 | Operational Security Hardening — `/metrics` security response headers, per-IP TCP connection cap (`[server].max_connections_per_ip`, default 50), dedicated `[server].handshake_timeout_secs` decoupled from WebSocket timeout |
+1. `cargo test --workspace` — all Rust tests must pass
+2. `cd latticeshield-js && npm test` — all TypeScript tests must pass
+3. `cargo fmt --check` — code must be formatted
+4. `cargo clippy -- -D warnings` — no new warnings
+
+For changes larger than a bug fix, open an issue first so the approach can be discussed before you write code. The project follows [Conventional Commits](https://www.conventionalcommits.org/). Do not include AI attribution in commit messages.
+
+---
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
-
-Copyright 2026 Nahuel Llamas.
+Apache 2.0 — see [LICENSE](LICENSE).
