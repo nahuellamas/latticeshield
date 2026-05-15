@@ -4,7 +4,7 @@ use criterion::{
 use latticeshield_crypto::{
     client_respond, generate_keypair, parse_server_hello, parse_server_hello_signed,
     serialize_client_response, serialize_client_response_signed, EncryptedChannel, ServerHandshake,
-    SERVER_HELLO_LEN,
+    SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 use rand_core::OsRng;
 use std::io::Cursor;
@@ -71,6 +71,7 @@ fn bench_handshake_signed(c: &mut Criterion) {
                 // Extract the raw (unsigned) hello from the signed wire format.
                 // Wire layout: server_hello_raw[..SERVER_HELLO_LEN] || ML-DSA-65-sig[..SIGNATURE_LEN]
                 // If the wire format ever changes, update this extraction accordingly.
+                debug_assert_eq!(hello_signed.len(), SERVER_HELLO_SIGNED_LEN);
                 let mut hello_raw = [0u8; SERVER_HELLO_LEN];
                 hello_raw.copy_from_slice(&hello_signed[..SERVER_HELLO_LEN]);
                 (server, hello_signed, hello_raw, rng)
