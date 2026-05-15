@@ -645,6 +645,21 @@ cd latticeshield-js && npm test           # 93 TypeScript tests
 
 ---
 
+## Benchmarks
+
+In-memory microbenchmarks (no network I/O — all byte passing via `Vec<u8>` / `Cursor`):
+
+```sh
+cargo bench -p latticeshield-crypto
+```
+
+Four groups are reported: `unsigned_handshake` (full X25519 + ML-KEM-768 round-trip),
+`signed_handshake` (same plus ML-DSA-65 mutual auth), `frame_throughput` (AES-256-GCM
+write + read at 1 KiB / 64 KiB / 1 MiB — reports MB/s), and `reconnect` (fresh PQC
+handshake cost, equivalent to `unsigned_handshake`).
+
+---
+
 ## What's New
 
 ### v0.3.1 — Browser SDK Auto-Reconnect + CLI Fixes (2026-05-14)
