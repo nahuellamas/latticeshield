@@ -69,16 +69,18 @@ LatticeShield uses a **hybrid model** (X25519 + ML-KEM-768) so sessions are prot
 
 | What the bridge guarantees | What it does NOT change |
 |---|---|
-| Traffic between client and bridge is quantum-safe encrypted | Your backend receives plain unencrypted TCP — no code changes needed |
+| Traffic between client and bridge is quantum-safe encrypted | Your **backend** receives plain TCP — zero backend code changes |
 | The server is cryptographically authenticated (ML-DSA-65) | Your existing HTTP, gRPC, or custom protocol passes through unchanged |
 | Clients can optionally prove their identity too (mutual auth) | The bridge is transparent — it relays bytes, not HTTP |
 | Every session uses fresh ephemeral keys (perfect forward secrecy) | No kernel modules, no eBPF, no sidecars that need root |
+
+> **Note**: clients connect via the SDK (`@latticeshield/js` for browsers, `latticeshield-client` for server-side) or any TCP client that implements the PQC handshake. Only the backend service requires no changes.
 
 ---
 
 ## Quickstart
 
-The idea is simple: your app keeps running exactly as it is. The bridge sits in front of it, handles all the encryption, and forwards plain bytes to your app over localhost. Clients talk to the bridge on `:8443`; your app keeps talking plain TCP on `:8080`. Nothing changes on either side.
+The idea is simple: your app keeps running exactly as it is. The bridge sits in front of it, handles all the encryption, and forwards plain bytes to your app over localhost. Clients talk to the bridge on `:8443`; your backend keeps listening on `:8080`. The backend needs no changes — clients use the SDK or the `latticeshield-client` proxy to speak the PQC handshake.
 
 ### 1. Install
 
@@ -133,7 +135,7 @@ COPY keys/server.vk /etc/latticeshield/server.vk
 
 Every client needs `server.vk` before it can connect. Ship it out-of-band — SSH, config management, Docker image, whatever fits your deployment. Never fetch it over the same connection it protects; that would defeat the authentication entirely. A client that has the wrong VK (or no VK) will reject the handshake.
 
-> **Mutual client authentication** is on by default. The config above disables it implicitly since there is no `[auth]` section — the bridge will log a warning at startup. For production deployments with mutual auth see **[QUICKSTART.md](QUICKSTART.md)**.
+> **Mutual client authentication** is off by default — the config above has no `[auth]` section so the bridge accepts any client. A `WARN` is logged at startup to remind you. For production deployments with mutual auth enabled see **[QUICKSTART.md](QUICKSTART.md)**.
 
 ---
 
@@ -194,7 +196,7 @@ max_connections_per_ip  = 100
 
 [admin]
 enabled                        = false
-listen_addr                    = "0.0.0.0:8445"
+listen_addr                    = "127.0.0.1:8445"
 control_plane_vk_path          = "./keys/admin.vk"
 rate_limit_per_second          = 5
 handshake_timeout_secs         = 10
@@ -288,7 +290,7 @@ The admin channel accepts a single PQC-authenticated TCP connection, reads one J
 | Field | Default | Required | Description |
 |---|---|---|---|
 | `enabled` | `false` | — | Activate the admin listener |
-| `listen_addr` | `"0.0.0.0:8445"` | — | TCP address |
+| `listen_addr` | `"127.0.0.1:8445"` | — | TCP address. Default is loopback — change only if the control plane runs on a separate host, and firewall accordingly |
 | `control_plane_vk_path` | — | when enabled | ML-DSA-65 verifying key of the control plane |
 | `rate_limit_per_second` | `5` | — | Max admin commands per second |
 | `handshake_timeout_secs` | `10` | — | PQC handshake timeout |
@@ -346,6 +348,8 @@ The endpoint responds on `GET /metrics` with Prometheus text format. It returns 
 
 ## CLI reference
 
+### `latticeshield-bridge` — the proxy daemon
+
 ```sh
 # Start the bridge
 latticeshield-bridge run [--config <path>]          # default: ./config.toml
@@ -365,6 +369,34 @@ latticeshield-bridge admin-keygen <dir>
 # → <dir>/admin.sk  (permissions 0600)
 # → <dir>/admin.vk  (permissions 0644)
 ```
+
+### `latticeshield` — unified key management CLI
+
+```sh
+# Generate keypairs
+latticeshield keygen server <dir>   # server.sk (0600) + server.vk (0644)
+latticeshield keygen client <dir>   # client.sk (0600) + client.vk (0644)
+latticeshield keygen tls <dir>      # tls.crt + tls.key (self-signed, dev only)
+
+# Inspect a verifying key
+latticeshield vk-info ./keys/server.vk
+# → File, Size (1952 bytes), SHA-256 fingerprint
+
+# Request a one-time VK download URL via the PQC admin channel
+latticeshield vk-share \
+  --admin-addr 127.0.0.1:8445 \
+  --bridge-vk  ./keys/server.vk \
+  --admin-sk   ./keys/admin.sk
+# → One-time VK download URL + token + expiry
+```
+
+### `latticeshield-client` — server-side PQC client proxy
+
+```sh
+latticeshield-client --config ./latticeshield-client.toml
+```
+
+Accepts local TCP connections and forwards them to the bridge using the full PQC handshake — for server-to-server scenarios where you can't modify the originating service.
 
 ---
 
@@ -431,10 +463,16 @@ VK-share is designed for scenarios where baking the key at build time is impract
 The TLS listener (`[tls]`) must be enabled — VK-share is served over HTTPS, not plain HTTP.
 
 ```sh
-# Generate a token via the admin channel
-# (requires admin channel enabled and admin.sk on the control plane)
-latticeshield-admin get-vk-token --admin-addr 127.0.0.1:8445 --vk ./keys/admin.sk
-# → {"token":"a3f8..."}
+# Request a one-time VK download URL via the PQC admin channel
+# (requires admin channel enabled + admin keypair generated)
+latticeshield vk-share \
+  --admin-addr 127.0.0.1:8445 \
+  --bridge-vk  ./keys/server.vk \
+  --admin-sk   ./keys/admin.sk
+# One-time VK download URL:
+#   https://bridge.example.com:8440/vk/a3f8...
+# Token: a3f8...
+# Expires in: 10 minutes (600 seconds)
 
 # Client fetches the verifying key
 curl https://bridge.example.com:8440/vk/a3f8...
@@ -456,7 +494,9 @@ curl https://bridge.example.com:8440/vk/a3f8...
 | Server/client signatures | ML-DSA-65 | NIST FIPS 204 |
 | Signing domain separator | `"latticeshield-v1"` | FIPS 204 §5.2 |
 
-All primitives are pure Rust — no C FFI, no OpenSSL, no `oqs-rs`.
+All primitives are pure Rust — no C FFI, no OpenSSL, no `oqs-rs`. Crypto crates: [`libcrux-ml-dsa`](https://crates.io/crates/libcrux-ml-dsa) (=0.0.8, ML-DSA-65), [`ml-kem`](https://crates.io/crates/ml-kem) (ML-KEM-768), [`x25519-dalek`](https://crates.io/crates/x25519-dalek), [`aes-gcm`](https://crates.io/crates/aes-gcm), [`hkdf`](https://crates.io/crates/hkdf).
+
+> ⚠️ **No third-party security audit has been performed.** The cryptographic primitives use audited upstream crates; the protocol design and integration code are self-reviewed only.
 
 ### Handshake flow (server-auth, no mutual auth)
 
@@ -536,7 +576,9 @@ The `/metrics` endpoint returns `X-Content-Type-Options: nosniff`, `X-Frame-Opti
 ```
 latticeshield/
 ├── latticeshield-crypto/   # ML-KEM-768, X25519, ML-DSA-65, AES-256-GCM, HKDF
-├── latticeshield-bridge/   # Reverse proxy binary + all listeners + CLI
+├── latticeshield-bridge/   # Reverse proxy binary + all listeners + config
+├── latticeshield-client/   # Server-side PQC client proxy (server-to-server)
+├── latticeshield-cli/      # Unified key management CLI (`latticeshield` binary)
 ├── latticeshield-wasm/     # latticeshield-crypto compiled to WASM (for browsers)
 └── latticeshield-js/       # @latticeshield/js npm package (PQCSession, usePQCSession)
 ```
@@ -547,7 +589,9 @@ latticeshield/
 
 ```sh
 # Requires Rust 1.75+
-cargo build --release -p latticeshield-bridge
+cargo build --release -p latticeshield-bridge   # reverse proxy daemon
+cargo build --release -p latticeshield          # key management CLI
+cargo build --release -p latticeshield-client   # server-side PQC client proxy
 
 # Build the browser WASM module (requires wasm-pack)
 wasm-pack build --target bundler latticeshield-wasm
@@ -561,24 +605,28 @@ cd latticeshield-js && npm install && npm run build
 ## Tests
 
 ```sh
-cargo test --workspace      # 457 Rust tests
-cd latticeshield-js && npm test   # 93 TypeScript tests
+cargo test --workspace                    # 457 Rust tests
+cd latticeshield-js && npm test           # 93 TypeScript tests
 ```
 
 | Crate / Package | Tests | Coverage highlights |
 |---|---|---|
-| `latticeshield-crypto` | 135 | Handshake vectors, anti-replay, key rotation, signing domain separation |
-| `latticeshield-bridge` | 209 + 47 + 45 | Config validation, integration (TCP, WebSocket, TLS), per-IP cap, admin channel |
-| `latticeshield-wasm` | 10 | WASM exports, WASM↔Rust wire format parity |
+| `latticeshield-bridge` | 355 (135 unit lib + 209 unit main + 11 integration) | Config validation, TCP/WebSocket/TLS integration, per-IP cap, admin channel |
+| `latticeshield-client` | 49 (47 unit + 2 integration) | Client proxy lifecycle, PQC handshake, config |
+| `latticeshield-crypto` | 45 | Handshake vectors, anti-replay, key rotation, signing domain separation |
+| `latticeshield-cli` | 7 | Key management CLI integration |
+| `latticeshield-wasm` | 1 | WASM↔Rust wire format parity |
 | `latticeshield-js` | 93 | PQCSession lifecycle, VK copy, unexpected close, framing, nonce layout |
 
 ---
 
 ## What's New
 
-### v0.3.1 — Browser SDK Auto-Reconnect (2026-05-14)
+### v0.3.1 — Browser SDK Auto-Reconnect + CLI Fixes (2026-05-14)
 
 Fixed two bugs that made auto-reconnect permanently broken in `@latticeshield/js`. The server verification key was silently zeroed after the first handshake (Transferable buffer detachment), and unexpected WebSocket drops were not detected (no `close` event emitted). The `usePQCSession` React hook already had full reconnect logic — it now fires correctly. Also fixes a `seqToNonce` nonce layout mismatch (bytes 4–11 instead of 0–7) that caused decryption failures from the second frame onwards.
+
+`latticeshield vk-share` was rewritten to use the real PQC admin channel (`--admin-addr`, `--bridge-vk`, `--admin-sk`) instead of a plain HTTP Bearer token endpoint that did not exist. Admin channel default bind changed from `0.0.0.0:8445` to `127.0.0.1:8445` — loopback-only by default, explicit config required for remote access.
 
 ### v0.3.0 — Security Hardening (2026-05-13)
 
