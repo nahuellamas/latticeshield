@@ -423,6 +423,32 @@ latticeshield-client --config ./latticeshield-client.toml
 
 Acepta conexiones TCP locales y las reenvía al bridge usando el handshake PQC completo — para escenarios server-to-server donde no podés modificar el servicio originador.
 
+**Reconexión automática** (opt-in): cuando el bridge cierra una sesión, el cliente reconecta silenciosamente con backoff exponencial. Cada reconexión realiza un handshake PQC completo y fresco — sin reutilización de sesión ni de claves.
+
+```toml
+[reconnect]
+max_retries   = 5      # 0 = deshabilitado (por defecto)
+base_delay_ms = 100
+max_delay_ms  = 30000
+```
+
+Suscribite a los eventos de reconexión para re-inicializar el estado del protocolo (re-suscribirse a Redis, reintentar transacciones PostgreSQL, reabrir streams gRPC):
+
+```rust
+use latticeshield_client::{run, ReconnectEvent};
+use tokio::sync::mpsc;
+
+let (tx, mut rx) = mpsc::channel(16);
+tokio::spawn(run(config, Some(tx)));
+
+while let Some(event) = rx.recv().await {
+    match event {
+        ReconnectEvent::Reconnected { attempt, peer } => { /* re-init state */ }
+        ReconnectEvent::Exhausted  { attempts, peer } => { /* give up    */ }
+    }
+}
+```
+
 ---
 
 ## SDK para browsers (`@latticeshield/js`)
@@ -600,12 +626,13 @@ El endpoint `/metrics` retorna `X-Content-Type-Options: nosniff`, `X-Frame-Optio
 
 ```
 latticeshield/
-├── latticeshield-crypto/   # ML-KEM-768, X25519, ML-DSA-65, AES-256-GCM, HKDF
-├── latticeshield-bridge/   # Binario del proxy inverso + todos los listeners + config
-├── latticeshield-client/   # Proxy cliente PQC server-side (server-to-server)
-├── latticeshield-cli/      # CLI unificado de gestión de claves (binario `latticeshield`)
-├── latticeshield-wasm/     # latticeshield-crypto compilado a WASM (para browsers)
-└── latticeshield-js/       # Paquete npm @latticeshield/js (PQCSession, usePQCSession)
+├── latticeshield-crypto/             # ML-KEM-768, X25519, ML-DSA-65, AES-256-GCM, HKDF
+├── latticeshield-bridge/             # Binario del proxy inverso + todos los listeners + config
+├── latticeshield-client/             # Proxy cliente PQC server-side (server-to-server)
+├── latticeshield-cli/                # CLI unificado de gestión de claves (binario `latticeshield`)
+├── latticeshield-wasm/               # latticeshield-crypto compilado a WASM (para browsers)
+├── latticeshield-js/                 # Paquete npm @latticeshield/js (PQCSession, usePQCSession)
+└── latticeshield-integration-tests/  # Tests de clasificación de reconexión por protocolo (solo dev)
 ```
 
 ---
@@ -630,22 +657,31 @@ cd latticeshield-js && npm install && npm run build
 ## Tests
 
 ```sh
-cargo test --workspace                    # 457 tests en Rust
+cargo test --workspace                    # 467 tests en Rust
 cd latticeshield-js && npm test           # 93 tests en TypeScript
 ```
 
 | Crate / Paquete | Tests | Cobertura destacada |
 |---|---|---|
 | `latticeshield-bridge` | 355 (135 unit lib + 209 unit main + 11 integración) | Validación de config, integración TCP/WebSocket/TLS, límite por IP, canal admin |
-| `latticeshield-client` | 49 (47 unit + 2 integración) | Ciclo de vida del proxy cliente, handshake PQC, config |
+| `latticeshield-client` | 49 (47 unit + 2 integración) | Ciclo de vida del proxy cliente, handshake PQC, config, reconexión automática |
 | `latticeshield-crypto` | 45 | Vectores de handshake, anti-replay, rotación de clave, separación de dominio de firma |
 | `latticeshield-cli` | 7 | Integración CLI de gestión de claves |
 | `latticeshield-wasm` | 1 | Paridad de wire format WASM↔Rust |
+| `latticeshield-integration-tests` | 10 (2 gRPC + 2 HTTP + 1 matrix + 5 TCP raw) | Clasificación de reconexión por protocolo, invariante de claves efímeras PQC |
 | `latticeshield-js` | 93 | Ciclo de vida de PQCSession, copia de VK, cierre inesperado, framing, layout de nonce |
 
 ---
 
 ## Novedades
+
+### v0.3.2 — Reconexión PQC automática server-side (2026-05-15)
+
+`latticeshield-client` ahora soporta reconexión automática transparente con backoff exponencial. Cuando el bridge cierra una sesión, el cliente re-establece la conexión silenciosamente realizando un handshake PQC completo y fresco en cada intento (ML-KEM-768 + X25519 + ML-DSA-65). Sin reutilización de sesión ni de claves, nunca.
+
+Opt-in via la sección `[reconnect]` del TOML (`max_retries = 0` por defecto, preservando el comportamiento actual). Un canal `ReconnectEvent` le avisa a la app cuando ocurre una reconexión para que pueda re-inicializar el estado del protocolo (re-suscribirse a Redis, reintentar transacciones PostgreSQL, reabrir streams gRPC). Los fallos de autenticación (firma VK incorrecta) nunca se reintentan — se propagan de inmediato.
+
+El nuevo crate `latticeshield-integration-tests` clasifica el comportamiento de reconexión por protocolo e incluye un test `reconnect_pqc_invariant` que verifica claves efímeras frescas en cada reconexión comparando dos payloads consecutivos del wire `ClientResponse`.
 
 ### v0.3.1 — Reconexión automática del SDK del browser + fixes de CLI (2026-05-14)
 

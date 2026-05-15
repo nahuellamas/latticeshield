@@ -9,4 +9,6 @@ pub mod mock_http;
 pub mod mock_tcp;
 pub mod pqc_stack;
 
-pub use pqc_stack::{spawn_stack, spawn_stack_with_reconnect};
+pub use pqc_stack::spawn_stack;
+#[allow(unused_imports)]
+pub use pqc_stack::spawn_stack_with_reconnect;
