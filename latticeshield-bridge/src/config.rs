@@ -155,7 +155,7 @@ fn default_admin_enabled() -> bool {
     false
 }
 fn default_admin_listen_addr() -> String {
-    "0.0.0.0:8445".to_string()
+    "127.0.0.1:8445".to_string()
 }
 fn default_admin_rate_limit() -> u32 {
     5
@@ -1371,7 +1371,7 @@ listen_addr = "not_an_addr"
         let f = write_toml("");
         let cfg = Config::load(f.path()).unwrap();
         assert!(!cfg.admin_enabled);
-        assert_eq!(cfg.admin_listen_addr.to_string(), "0.0.0.0:8445");
+        assert_eq!(cfg.admin_listen_addr.to_string(), "127.0.0.1:8445");
         assert_eq!(cfg.admin_rate_limit_per_second, 5);
         assert_eq!(cfg.admin_handshake_timeout_secs, 10);
         assert!(cfg.admin_control_plane_vk_path.is_none());

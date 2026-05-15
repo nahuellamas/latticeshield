@@ -15,11 +15,14 @@ path = "src/main.rs"
 [dependencies]
 latticeshield-bridge = { path = "../latticeshield-bridge", features = ["tls-keygen"] }
 latticeshield-client = { path = "../latticeshield-client" }
+latticeshield-crypto = { path = "../latticeshield-crypto" }
 anyhow     = { workspace = true }
 clap       = { version = "4", features = ["derive", "env"] }
 colored    = "2"
-reqwest    = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots-no-provider"] }
+rand_core  = { workspace = true }
+serde      = { workspace = true }
 serde_json = { workspace = true }
+tokio      = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
