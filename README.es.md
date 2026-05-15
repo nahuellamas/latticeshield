@@ -1,6 +1,10 @@
 # LatticeShield
 
 <p align="center">
+  <a href="README.md">🇺🇸 Read in English</a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
   <img src="https://img.shields.io/badge/tests-550_pasando-brightgreen?style=for-the-badge" alt="550 tests pasando">
   <img src="https://img.shields.io/badge/sin_FFI-Rust_puro-blue?style=for-the-badge" alt="Sin FFI — Rust puro">
@@ -18,6 +22,7 @@ Agregá cifrado post-cuántico a cualquier servicio TCP **sin tocar una sola lí
 
 ## Tabla de contenidos
 
+- [FAQ](#faq)
 - [¿Por qué criptografía post-cuántica ahora?](#por-qué-criptografía-post-cuántica-ahora)
 - [Cómo funciona](#cómo-funciona)
 - [Inicio rápido](#inicio-rápido)
@@ -49,6 +54,26 @@ Agregá cifrado post-cuántico a cualquier servicio TCP **sin tocar una sola lí
 
 ---
 
+## FAQ
+
+**¿Por qué no WireGuard?**
+
+WireGuard usa Curve25519, que el algoritmo de Shor rompe en una computadora cuántica. Además requiere un módulo de kernel o dispositivo TUN — acceso root, restricciones de versión de kernel y reglas de firewall. LatticeShield corre completamente en userspace, no necesita root y se pone delante de cualquier servicio TCP sin tocar el stack de red del OS.
+
+**¿Por qué no TLS 1.3 con extensiones post-cuánticas?**
+
+Podés — Cloudflare, Chrome y algunos servidores ya negocian X25519Kyber768 en TLS 1.3. Pero eso solo protege el intercambio de clave, no la identidad del servidor (que sigue siendo ECDSA o RSA). LatticeShield reemplaza ambos: intercambio de clave (X25519 + ML-KEM-768) y autenticación del servidor (ML-DSA-65). Además funciona para TCP crudo, no solo HTTPS.
+
+**¿Por qué no Cloudflare o un CDN que ya hace PQC?**
+
+Porque tu tráfico pasa por su infraestructura y sus claves. LatticeShield es self-hosted — vos generás las claves, vos corrés el bridge, ningún tercero toca tu texto plano. El modelo de amenaza incluye a tu proveedor de CDN.
+
+**¿Está listo para producción?**
+
+Las primitivas criptográficas usan crates auditadas upstream (`libcrux-ml-dsa`, `ml-kem`, `x25519-dalek`). El diseño del protocolo y el código de integración son self-reviewed — no se realizó ninguna auditoría de terceros. Tratalo como production-capable pero deployá con eso en mente: correlo detrás de un firewall, monitoreá `/metrics` y mantené `server.sk` fuera de internet.
+
+---
+
 ## ¿Por qué criptografía post-cuántica ahora?
 
 En 2024 el NIST finalizó tres estándares de criptografía post-cuántica (FIPS 203 ML-KEM, FIPS 204 ML-DSA, FIPS 205 SLH-DSA). El algoritmo de Shor rompe ECDH y RSA en una computadora cuántica suficientemente grande. Los ataques de "cosecha ahora, descifrado después" ya están ocurriendo: adversarios recopilan tráfico cifrado hoy para descifrarlo cuando llegue el hardware cuántico.
@@ -69,16 +94,18 @@ LatticeShield usa un **modelo híbrido** (X25519 + ML-KEM-768): cada sesión est
 
 | Qué garantiza el bridge | Qué NO cambia |
 |---|---|
-| El tráfico entre cliente y bridge está cifrado con criptografía cuántico-resistente | Tu backend recibe TCP plano sin cifrar — sin cambios en el código |
+| El tráfico entre cliente y bridge está cifrado con criptografía cuántico-resistente | Tu **backend** recibe TCP plano — sin cambios en el código |
 | El servidor se autentica criptográficamente ante el cliente (ML-DSA-65) | Tu protocolo HTTP, gRPC o custom pasa sin modificaciones |
 | Los clientes también pueden probar su identidad (autenticación mutua) | El bridge es transparente — reenvía bytes, no parsea HTTP |
 | Cada sesión usa claves efímeras frescas (forward secrecy perfecta) | Sin módulos de kernel, sin eBPF, sin sidecars que necesiten root |
+
+> **Nota**: los clientes se conectan via el SDK (`@latticeshield/js` para browsers, `latticeshield-client` para server-side) o cualquier cliente TCP que implemente el handshake PQC. Solo el backend no requiere cambios.
 
 ---
 
 ## Inicio rápido
 
-La idea es simple: tu app sigue corriendo exactamente igual que antes. El bridge se pone adelante, maneja todo el cifrado y reenvía bytes planos a tu app por localhost. Los clientes hablan con el bridge en `:8443`; tu app sigue en `:8080` sin cambios. Nada cambia en ninguno de los dos lados.
+La idea es simple: tu app sigue corriendo exactamente igual que antes. El bridge se pone adelante, maneja todo el cifrado y reenvía bytes planos a tu app por localhost. Los clientes hablan con el bridge en `:8443`; tu backend sigue en `:8080`. El backend no necesita cambios — los clientes usan el SDK o el proxy `latticeshield-client` para hablar el handshake PQC.
 
 ### 1. Instalar
 
@@ -133,7 +160,7 @@ COPY keys/server.vk /etc/latticeshield/server.vk
 
 Cada cliente necesita `server.vk` antes de conectarse. Distribuila fuera de banda — SSH, gestión de configuración, imagen Docker, lo que encaje con tu deployment. Nunca la descargues en tiempo de conexión por el mismo canal que protege; eso anularía la autenticación. Un cliente con la VK incorrecta (o sin VK) rechazará el handshake.
 
-> **La autenticación mutua** está activa por defecto. La configuración de arriba la deshabilita implícitamente al no incluir sección `[auth]` — el bridge mostrará una advertencia al arrancar. Para deployments en producción con autenticación mutua consultá **[QUICKSTART.md](QUICKSTART.md)**.
+> **La autenticación mutua de clientes** está desactivada por defecto — la configuración de arriba no incluye sección `[auth]` así que el bridge acepta cualquier cliente. Se registra un `WARN` al arrancar para recordártelo. Para deployments en producción con autenticación mutua habilitada consultá **[QUICKSTART.md](QUICKSTART.md)**.
 
 ---
 
@@ -194,7 +221,7 @@ max_connections_per_ip  = 100
 
 [admin]
 enabled                        = false
-listen_addr                    = "0.0.0.0:8445"
+listen_addr                    = "127.0.0.1:8445"
 control_plane_vk_path          = "./keys/admin.vk"
 rate_limit_per_second          = 5
 handshake_timeout_secs         = 10
@@ -226,7 +253,7 @@ listen_addr             = "0.0.0.0:8444"
 | `backend_addr` | `"127.0.0.1:8080"` | dirección válida | Backend destino — recibe TCP plano |
 | `max_frame_size` | `65536` | 1024–16 777 216 | Tamaño máximo de frame AES-256-GCM en bytes |
 | `handshake_timeout_secs` | `10` | ≥ 1 | Segundos permitidos para completar el handshake PQC. Solo aplica al handshake — el relay no tiene timeout |
-| `max_connections_per_ip` | `50` | ≥ 1 | Límite de conexiones por IP de origen. Las conexiones en exceso se descartan para prevenir agotamiento de CPU durante floods de conexiones |
+| `max_connections_per_ip` | `50` | ≥ 1 | Límite de conexiones por IP de origen. Las conexiones en exceso se descartan para prevenir agotamiento de CPU bajo floods de conexiones |
 
 ### [crypto]
 
@@ -288,7 +315,7 @@ El canal admin acepta una conexión TCP PQC-autenticada, lee un comando JSON, re
 | Campo | Por defecto | Requerido | Descripción |
 |---|---|---|---|
 | `enabled` | `false` | — | Activar el listener admin |
-| `listen_addr` | `"0.0.0.0:8445"` | — | Dirección TCP |
+| `listen_addr` | `"127.0.0.1:8445"` | — | Dirección TCP. Por defecto es loopback — cambialo solo si el control plane corre en un host separado, y configurá el firewall en consecuencia |
 | `control_plane_vk_path` | — | cuando enabled | Clave pública ML-DSA-65 del control plane |
 | `rate_limit_per_second` | `5` | — | Máximo comandos admin por segundo |
 | `handshake_timeout_secs` | `10` | — | Timeout del handshake PQC |
@@ -346,6 +373,8 @@ El endpoint responde en `GET /metrics` con formato de texto Prometheus. Retorna 
 
 ## Referencia de CLI
 
+### `latticeshield-bridge` — el daemon proxy
+
 ```sh
 # Iniciar el bridge
 latticeshield-bridge run [--config <ruta>]          # por defecto: ./config.toml
@@ -365,6 +394,34 @@ latticeshield-bridge admin-keygen <dir>
 # → <dir>/admin.sk  (permisos 0600)
 # → <dir>/admin.vk  (permisos 0644)
 ```
+
+### `latticeshield` — CLI unificado de gestión de claves
+
+```sh
+# Generar pares de claves
+latticeshield keygen server <dir>   # server.sk (0600) + server.vk (0644)
+latticeshield keygen client <dir>   # client.sk (0600) + client.vk (0644)
+latticeshield keygen tls <dir>      # tls.crt + tls.key (autofirmado, solo dev)
+
+# Inspeccionar una clave pública
+latticeshield vk-info ./keys/server.vk
+# → Archivo, Tamaño (1952 bytes), fingerprint SHA-256
+
+# Solicitar una URL de descarga de VK de un solo uso via el canal admin PQC
+latticeshield vk-share \
+  --admin-addr 127.0.0.1:8445 \
+  --bridge-vk  ./keys/server.vk \
+  --admin-sk   ./keys/admin.sk
+# → URL de descarga de VK de un solo uso + token + expiración
+```
+
+### `latticeshield-client` — proxy cliente PQC server-side
+
+```sh
+latticeshield-client --config ./latticeshield-client.toml
+```
+
+Acepta conexiones TCP locales y las reenvía al bridge usando el handshake PQC completo — para escenarios server-to-server donde no podés modificar el servicio originador.
 
 ---
 
@@ -431,10 +488,16 @@ VK-share está diseñado para escenarios donde embeber la clave en el build no e
 El listener TLS (`[tls]`) debe estar habilitado — VK-share se sirve por HTTPS, no por HTTP plano.
 
 ```sh
-# Generar un token via el canal admin
-# (requiere canal admin habilitado y admin.sk en el control plane)
-latticeshield-admin get-vk-token --admin-addr 127.0.0.1:8445 --vk ./keys/admin.sk
-# → {"token":"a3f8..."}
+# Solicitar una URL de descarga de VK de un solo uso via el canal admin PQC
+# (requiere canal admin habilitado + par de claves admin generado)
+latticeshield vk-share \
+  --admin-addr 127.0.0.1:8445 \
+  --bridge-vk  ./keys/server.vk \
+  --admin-sk   ./keys/admin.sk
+# URL de descarga de VK de un solo uso:
+#   https://bridge.ejemplo.com:8440/vk/a3f8...
+# Token: a3f8...
+# Expira en: 10 minutos (600 segundos)
 
 # El cliente descarga la clave pública
 curl https://bridge.ejemplo.com:8440/vk/a3f8...
@@ -456,7 +519,9 @@ curl https://bridge.ejemplo.com:8440/vk/a3f8...
 | Firmas servidor/cliente | ML-DSA-65 | NIST FIPS 204 |
 | Separador de dominio de firma | `"latticeshield-v1"` | FIPS 204 §5.2 |
 
-Todas las primitivas son Rust puro — sin FFI en C, sin OpenSSL, sin `oqs-rs`.
+Todas las primitivas son Rust puro — sin FFI en C, sin OpenSSL, sin `oqs-rs`. Crates crypto: [`libcrux-ml-dsa`](https://crates.io/crates/libcrux-ml-dsa) (=0.0.8, ML-DSA-65), [`ml-kem`](https://crates.io/crates/ml-kem) (ML-KEM-768), [`x25519-dalek`](https://crates.io/crates/x25519-dalek), [`aes-gcm`](https://crates.io/crates/aes-gcm), [`hkdf`](https://crates.io/crates/hkdf).
+
+> ⚠️ **No se realizó ninguna auditoría de seguridad de terceros.** Las primitivas criptográficas usan crates auditadas upstream; el diseño del protocolo y el código de integración son self-reviewed únicamente.
 
 ### Flujo del handshake (autenticación del servidor, sin autenticación mutua)
 
@@ -536,7 +601,9 @@ El endpoint `/metrics` retorna `X-Content-Type-Options: nosniff`, `X-Frame-Optio
 ```
 latticeshield/
 ├── latticeshield-crypto/   # ML-KEM-768, X25519, ML-DSA-65, AES-256-GCM, HKDF
-├── latticeshield-bridge/   # Binario del proxy + todos los listeners + CLI
+├── latticeshield-bridge/   # Binario del proxy inverso + todos los listeners + config
+├── latticeshield-client/   # Proxy cliente PQC server-side (server-to-server)
+├── latticeshield-cli/      # CLI unificado de gestión de claves (binario `latticeshield`)
 ├── latticeshield-wasm/     # latticeshield-crypto compilado a WASM (para browsers)
 └── latticeshield-js/       # Paquete npm @latticeshield/js (PQCSession, usePQCSession)
 ```
@@ -547,7 +614,9 @@ latticeshield/
 
 ```sh
 # Requiere Rust 1.75+
-cargo build --release -p latticeshield-bridge
+cargo build --release -p latticeshield-bridge   # daemon proxy inverso
+cargo build --release -p latticeshield          # CLI de gestión de claves
+cargo build --release -p latticeshield-client   # proxy cliente PQC server-side
 
 # Compilar el módulo WASM del browser (requiere wasm-pack)
 wasm-pack build --target bundler latticeshield-wasm
@@ -561,24 +630,28 @@ cd latticeshield-js && npm install && npm run build
 ## Tests
 
 ```sh
-cargo test --workspace      # 457 tests en Rust
-cd latticeshield-js && npm test   # 93 tests en TypeScript
+cargo test --workspace                    # 457 tests en Rust
+cd latticeshield-js && npm test           # 93 tests en TypeScript
 ```
 
 | Crate / Paquete | Tests | Cobertura destacada |
 |---|---|---|
-| `latticeshield-crypto` | 135 | Vectores de handshake, anti-replay, rotación de clave, separación de dominio de firma |
-| `latticeshield-bridge` | 209 + 47 + 45 | Validación de config, integración (TCP, WebSocket, TLS), límite por IP, canal admin |
-| `latticeshield-wasm` | 10 | Exports WASM, paridad de wire format WASM↔Rust |
+| `latticeshield-bridge` | 355 (135 unit lib + 209 unit main + 11 integración) | Validación de config, integración TCP/WebSocket/TLS, límite por IP, canal admin |
+| `latticeshield-client` | 49 (47 unit + 2 integración) | Ciclo de vida del proxy cliente, handshake PQC, config |
+| `latticeshield-crypto` | 45 | Vectores de handshake, anti-replay, rotación de clave, separación de dominio de firma |
+| `latticeshield-cli` | 7 | Integración CLI de gestión de claves |
+| `latticeshield-wasm` | 1 | Paridad de wire format WASM↔Rust |
 | `latticeshield-js` | 93 | Ciclo de vida de PQCSession, copia de VK, cierre inesperado, framing, layout de nonce |
 
 ---
 
 ## Novedades
 
-### v0.3.1 — Reconexión automática del SDK del browser (2026-05-14)
+### v0.3.1 — Reconexión automática del SDK del browser + fixes de CLI (2026-05-14)
 
 Se corrigieron dos bugs que hacían que la reconexión automática en `@latticeshield/js` estuviera permanentemente rota. La clave pública del servidor se zeroeaba silenciosamente después del primer handshake (detachment de buffer Transferable), y los cierres inesperados de WebSocket no se detectaban (no se emitía el evento `close`). El hook `usePQCSession` ya tenía lógica completa de reconexión — ahora se dispara correctamente. También se corrige un mismatch de layout en `seqToNonce` (bytes 4–11 en lugar de 0–7) que causaba fallos de descifrado desde el segundo frame en adelante.
+
+`latticeshield vk-share` fue reescrito para usar el canal admin PQC real (`--admin-addr`, `--bridge-vk`, `--admin-sk`) en lugar de un endpoint HTTP Bearer que no existía. El bind por defecto del canal admin cambió de `0.0.0.0:8445` a `127.0.0.1:8445` — solo loopback por defecto, se necesita config explícita para acceso remoto.
 
 ### v0.3.0 — Hardening de seguridad (2026-05-13)
 

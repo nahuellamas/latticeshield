@@ -1,6 +1,10 @@
 # LatticeShield
 
 <p align="center">
+  <a href="README.es.md">🇦🇷 Leer en español</a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
   <img src="https://img.shields.io/badge/tests-550_passing-brightgreen?style=for-the-badge" alt="550 tests passing">
   <img src="https://img.shields.io/badge/no_FFI-pure_Rust-blue?style=for-the-badge" alt="No FFI — pure Rust">
