@@ -41,7 +41,38 @@ fn default_pool_warm_interval_secs() -> u64 {
     5
 }
 
+fn default_reconnect_max_retries() -> u32 {
+    0
+}
+fn default_reconnect_base_delay_ms() -> u64 {
+    100
+}
+fn default_reconnect_max_delay_ms() -> u64 {
+    30_000
+}
+
 // ── Sub-structs ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReconnectConfig {
+    #[serde(default = "default_reconnect_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_reconnect_base_delay_ms")]
+    pub base_delay_ms: u64,
+    #[serde(default = "default_reconnect_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_reconnect_max_retries(),
+            base_delay_ms: default_reconnect_base_delay_ms(),
+            max_delay_ms: default_reconnect_max_delay_ms(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -117,6 +148,8 @@ pub struct ClientConfig {
     pub logging: LoggingSection,
     #[serde(default)]
     pub pool: PoolConfig,
+    #[serde(default)]
+    pub reconnect: ReconnectConfig,
 }
 
 // ── ValidClientConfig — post-validation ────────────────────────────────────────
@@ -130,6 +163,7 @@ pub struct ValidClientConfig {
     pub max_frame_size: usize,
     pub log_level: String,
     pub pool: PoolConfig,
+    pub reconnect: ReconnectConfig,
 }
 
 // ── ClientConfig::load + validate ─────────────────────────────────────────────
@@ -181,6 +215,14 @@ impl ClientConfig {
             anyhow::bail!("pool.warm_interval_secs must be >= 1");
         }
 
+        if self.reconnect.base_delay_ms > self.reconnect.max_delay_ms {
+            anyhow::bail!(
+                "reconnect.base_delay_ms ({}) must be <= reconnect.max_delay_ms ({})",
+                self.reconnect.base_delay_ms,
+                self.reconnect.max_delay_ms
+            );
+        }
+
         Ok(ValidClientConfig {
             listen_addr,
             bridge_addr,
@@ -189,6 +231,7 @@ impl ClientConfig {
             max_frame_size: self.client.max_frame_size,
             log_level: self.logging.level,
             pool: self.pool,
+            reconnect: self.reconnect,
         })
     }
 }

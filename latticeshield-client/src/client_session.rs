@@ -1,12 +1,14 @@
 //! Maneja una sesion PQC con el bridge: handshake + relay bidireccional cifrado.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Context;
-use rand_core::OsRng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rand_core::{OsRng, RngCore};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use latticeshield_crypto::{
@@ -15,85 +17,87 @@ use latticeshield_crypto::{
     SERVER_HELLO_LEN, SERVER_HELLO_SIGNED_LEN,
 };
 
-use crate::config::ValidClientConfig;
+use crate::config::{ReconnectConfig, ValidClientConfig};
 use crate::identity::ClientIdentity;
 use crate::pool::ConnectionPool;
 
-/// Maneja una conexion de usuario: realiza el handshake PQC con el bridge
-/// y luego relay bidireccional cifrado.
-///
-/// - `client_identity`: `Some` habilita autenticacion mutua (firma la ClientResponse).
-/// - `pool`: pool de conexiones pre-calentadas al bridge.
-///
-/// INVARIANTE: errores de handshake (incluyendo autenticacion fallida) fallan inmediatamente.
-pub async fn handle(
-    user: TcpStream,
-    peer: SocketAddr,
-    config: ValidClientConfig,
-    vk: Arc<VerifyingKey>,
-    client_identity: Option<Arc<ClientIdentity>>,
-    pool: Arc<ConnectionPool>,
-) -> anyhow::Result<()> {
-    // ── Adquirir conexion del pool ───────────────────────────────────────────
-    let bridge = match pool.acquire().await {
-        Ok(stream) => stream,
-        Err(e) => {
-            warn!(peer = %peer, bridge = %config.bridge_addr, "pool.acquire failed: {e}");
-            let (_, mut user_w) = tokio::io::split(user);
-            let _ = user_w.shutdown().await;
-            return Ok(());
-        }
-    };
+// ── Public event type ──────────────────────────────────────────────────────────
 
-    // ── Split streams ────────────────────────────────────────────────────────
-    let (mut user_r, mut user_w) = tokio::io::split(user);
-    let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge);
+/// Events emitted by the reconnect loop. Subscribe via `reconnect_tx`.
+#[derive(Debug)]
+pub enum ReconnectEvent {
+    /// A reconnect attempt succeeded. `attempt` starts at 1 (first retry).
+    Reconnected { attempt: u32, peer: SocketAddr },
+    /// All retries exhausted or a terminal condition was hit.
+    Exhausted { attempts: u32, peer: SocketAddr },
+}
 
-    // ── Leer ServerHello firmado (con stale-retry) ───────────────────────────
-    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
-    if let Err(e) = bridge_r.read_exact(&mut hello_buf).await {
-        warn!(peer = %peer, "server hello read failed (possible stale conn): {e} — retrying with fresh connect");
-        match TcpStream::connect(config.bridge_addr).await {
-            Ok(fresh) => {
-                fresh.set_nodelay(true).ok();
-                let (fresh_r, fresh_w) = tokio::io::split(fresh);
-                bridge_r = fresh_r;
-                bridge_w = fresh_w;
-                if let Err(e2) = bridge_r.read_exact(&mut hello_buf).await {
-                    warn!(peer = %peer, "server hello read failed on fresh connect: {e2}");
-                    let _ = user_w.shutdown().await;
-                    let _ = bridge_w.shutdown().await;
-                    return Ok(());
-                }
-            }
-            Err(e2) => {
-                warn!(peer = %peer, "fresh connect after stale pool conn failed: {e2}");
-                let _ = user_w.shutdown().await;
-                return Ok(());
-            }
+// ── Private types ──────────────────────────────────────────────────────────────
+
+/// Typed handshake error. Auth failures NEVER retry (REQ-5 / REQ-4/C).
+#[derive(Debug)]
+enum HandshakeError {
+    Auth(anyhow::Error),
+    Transport(anyhow::Error),
+}
+
+impl fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HandshakeError::Auth(e) => write!(f, "auth: {e}"),
+            HandshakeError::Transport(e) => write!(f, "transport: {e}"),
         }
     }
+}
 
-    // Los primeros SERVER_HELLO_LEN (1248) bytes son el ServerHello raw (sin firma).
+impl std::error::Error for HandshakeError {}
+
+/// Outcome of a relay cycle. Drives reconnect vs. exit decision.
+enum RelayOutcome {
+    /// User app closed its TCP side cleanly.
+    UserEof,
+    /// User app produced an I/O error (treat as terminal).
+    #[allow(dead_code)]
+    UserError(anyhow::Error),
+    /// Bridge side dropped / errored — eligible for reconnect.
+    BridgeError(anyhow::Error),
+}
+
+// ── do_handshake — sole EncryptedChannel producer ──────────────────────────────
+
+/// Performs the full PQC handshake with the bridge.
+///
+/// This is the ONLY function allowed to call `EncryptedChannel::new` or
+/// `client_respond`. Every reconnect attempt calls this fresh — guaranteeing
+/// new ML-KEM-768 + X25519 ephemerals (REQ-1).
+async fn do_handshake(
+    bridge: TcpStream,
+    vk: &VerifyingKey,
+    client_identity: Option<&ClientIdentity>,
+    config: &ValidClientConfig,
+) -> Result<(EncryptedChannel, ReadHalf<TcpStream>, WriteHalf<TcpStream>), HandshakeError> {
+    let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge);
+
+    // ── Read ServerHello (signed) ────────────────────────────────────────────
+    let mut hello_buf = [0u8; SERVER_HELLO_SIGNED_LEN];
+    bridge_r
+        .read_exact(&mut hello_buf)
+        .await
+        .map_err(|e| HandshakeError::Transport(anyhow::anyhow!("server hello read: {e}")))?;
+
     let mut server_hello_raw = [0u8; SERVER_HELLO_LEN];
     server_hello_raw.copy_from_slice(&hello_buf[..SERVER_HELLO_LEN]);
 
-    // ── Verificar firma del servidor ─────────────────────────────────────────
-    let hello = match parse_server_hello_signed(&hello_buf, &vk) {
-        Ok(h) => h,
-        Err(_) => {
-            warn!(peer = %peer, "authentication failed — peer: {peer}");
-            let _ = user_w.shutdown().await;
-            return Ok(());
-        }
-    };
+    // ── Verify ML-DSA-65 signature — auth failure never retries ─────────────
+    let hello = parse_server_hello_signed(&hello_buf, vk)
+        .map_err(|e| HandshakeError::Auth(anyhow::anyhow!("verify: {e:?}")))?;
 
-    // ── Respuesta del cliente: encapsular + derivar session key ──────────────
-    let (response, session_key) =
-        client_respond(&hello, &mut OsRng).context("client_respond failed")?;
+    // ── ML-KEM-768 + X25519 client response — fresh ephemerals per call ─────
+    let (response, session_key) = client_respond(&hello, &mut OsRng)
+        .map_err(|e| HandshakeError::Transport(anyhow::anyhow!("client_respond: {e}")))?;
 
-    // ── Enviar respuesta al bridge (con o sin firma del cliente) ─────────────
-    match &client_identity {
+    // ── Send client response (signed if mutual auth enabled) ─────────────────
+    match client_identity {
         Some(identity) => {
             let signed = serialize_client_response_signed(
                 &response,
@@ -101,76 +105,243 @@ pub async fn handle(
                 &server_hello_raw,
                 &mut OsRng,
             )
-            .map_err(|e| anyhow::anyhow!("client response signing failed: {e:?}"))?;
+            .map_err(|e| {
+                HandshakeError::Transport(anyhow::anyhow!("client response signing: {e:?}"))
+            })?;
             bridge_w
                 .write_all(&signed)
                 .await
-                .context("write signed client response")?;
+                .map_err(|e| HandshakeError::Transport(e.into()))?;
         }
         None => {
             bridge_w
                 .write_all(&serialize_client_response(&response))
                 .await
-                .context("write client response")?;
+                .map_err(|e| HandshakeError::Transport(e.into()))?;
         }
     }
 
-    // ── Canal cifrado ────────────────────────────────────────────────────────
-    let mut channel = EncryptedChannel::new(session_key.as_bytes(), config.max_frame_size);
+    // ── Build encrypted channel — only call site ─────────────────────────────
+    let channel = EncryptedChannel::new(session_key.as_bytes(), config.max_frame_size);
+    Ok((channel, bridge_r, bridge_w))
+}
 
-    // ── Relay bidireccional ──────────────────────────────────────────────────
-    // user_eof: el usuario cerro su lado de escritura (half-close).
-    // Cuando ocurre, dejamos de leer del usuario y enviamos FIN al bridge,
-    // pero seguimos drenando frames pendientes bridge→user hasta que el bridge
-    // tambien cierre. Sin esto, read_to_end() del usuario devuelve vacio.
+// ── run_relay ──────────────────────────────────────────────────────────────────
+
+/// Bidirectional relay between user and bridge using the established encrypted channel.
+///
+/// Returns a `RelayOutcome` so the caller can decide whether to reconnect.
+#[allow(clippy::too_many_arguments)]
+async fn run_relay(
+    channel: &mut EncryptedChannel,
+    user_r: &mut ReadHalf<TcpStream>,
+    user_w: &mut WriteHalf<TcpStream>,
+    bridge_r: ReadHalf<TcpStream>,
+    bridge_w: WriteHalf<TcpStream>,
+    user_eof: &mut bool,
+    config: &ValidClientConfig,
+    peer: SocketAddr,
+) -> RelayOutcome {
+    let mut bridge_r = bridge_r;
+    let mut bridge_w = bridge_w;
     let mut user_buf = vec![0u8; config.max_frame_size];
-    let mut user_eof = false;
 
     loop {
         tokio::select! {
-            // user → bridge: leer datos del usuario y cifrar hacia el bridge
-            result = user_r.read(&mut user_buf), if !user_eof => {
+            // user → bridge
+            result = user_r.read(&mut user_buf), if !*user_eof => {
                 match result {
                     Ok(0) => {
-                        user_eof = true;
-                        let _ = bridge_w.shutdown().await; // FIN al bridge
+                        *user_eof = true;
+                        let _ = bridge_w.shutdown().await;
                     }
                     Ok(n) => {
                         if let Err(e) = channel.write_frame(&mut bridge_w, &user_buf[..n]).await {
                             warn!(peer = %peer, "write frame to bridge failed: {e}");
-                            break;
+                            return RelayOutcome::BridgeError(e.into());
                         }
                     }
                     Err(e) => {
                         warn!(peer = %peer, "read from user failed: {e}");
-                        break;
+                        return RelayOutcome::UserError(e.into());
                     }
                 }
             }
 
-            // bridge → user: leer frame cifrado del bridge y descifrar hacia el usuario
+            // bridge → user
             result = channel.read_frame(&mut bridge_r) => {
                 match result {
                     Ok(FrameResult::Data(data)) => {
                         if let Err(e) = user_w.write_all(&data).await {
                             warn!(peer = %peer, "write to user failed: {e}");
-                            break;
+                            return RelayOutcome::UserError(e.into());
                         }
                     }
                     Ok(FrameResult::KeyRotate(nonce)) => {
                         channel.rotate_key(&nonce);
                     }
                     Err(e) => {
+                        if *user_eof {
+                            // Bridge closed after we signaled EOF — clean close.
+                            return RelayOutcome::UserEof;
+                        }
                         warn!(peer = %peer, "read frame from bridge failed: {e}");
-                        break;
+                        return RelayOutcome::BridgeError(anyhow::anyhow!("{e}"));
                     }
                 }
             }
         }
     }
+}
 
-    info!(peer = %peer, "session ended for {peer}");
-    Ok(())
+// ── backoff ────────────────────────────────────────────────────────────────────
+
+fn backoff(attempt: u32, cfg: &ReconnectConfig) -> Duration {
+    let raw = cfg.base_delay_ms.saturating_mul(1u64 << attempt.min(20));
+    let capped = raw.min(cfg.max_delay_ms);
+    let jitter_span = (capped / 5).max(1);
+    // ±20% jitter: random in [0, jitter_span*2]
+    let jitter = OsRng.next_u32() as u64 % (jitter_span * 2 + 1);
+    // capped + jitter - jitter_span can underflow if jitter_span > capped
+    let ms = (capped as i64 + jitter as i64 - jitter_span as i64).max(1) as u64;
+    Duration::from_millis(ms)
+}
+
+// ── handle — public entry point ────────────────────────────────────────────────
+
+/// Maneja una conexion de usuario: realiza el handshake PQC con el bridge
+/// y luego relay bidireccional cifrado. Soporta reconexion transparente
+/// cuando `config.reconnect.max_retries > 0`.
+///
+/// - `client_identity`: `Some` habilita autenticacion mutua.
+/// - `pool`: pool de conexiones pre-calentadas al bridge.
+/// - `reconnect_tx`: canal de eventos de reconexion (opcional).
+///
+/// INVARIANTE: errores de autenticacion fallan inmediatamente sin reintentos.
+pub async fn handle(
+    user: TcpStream,
+    peer: SocketAddr,
+    config: ValidClientConfig,
+    vk: Arc<VerifyingKey>,
+    client_identity: Option<Arc<ClientIdentity>>,
+    pool: Arc<ConnectionPool>,
+    reconnect_tx: Option<Arc<mpsc::Sender<ReconnectEvent>>>,
+) -> anyhow::Result<()> {
+    // User-side stream is split ONCE and preserved across bridge reconnects.
+    let (mut user_r, mut user_w) = tokio::io::split(user);
+    let mut user_eof = false;
+    let mut attempt: u32 = 0;
+    let max = config.reconnect.max_retries;
+
+    loop {
+        // ── Acquire bridge connection from pool ──────────────────────────────
+        let bridge = match pool.acquire().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(peer = %peer, bridge = %config.bridge_addr, "pool.acquire failed: {e}");
+                if attempt < max {
+                    tokio::time::sleep(backoff(attempt, &config.reconnect)).await;
+                    attempt += 1;
+                    continue;
+                }
+                if max > 0 {
+                    if let Some(tx) = &reconnect_tx {
+                        let _ = tx
+                            .send(ReconnectEvent::Exhausted {
+                                attempts: attempt,
+                                peer,
+                            })
+                            .await;
+                    }
+                }
+                let _ = user_w.shutdown().await;
+                return Ok(());
+            }
+        };
+
+        // ── Full PQC handshake — fresh ephemerals every time ─────────────────
+        let (mut channel, bridge_r, bridge_w) =
+            match do_handshake(bridge, &vk, client_identity.as_deref(), &config).await {
+                Ok(t) => t,
+                Err(HandshakeError::Auth(e)) => {
+                    // Auth failure: NEVER retry (REQ-5 / REQ-4/C).
+                    warn!(peer = %peer, "auth failure — no retry: {e}");
+                    let _ = user_w.shutdown().await;
+                    return Ok(());
+                }
+                Err(HandshakeError::Transport(e)) => {
+                    warn!(peer = %peer, "handshake transport error: {e}");
+                    if attempt < max {
+                        tokio::time::sleep(backoff(attempt, &config.reconnect)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    if max > 0 {
+                        if let Some(tx) = &reconnect_tx {
+                            let _ = tx
+                                .send(ReconnectEvent::Exhausted {
+                                    attempts: attempt,
+                                    peer,
+                                })
+                                .await;
+                        }
+                    }
+                    let _ = user_w.shutdown().await;
+                    return Ok(());
+                }
+            };
+
+        // ── Emit Reconnected event on any attempt after the first ────────────
+        if attempt > 0 {
+            if let Some(tx) = &reconnect_tx {
+                let _ = tx.send(ReconnectEvent::Reconnected { attempt, peer }).await;
+            }
+        }
+
+        // ── Bidirectional relay ──────────────────────────────────────────────
+        match run_relay(
+            &mut channel,
+            &mut user_r,
+            &mut user_w,
+            bridge_r,
+            bridge_w,
+            &mut user_eof,
+            &config,
+            peer,
+        )
+        .await
+        {
+            RelayOutcome::UserEof | RelayOutcome::UserError(_) => {
+                info!(peer = %peer, "session ended for {peer}");
+                return Ok(());
+            }
+            RelayOutcome::BridgeError(e) => {
+                if user_eof || attempt >= max {
+                    if attempt >= max && max > 0 {
+                        if let Some(tx) = &reconnect_tx {
+                            let _ = tx
+                                .send(ReconnectEvent::Exhausted {
+                                    attempts: attempt,
+                                    peer,
+                                })
+                                .await;
+                        }
+                    }
+                    let _ = user_w.shutdown().await;
+                    info!(peer = %peer, "session ended for {peer}");
+                    return Ok(());
+                }
+                warn!(
+                    peer = %peer,
+                    "bridge dropped: {e} — reconnecting (attempt {})",
+                    attempt + 1
+                );
+                tokio::time::sleep(backoff(attempt, &config.reconnect)).await;
+                attempt += 1;
+                // continue loop → fresh pool.acquire() + do_handshake()
+            }
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -185,7 +356,7 @@ mod tests {
     use latticeshield_crypto::generate_keypair;
     use rand_core::OsRng;
 
-    use crate::config::{PoolConfig, ValidClientConfig};
+    use crate::config::{PoolConfig, ReconnectConfig, ValidClientConfig};
 
     fn make_config(bridge_addr: SocketAddr) -> ValidClientConfig {
         ValidClientConfig {
@@ -196,6 +367,7 @@ mod tests {
             max_frame_size: 65536,
             log_level: "info".to_string(),
             pool: PoolConfig::default(),
+            reconnect: ReconnectConfig::default(),
         }
     }
 
@@ -235,7 +407,16 @@ mod tests {
         let pool = make_pool(bridge_addr);
 
         // handle debe retornar Ok(()) — error de sesion, no fatal.
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
+        let result = handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "handle should return Ok(()) on bridge refused, got: {result:?}"
@@ -283,7 +464,16 @@ mod tests {
         let pool = make_pool(bridge_addr);
 
         // handle debe retornar Ok(()) — error de sesion, no fatal
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
+        let result = handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "handle should return Ok(()) for auth failure, got: {result:?}"
@@ -295,7 +485,7 @@ mod tests {
         let mut rng = OsRng;
         let (_sk, vk) = generate_keypair(&mut rng);
 
-        // El bridge acepta la conexion y cierra inmediatamente (simula EOF → stale retry path).
+        // El bridge acepta la conexion y cierra inmediatamente (simula EOF → handled by reconnect loop).
         let real_bridge = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let real_addr = real_bridge.local_addr().unwrap();
 
@@ -323,11 +513,21 @@ mod tests {
             max_frame_size: 65536,
             log_level: "info".to_string(),
             pool: PoolConfig::default(),
+            reconnect: ReconnectConfig::default(),
         };
         let pool = make_pool(real_addr);
 
-        // El bridge cierra sin enviar datos → read_exact del hello falla → stale retry → falla también → handle Ok(())
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
+        // El bridge cierra sin enviar datos → read_exact del hello falla → handshake transport error → handle Ok(())
+        let result = handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "handle should return Ok(()) when bridge closes early, got: {result:?}"
@@ -360,11 +560,21 @@ mod tests {
             max_frame_size: 65536,
             log_level: "info".to_string(),
             pool: PoolConfig::default(),
+            reconnect: ReconnectConfig::default(),
         };
         let pool = make_pool(closed_addr);
 
         // acquire falla → Ok(()) con user recibiendo EOF.
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
+        let result = handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "handle should return Ok(()) after acquire fails, got: {result:?}"
@@ -412,10 +622,24 @@ mod tests {
             max_frame_size: 65536,
             log_level: "info".to_string(),
             pool: PoolConfig::default(),
+            reconnect: ReconnectConfig {
+                max_retries: 3,
+                base_delay_ms: 10,
+                max_delay_ms: 50,
+            },
         };
         let pool = make_pool(bridge_addr);
 
-        let result = handle(user_server_side, peer, config, Arc::new(vk), None, pool).await;
+        let result = handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "handle should return Ok(()) on auth failure, got: {result:?}"

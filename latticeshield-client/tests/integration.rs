@@ -19,7 +19,7 @@ use latticeshield_crypto::{
 };
 
 use latticeshield_client::client_session;
-use latticeshield_client::config::{PoolConfig, ValidClientConfig};
+use latticeshield_client::config::{PoolConfig, ReconnectConfig, ValidClientConfig};
 use latticeshield_client::pool::ConnectionPool;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -51,6 +51,7 @@ fn make_client_config(bridge_addr: SocketAddr) -> ValidClientConfig {
         max_frame_size: 65536,
         log_level: "info".to_string(),
         pool: PoolConfig::default(),
+        reconnect: ReconnectConfig::default(),
     }
 }
 
@@ -154,9 +155,17 @@ async fn full_bridge_client_relay() {
     let pool = make_pool(bridge_addr);
 
     let handle_task = tokio::spawn(async move {
-        client_session::handle(user_server_side, peer, config, Arc::new(vk), None, pool)
-            .await
-            .expect("client_session::handle failed")
+        client_session::handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await
+        .expect("client_session::handle failed")
     });
 
     let payload = b"hello integration test";
@@ -235,9 +244,17 @@ async fn key_rotate_survives_relay() {
     let pool = make_pool(bridge_addr);
 
     let handle_task = tokio::spawn(async move {
-        client_session::handle(user_server_side, peer, config, Arc::new(vk), None, pool)
-            .await
-            .expect("client_session::handle failed")
+        client_session::handle(
+            user_server_side,
+            peer,
+            config,
+            Arc::new(vk),
+            None,
+            pool,
+            None,
+        )
+        .await
+        .expect("client_session::handle failed")
     });
 
     let payload = b"key-rotate-test-payload";

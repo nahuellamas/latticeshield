@@ -5,3 +5,5 @@ pub mod config;
 pub mod identity;
 pub mod pool;
 pub mod server;
+
+pub use client_session::ReconnectEvent;

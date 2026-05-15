@@ -52,7 +52,7 @@ pub async fn run(
                 let client_identity = client_identity.clone();
                 let pool = Arc::clone(&pool);
                 tokio::spawn(async move {
-                    if let Err(e) = client_session::handle(stream, peer, config, vk, client_identity, pool).await {
+                    if let Err(e) = client_session::handle(stream, peer, config, vk, client_identity, pool, None).await {
                         tracing::warn!(peer = %peer, "session error: {e}");
                     }
                 });
@@ -77,7 +77,7 @@ mod tests {
     use rand_core::OsRng;
     use tokio::net::TcpStream;
 
-    use crate::config::PoolConfig;
+    use crate::config::{PoolConfig, ReconnectConfig};
 
     #[tokio::test]
     async fn run_binds_and_accepts() {
@@ -98,6 +98,7 @@ mod tests {
             max_frame_size: 65536,
             log_level: "info".to_string(),
             pool: PoolConfig::default(),
+            reconnect: ReconnectConfig::default(),
         };
 
         let task = tokio::spawn(run(config, Arc::clone(&vk), None));
