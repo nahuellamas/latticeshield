@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
-  <img src="https://img.shields.io/badge/tests-560_pasando-brightgreen?style=for-the-badge" alt="560 tests pasando">
+  <img src="https://img.shields.io/badge/tests-562_pasando-brightgreen?style=for-the-badge" alt="562 tests pasando">
   <img src="https://img.shields.io/badge/sin_FFI-Rust_puro-blue?style=for-the-badge" alt="Sin FFI — Rust puro">
   <img src="https://img.shields.io/badge/PQC-ML--KEM--768_%2B_ML--DSA--65-blueviolet?style=for-the-badge" alt="PQC: ML-KEM-768 + ML-DSA-65">
   <img src="https://img.shields.io/badge/licencia-Apache--2.0-blue?style=for-the-badge" alt="Apache-2.0">
@@ -669,13 +669,13 @@ cd latticeshield-js && npm install && npm run build
 ## Tests
 
 ```sh
-cargo test --workspace                    # 467 tests en Rust
+cargo test --workspace                    # 469 tests en Rust
 cd latticeshield-js && npm test           # 93 tests en TypeScript
 ```
 
 | Crate / Paquete | Tests | Cobertura destacada |
 |---|---|---|
-| `latticeshield-bridge` | 355 (135 unit lib + 209 unit main + 11 integración) | Validación de config, integración TCP/WebSocket/TLS, límite por IP, canal admin |
+| `latticeshield-bridge` | 351 (132 unit lib + 208 unit main + 11 integración) | Validación de config, integración TCP/WebSocket/TLS/healthz, límite por IP, canal admin |
 | `latticeshield-client` | 49 (47 unit + 2 integración) | Ciclo de vida del proxy cliente, handshake PQC, config, reconexión automática |
 | `latticeshield-crypto` | 45 | Vectores de handshake, anti-replay, rotación de clave, separación de dominio de firma |
 | `latticeshield-cli` | 7 | Integración CLI de gestión de claves |
