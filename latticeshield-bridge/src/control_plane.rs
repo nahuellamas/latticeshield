@@ -17,6 +17,8 @@ use crate::config::ValidConfig;
 use crate::identity::ServerIdentity;
 use crate::metrics::MetricsState;
 
+use latticeshield_crypto::signing::{Signature, VerifyingKey, VERIFYING_KEY_LEN};
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -58,6 +60,11 @@ struct SignedHeartbeatPayload {
 struct HeartbeatResponse {
     #[serde(default)]
     pending_commands: Option<Vec<BridgeCommand>>,
+    /// ML-DSA-65 signature over the raw response body (base64-encoded).
+    /// Signed by the cloud using its private key. The bridge verifies this
+    /// against `cloud_vk_path` (if configured) before dispatching commands.
+    #[serde(default)]
+    response_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +94,23 @@ pub async fn start(
     cmd_tx: tokio::sync::mpsc::Sender<BridgeCommand>,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) {
+    // ── Load cloud VK for HeartbeatResponse signature verification (C1/H6) ──
+    // If cloud_vk_path is set: load the VK and require signatures on responses.
+    // If not set: warn and proceed without verification (backward compat).
+    let cloud_vk: Option<Arc<VerifyingKey>> = match &config.cloud_vk_path {
+        Some(path) => match load_cloud_vk(path) {
+            Ok(vk) => {
+                info!(path = %path.display(), "cloud verifying key loaded — HeartbeatResponse commands will be signature-verified");
+                Some(Arc::new(vk))
+            }
+            Err(e) => {
+                warn!("control plane: failed to load cloud_vk_path '{}': {e} — BridgeCommand verification disabled", path.display());
+                None
+            }
+        },
+        None => None, // startup warning already emitted in config validation (H5)
+    };
+
     let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
         Ok(c) => c,
         Err(e) => {
@@ -131,7 +155,17 @@ pub async fn start(
             },
         };
 
-        match send_heartbeat(&client, &config, &agent_id, &signable, &identity, &mut rng).await {
+        match send_heartbeat(
+            &client,
+            &config,
+            &agent_id,
+            &signable,
+            &identity,
+            &mut rng,
+            cloud_vk.as_deref(),
+        )
+        .await
+        {
             Ok(hb_resp) => {
                 for cmd in hb_resp.pending_commands.unwrap_or_default() {
                     match cmd {
@@ -214,6 +248,7 @@ async fn send_heartbeat(
     signable: &SignableHeartbeatPayload,
     identity: &ServerIdentity,
     rng: &mut impl rand_core::CryptoRngCore,
+    cloud_vk: Option<&VerifyingKey>,
 ) -> anyhow::Result<HeartbeatResponse> {
     // 1. Canonical bytes
     let canonical = serde_json::to_vec(signable)
@@ -254,9 +289,66 @@ async fn send_heartbeat(
         return Err(anyhow::anyhow!("heartbeat non-2xx: {}", resp.status()));
     }
 
-    // 6. Parse response (non-fatal fallback to default)
-    let hb_resp = resp.json::<HeartbeatResponse>().await.unwrap_or_default();
+    // 6. Read response body
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("heartbeat read body failed: {e}"))?;
+
+    // Parse as generic JSON first to extract canonical pending_commands bytes for verification.
+    let body_value: serde_json::Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let hb_resp =
+        serde_json::from_value::<HeartbeatResponse>(body_value.clone()).unwrap_or_default();
+
+    // 7. If cloud VK is configured, verify ML-DSA-65 signature over pending_commands (C1/H6).
+    //    The cloud signs the canonical JSON of pending_commands only (not the full body).
+    //    This avoids circular signing — the signature field itself is NOT part of the signed data.
+    //    If the signature is absent or invalid, drop all pending commands.
+    if let Some(vk) = cloud_vk {
+        match &hb_resp.response_signature {
+            None => {
+                warn!("control plane: cloud response has no response_signature — dropping all pending commands (cloud_vk_path is set but response is unsigned)");
+                return Ok(HeartbeatResponse::default());
+            }
+            Some(sig_b64) => {
+                let sig_bytes = STANDARD
+                    .decode(sig_b64)
+                    .map_err(|e| anyhow::anyhow!("cloud sig base64 decode failed: {e}"))?;
+                let sig = Signature::from_bytes(&sig_bytes)
+                    .map_err(|e| anyhow::anyhow!("cloud sig parse failed: {e:?}"))?;
+                // Canonical signed payload: the pending_commands field as raw JSON bytes.
+                // The cloud signs `to_vec(&body["pending_commands"])`.
+                let canonical = serde_json::to_vec(&body_value["pending_commands"])
+                    .map_err(|e| anyhow::anyhow!("heartbeat canonical serialize failed: {e}"))?;
+                if let Err(e) = latticeshield_crypto::signing::verify(vk, &canonical, &sig) {
+                    warn!("control plane: cloud response signature verification FAILED ({e:?}) — dropping all pending commands");
+                    return Ok(HeartbeatResponse::default());
+                }
+                return Ok(hb_resp);
+            }
+        }
+    }
+
+    // 8. No cloud VK configured — return response without verification (backward compat)
     Ok(hb_resp)
+}
+
+/// Load a cloud ML-DSA-65 VerifyingKey from a raw binary file.
+/// The file must contain exactly VERIFYING_KEY_LEN bytes.
+fn load_cloud_vk(path: &std::path::Path) -> anyhow::Result<VerifyingKey> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("cannot read cloud_vk_path '{}': {e}", path.display()))?;
+    if bytes.len() != VERIFYING_KEY_LEN {
+        anyhow::bail!(
+            "cloud_vk_path '{}' has {} bytes; expected {} (ML-DSA-65 VerifyingKey)",
+            path.display(),
+            bytes.len(),
+            VERIFYING_KEY_LEN
+        );
+    }
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("cloud_vk_path '{}' parse failed: {e:?}", path.display()))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -474,6 +566,7 @@ mod tests {
             &signable,
             &identity,
             &mut rng,
+            None,
         )
         .await;
         assert!(result.is_ok(), "send_heartbeat failed: {:?}", result.err());
@@ -503,6 +596,7 @@ mod tests {
             &signable,
             &identity,
             &mut rng,
+            None,
         )
         .await
         .unwrap();
@@ -549,6 +643,7 @@ mod tests {
             &signable,
             &identity,
             &mut rng,
+            None,
         )
         .await
         .unwrap();
@@ -598,6 +693,7 @@ mod tests {
             &signable,
             &identity,
             &mut rng,
+            None,
         )
         .await
         .unwrap();
@@ -636,6 +732,7 @@ mod tests {
             &signable,
             &identity,
             &mut rng,
+            None,
         )
         .await
         .unwrap();
@@ -672,6 +769,7 @@ mod tests {
             &signable,
             &identity,
             &mut rng,
+            None,
         )
         .await;
 
@@ -751,6 +849,221 @@ mod tests {
             body.get("install_token").is_none(),
             "install_token should be absent from registration body when None, got: {:?}",
             body.get("install_token")
+        );
+    }
+
+    // ── Cloud VK verification tests (C1/H6) ────────────────────────────────────
+
+    /// H1: RegistrationPayload must NOT contain backend_addr.
+    #[tokio::test]
+    async fn registration_body_omits_backend_addr() {
+        init_crypto();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "agent_id": "no-backend-test" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let _ = try_register(&client, &config, &identity).await;
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            body.get("backend_addr").is_none(),
+            "backend_addr must be absent from RegistrationPayload (H1 — topology leak prevention), got: {:?}",
+            body.get("backend_addr")
+        );
+    }
+
+    /// C1: Valid cloud signature → command is dispatched.
+    ///
+    /// The cloud signs the canonical JSON of `pending_commands` only (not the full body).
+    /// This avoids circular signing — `response_signature` is NOT part of the signed data.
+    #[tokio::test]
+    async fn cloud_vk_valid_sig_dispatches_command() {
+        init_crypto();
+
+        // Generate a cloud keypair
+        let mut rng = rand_core::OsRng;
+        let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+
+        // Canonical payload the cloud signs: pending_commands as a JSON Value.
+        // Bridge does: serde_json::to_vec(&body_value["pending_commands"]).
+        // So the cloud must sign the same: to_vec(&json!([{"type":"Rotate"}])).
+        let commands_value = serde_json::json!([{"type": "Rotate"}]);
+        let canonical = serde_json::to_vec(&commands_value).unwrap();
+        let sig = latticeshield_crypto::signing::sign(&cloud_sk, &canonical, &mut rng).unwrap();
+        let sig_b64 = STANDARD.encode(sig.to_bytes());
+
+        // The signed body contains pending_commands + response_signature
+        let signed_body = format!(
+            r#"{{"pending_commands":[{{"type":"Rotate"}}],"response_signature":"{sig_b64}"}}"#
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(signed_body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap();
+
+        let cmds = resp
+            .pending_commands
+            .expect("should have pending_commands when sig is valid");
+        assert!(matches!(cmds[0], BridgeCommand::Rotate));
+    }
+
+    /// C1: Invalid cloud signature → commands dropped, no panic.
+    #[tokio::test]
+    async fn cloud_vk_invalid_sig_drops_command() {
+        init_crypto();
+
+        let mut rng = rand_core::OsRng;
+        let (_, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+
+        let server = MockServer::start().await;
+        // Response has an invalid (all-zeros) signature
+        let bad_sig = vec![0u8; latticeshield_crypto::signing::SIGNATURE_LEN];
+        let bad_sig_b64 = STANDARD.encode(&bad_sig);
+        let body = format!(
+            r#"{{"pending_commands":[{{"type":"Rotate"}}],"response_signature":"{bad_sig_b64}"}}"#
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap(); // must not error — invalid sig → drop commands, return default
+
+        // Commands must be dropped
+        assert!(
+            resp.pending_commands.is_none(),
+            "invalid sig must drop all commands, got: {:?}",
+            resp.pending_commands
+        );
+    }
+
+    /// C1: No cloud VK configured → commands dispatched (backward compat).
+    #[tokio::test]
+    async fn cloud_vk_not_configured_dispatches_command() {
+        init_crypto();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"pending_commands":[{"type":"Rotate"}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+            None, // no cloud VK → backward compat
+        )
+        .await
+        .unwrap();
+
+        let cmds = resp
+            .pending_commands
+            .expect("commands should be dispatched when no cloud VK");
+        assert!(matches!(cmds[0], BridgeCommand::Rotate));
+    }
+
+    /// C1: response_signature absent when cloud_vk IS configured → commands rejected.
+    #[tokio::test]
+    async fn cloud_vk_set_but_signature_absent_drops_command() {
+        init_crypto();
+
+        let mut rng = rand_core::OsRng;
+        let (_, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+
+        let server = MockServer::start().await;
+        // Response has no response_signature field
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"pending_commands":[{"type":"Rotate"}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk), // VK set but no sig in response → reject
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resp.pending_commands.is_none(),
+            "missing response_signature when cloud_vk is set must drop all commands"
         );
     }
 }

@@ -552,6 +552,9 @@ fn spawn_quic_listener(
         info!(addr = %config.quic_listen_addr, "QUIC listener active");
 
         let relay = quic::QuicRelay::new(config.backend_addr);
+        let quic_max_per_ip = config.max_connections_per_ip as usize;
+        let quic_ip_counter: ws::IpCounterMap =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         loop {
             let connecting = tokio::select! {
@@ -568,9 +571,26 @@ fn spawn_quic_listener(
                 }
             };
             let relay = relay.clone();
+            let ip_counter = Arc::clone(&quic_ip_counter);
             tokio::spawn(async move {
                 match connecting.await {
                     Ok(conn) => {
+                        // ── Per-IP connection cap (H4) ────────────────────
+                        let peer_ip = conn.remote_address().ip();
+                        {
+                            let mut map = ip_counter.lock().unwrap_or_else(|e| e.into_inner());
+                            let count = map.entry(peer_ip).or_insert(0);
+                            if *count >= quic_max_per_ip {
+                                warn!(%peer_ip, "QUIC: connection rejected — IP rate limit ({quic_max_per_ip}) exceeded");
+                                conn.close(0u32.into(), b"rate-limited");
+                                return;
+                            }
+                            *count += 1;
+                        }
+                        let _ip_guard = ws::IpCountGuard {
+                            ip: peer_ip,
+                            map: ip_counter,
+                        };
                         if let Err(e) = relay.relay_connection(conn).await {
                             tracing::warn!("QUIC connection error: {e:#}");
                         }
