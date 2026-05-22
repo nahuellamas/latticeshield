@@ -23,7 +23,8 @@ ml-kem       = { version = "0.2", features = ["std"] }
 # ml-dsa: pendiente 0.1.0 estable — ver memoria tracking/ml-dsa-stable-release
 # (0.0.4 tiene RUSTSEC-2025-0144 + CVE-2026-24850 sin parchear en stable)
 # Usando libcrux-ml-dsa como alternativa auditada hasta que RustCrypto publique 0.1.0 stable.
-libcrux-ml-dsa = { version = "=0.0.8", default-features = false, features = ["mldsa65"] }
+# 0.0.9 fija el bug de use_hint en el backend AVX2 (GHSA-fhvh-vw7h-9xf3). Usamos backend portable.
+libcrux-ml-dsa = { version = "=0.0.9", default-features = false, features = ["mldsa65"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf         = "0.12"
 sha2         = "0.10"

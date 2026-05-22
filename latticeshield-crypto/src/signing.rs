@@ -1,8 +1,8 @@
 //! Firmas post-cuanticas ML-DSA-65 (FIPS 204).
 //!
-//! Expone una API opaca sobre `libcrux-ml-dsa 0.0.8` usando el backend portable
-//! (sin AVX2 — las pruebas del backend AVX2 tienen problemas de soundness per
-//! IACR eprint 2026/192 en libcrux 0.0.8).
+//! Expone una API opaca sobre `libcrux-ml-dsa 0.0.9` usando el backend portable
+//! (sin AVX2 — 0.0.9 fija el bug del use_hint en AVX2 / GHSA-fhvh-vw7h-9xf3;
+//! mantenemos el portable backend igual por reducir superficie de riesgo).
 //!
 //! Tamanos wire (ML-DSA-65, FIPS 204 §Table 2):
 //!   - Clave de firma:      4032 bytes
