@@ -34,3 +34,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run JS SDK tests
+        working-directory: latticeshield-js
+        run: |
+          npm ci
+          npm test
