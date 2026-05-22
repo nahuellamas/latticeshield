@@ -19,7 +19,7 @@
     "src"
   ],
   "scripts": {
-    "build": "vite build",
+    "build": "tsc",
     "postbuild": "node scripts/sri.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
