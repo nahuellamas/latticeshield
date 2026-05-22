@@ -4,6 +4,8 @@ All notable changes to LatticeShield will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-05-22
+
 ### Security
 
 - **BREAKING**: TLS listener now enforces TLS 1.3 only (`[tls].enabled = true`). TLS 1.2
@@ -32,6 +34,34 @@ All notable changes to LatticeShield will be documented in this file.
   `$INSTALL_TOKEN` environment variable in production.
 - QUIC listener limits concurrent bidirectional streams to 100 per connection via
   `TransportConfig::max_concurrent_bidi_streams`.
+
+### Fixed
+
+- Heartbeat response body buffering capped at 1 MiB — rejects oversized cloud responses
+  by both `Content-Length` (pre-buffer) and actual byte count (post-buffer). Prevents OOM
+  via a hostile cloud endpoint.
+- Cloud signature `ts` overflow-safe: `checked_sub` + `saturating_abs` guards against
+  `ts = i64::MIN` panicking in debug builds and silently wrapping in release builds.
+  Both profiles now reject extreme `ts` values cleanly.
+- Coherent fail-closed across malformed-cloud-response branches: base64 decode failure
+  and signature parse failure now both `Ok(default())` + `warn!` instead of propagating
+  `Err` from the heartbeat task.
+
+### CI / Release
+
+- `release.yml` `publish-npm` job now depends on `[build, upload-release]` — npm publish
+  will not fire if binary cross-compilation or GitHub Release upload fails. Prevents
+  releasing `@latticeshield/js` with no matching bridge binaries for the tag.
+
+### Docker
+
+- Builder image switched from `rust:1.87-slim` to `rust:1.87-alpine` (~0–14 high CVEs vs
+  ~23 high CVEs in the Debian-based slim variant). Runtime image unchanged
+  (`gcr.io/distroless/static-debian12:nonroot`). Multi-arch ready —
+  `docker buildx build --platform linux/amd64,linux/arm64 .` works.
+- `.dockerignore` aligned with `.gitignore`: prevents TLS material (`*.pem`, `*.key`,
+  `*.crt`), env files (`.env`), and local tooling state (`.claude/`, `.engram/`, etc.)
+  from entering the docker build context.
 
 ## [0.3.3] - 2026-05-22
 

@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "latticeshield-bridge"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "latticeshield-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "latticeshield-client"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "latticeshield-crypto"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "latticeshield-wasm"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "getrandom 0.2.17",
  "hkdf",

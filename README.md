@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 1.75+">
-  <img src="https://img.shields.io/badge/tests-562_passing-brightgreen?style=for-the-badge" alt="562 tests passing">
+  <img src="https://img.shields.io/badge/tests-579_passing-brightgreen?style=for-the-badge" alt="579 tests passing">
   <img src="https://img.shields.io/badge/no_FFI-pure_Rust-blue?style=for-the-badge" alt="No FFI — pure Rust">
   <img src="https://img.shields.io/badge/PQC-ML--KEM--768_%2B_ML--DSA--65-blueviolet?style=for-the-badge" alt="PQC: ML-KEM-768 + ML-DSA-65">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge" alt="Apache-2.0">
