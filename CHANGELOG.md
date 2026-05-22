@@ -4,6 +4,24 @@ All notable changes to LatticeShield will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING**: TLS listener now enforces TLS 1.3 only (`[tls].enabled = true`). TLS 1.2
+  clients will be rejected at handshake. This applies to the standard HTTPS listener on port
+  8440 — the PQC listener on 8443 and WebSocket listener on 8446 were unaffected as they
+  already required TLS 1.3+ via rustls defaults.
+- Cloud heartbeat responses are now signature-verified with ML-DSA-65 before dispatching
+  `BridgeCommand::Rotate`. Set `[control_plane].cloud_vk_path` to the cloud's verifying key
+  file to enable. Without this config the bridge behaves as before (backward compatible).
+- QUIC listener now enforces `[server].max_connections_per_ip` per source IP, consistent
+  with TCP and WebSocket listeners.
+- `RegistrationPayload` no longer includes `backend_addr`, preventing internal topology
+  disclosure to the cloud control plane.
+- Emits a startup `warn!` when `[control_plane].install_token` is set in TOML. Prefer the
+  `$INSTALL_TOKEN` environment variable in production.
+- QUIC listener limits concurrent bidirectional streams to 100 per connection via
+  `TransportConfig::max_concurrent_bidi_streams`.
+
 ## [0.3.3] - 2026-05-22
 
 ### Changed
