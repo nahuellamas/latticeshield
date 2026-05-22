@@ -4,6 +4,8 @@ All notable changes to LatticeShield will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-05-22
+
 ### Changed
 
 - `session::handle()` now reads `[server].handshake_timeout_secs` for the PQC TCP handshake

@@ -250,4 +250,4 @@ These are re-exported from the package for advanced use:
 
 ## License
 
-UNLICENSED — private project.
+Apache-2.0. See the root [LICENSE](../LICENSE) file.

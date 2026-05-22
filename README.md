@@ -68,6 +68,18 @@ You can — Cloudflare, Chrome, and some servers already negotiate X25519Kyber76
 
 Because your traffic goes through their infrastructure and their keys. LatticeShield is self-hosted — you generate the keys, you run the bridge, no third party touches your plaintext. The threat model includes your CDN provider.
 
+**How does LatticeShield compare to alternatives?**
+
+| | LatticeShield | WireGuard | Cloudflare WARP | Nginx + BoringSSL PQ TLS | Raw TLS 1.3 |
+|---|---|---|---|---|---|
+| **Key exchange** | X25519 + ML-KEM-768 (hybrid PQC) | Curve25519 | X25519 | X25519 + Kyber (draft) | X25519 / ECDH |
+| **Server auth** | ML-DSA-65 (PQC signature) | Static public keys | ECDSA | ECDSA / RSA | ECDSA / RSA |
+| **Transport** | Any TCP service | IP-layer VPN | HTTPS proxy | HTTPS only | HTTPS only |
+| **Root required** | No | Yes (kernel / TUN) | No (client app) | No | No |
+| **PQC-safe today** | Yes — both KEM + sig | No | Partial — KEM only | Partial — KEM only | No |
+| **Self-hosted** | Yes | Yes | No (Cloudflare cloud) | Yes | Yes |
+| **Backend changes** | Zero | Zero | Zero | Zero | Zero |
+
 **Is this production-ready?**
 
 The cryptographic primitives use audited upstream crates (`libcrux-ml-dsa`, `ml-kem`, `x25519-dalek`). The protocol design and integration code are self-reviewed — no third-party audit has been performed. Treat it as production-capable but deploy with that in mind: run it behind a firewall, monitor `/metrics`, and keep `server.sk` off the internet.

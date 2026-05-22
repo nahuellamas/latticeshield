@@ -68,6 +68,18 @@ Podés — Cloudflare, Chrome y algunos servidores ya negocian X25519Kyber768 en
 
 Porque tu tráfico pasa por su infraestructura y sus claves. LatticeShield es self-hosted — vos generás las claves, vos corrés el bridge, ningún tercero toca tu texto plano. El modelo de amenaza incluye a tu proveedor de CDN.
 
+**¿Cómo se compara LatticeShield con las alternativas?**
+
+| | LatticeShield | WireGuard | Cloudflare WARP | Nginx + BoringSSL PQ TLS | TLS 1.3 estándar |
+|---|---|---|---|---|---|
+| **Intercambio de clave** | X25519 + ML-KEM-768 (híbrido PQC) | Curve25519 | X25519 | X25519 + Kyber (borrador) | X25519 / ECDH |
+| **Autenticación servidor** | ML-DSA-65 (firma PQC) | Claves públicas estáticas | ECDSA | ECDSA / RSA | ECDSA / RSA |
+| **Transporte** | Cualquier servicio TCP | VPN capa IP | Proxy HTTPS | Solo HTTPS | Solo HTTPS |
+| **Requiere root** | No | Sí (kernel / TUN) | No (app cliente) | No | No |
+| **Seguro PQC hoy** | Sí — KEM + firma | No | Parcial — solo KEM | Parcial — solo KEM | No |
+| **Self-hosted** | Sí | Sí | No (nube Cloudflare) | Sí | Sí |
+| **Cambios en backend** | Cero | Cero | Cero | Cero | Cero |
+
 **¿Está listo para producción?**
 
 Las primitivas criptográficas usan crates auditadas upstream (`libcrux-ml-dsa`, `ml-kem`, `x25519-dalek`). El diseño del protocolo y el código de integración son self-reviewed — no se realizó ninguna auditoría de terceros. Tratalo como production-capable pero deployá con eso en mente: correlo detrás de un firewall, monitoreá `/metrics` y mantené `server.sk` fuera de internet.
