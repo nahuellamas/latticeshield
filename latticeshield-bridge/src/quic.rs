@@ -20,6 +20,9 @@ pub struct QuicRelay {
 }
 
 /// Build a quinn Endpoint bound to `listen_addr` using the cert+key at the given paths.
+///
+/// Enforces `max_concurrent_bidi_streams = 100` per connection to prevent a single QUIC
+/// connection from opening unbounded streams and exhausting backend TCP connections (H3).
 pub fn build_endpoint(
     cert_path: &Path,
     key_path: &Path,
@@ -28,7 +31,10 @@ pub fn build_endpoint(
     let rustls_config = tls::build_server_config(cert_path, key_path)?;
     let quinn_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
         .context("failed to build quinn crypto config from rustls ServerConfig")?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(100u32.into());
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quinn_crypto));
+    server_config.transport_config(Arc::new(transport));
     let endpoint = quinn::Endpoint::server(server_config, listen_addr)
         .with_context(|| format!("failed to bind QUIC endpoint on {listen_addr}"))?;
     Ok(endpoint)

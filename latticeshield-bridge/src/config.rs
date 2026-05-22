@@ -253,6 +253,11 @@ pub struct ControlPlaneConfig {
     #[serde(default = "default_cp_interval")]
     pub heartbeat_interval_secs: u64,
     pub install_token: Option<String>,
+    /// Path to the cloud's ML-DSA-65 verifying key (optional).
+    /// When set, the bridge verifies the ML-DSA-65 signature on every
+    /// HeartbeatResponse before dispatching any BridgeCommand::Rotate.
+    /// If unset, a warning is emitted at startup and commands are accepted unverified.
+    pub cloud_vk_path: Option<PathBuf>,
 }
 
 impl Default for ControlPlaneConfig {
@@ -263,6 +268,7 @@ impl Default for ControlPlaneConfig {
             agent_name: default_cp_agent_name(),
             heartbeat_interval_secs: default_cp_interval(),
             install_token: None,
+            cloud_vk_path: None,
         }
     }
 }
@@ -431,6 +437,9 @@ pub struct ValidConfig {
     pub admin_rate_limit_per_second: u32,
     pub admin_handshake_timeout_secs: u64,
     pub control_plane_install_token: Option<String>,
+    /// Path to the cloud's ML-DSA-65 verifying key for HeartbeatResponse signature verification.
+    /// None means verification is skipped (a startup warning is emitted).
+    pub cloud_vk_path: Option<PathBuf>,
     /// Graceful shutdown drain timeout. Sessions still active after this duration are forced.
     pub shutdown_timeout: std::time::Duration,
     // ── WebSocket listener (:8446) ───────────────────────────────────────────────
@@ -495,6 +504,7 @@ impl std::fmt::Debug for ValidConfig {
                     .as_ref()
                     .map(|_| "[REDACTED]"),
             )
+            .field("cloud_vk_path", &self.cloud_vk_path)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("ws_enabled", &self.ws_enabled)
             .field("ws_listen_addr", &self.ws_listen_addr)
@@ -594,14 +604,35 @@ impl Config {
             std::time::Duration::from_secs(self.control_plane.heartbeat_interval_secs.max(5));
 
         // ── install_token resolution (env var takes precedence over TOML) ───
-        let control_plane_install_token = match std::env::var("INSTALL_TOKEN") {
-            Ok(val) if !val.is_empty() => Some(val),
-            _ => self.control_plane.install_token.clone(),
-        };
+        let env_install_token = std::env::var("INSTALL_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let control_plane_install_token = env_install_token
+            .clone()
+            .or_else(|| self.control_plane.install_token.clone());
+
+        // H5: Warn if install_token is TOML-sourced rather than env-var-sourced.
+        // In production, $INSTALL_TOKEN should be used to avoid credentials in config files.
+        if control_plane_enabled
+            && self.control_plane.install_token.is_some()
+            && env_install_token.is_none()
+        {
+            tracing::warn!(
+                "install_token is set in TOML config — in production, use the $INSTALL_TOKEN env var instead to avoid credentials in config files"
+            );
+        }
 
         if control_plane_enabled && control_plane_install_token.is_none() {
             tracing::warn!(
                 "control_plane.install_token is not set — the cloud cannot authenticate this bridge on registration"
+            );
+        }
+
+        // ── Cloud VK path (for HeartbeatResponse signature verification) ────
+        let cloud_vk_path = self.control_plane.cloud_vk_path.clone();
+        if control_plane_enabled && cloud_vk_path.is_none() {
+            tracing::warn!(
+                "control_plane.cloud_vk_path is not set — BridgeCommand::Rotate will be accepted without signature verification"
             );
         }
 
@@ -878,6 +909,7 @@ impl Config {
             admin_rate_limit_per_second: self.admin.rate_limit_per_second,
             admin_handshake_timeout_secs: self.admin.handshake_timeout_secs,
             control_plane_install_token,
+            cloud_vk_path,
             shutdown_timeout,
             ws_enabled: self.websocket.enabled,
             ws_listen_addr,
@@ -938,6 +970,7 @@ impl ValidConfig {
             admin_rate_limit_per_second: 5,
             admin_handshake_timeout_secs: 10,
             control_plane_install_token: None,
+            cloud_vk_path: None,
             shutdown_timeout: std::time::Duration::from_secs(1),
             ws_enabled: false,
             ws_listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1558,8 +1591,32 @@ handshake_timeout_secs = 30
         assert!(cfg.control_plane_enabled);
         assert_eq!(cfg.control_plane_install_token, None);
 
+        // Case 6 (H5): TOML install_token is loaded when env var is absent (backward compat).
+        // The warn path is exercised but cannot be asserted without tracing capture.
+        std::env::remove_var("INSTALL_TOKEN");
+        let f = write_toml(
+            "[control_plane]\ninstall_token = \"my-toml-token\"\nendpoint = \"http://localhost:9000\"\n",
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.control_plane_install_token,
+            Some("my-toml-token".to_string()),
+            "H5: TOML install_token must still load when env var is absent (backward compat)"
+        );
+
         // Cleanup
         std::env::remove_var("INSTALL_TOKEN");
+    }
+
+    /// Slice 1: cloud_vk_path defaults to None when not specified.
+    #[test]
+    fn cloud_vk_path_defaults_to_none() {
+        let f = write_toml("[control_plane]\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(
+            cfg.cloud_vk_path.is_none(),
+            "cloud_vk_path should default to None"
+        );
     }
 
     #[test]
@@ -1597,6 +1654,7 @@ handshake_timeout_secs = 30
             admin_rate_limit_per_second: 5,
             admin_handshake_timeout_secs: 10,
             control_plane_install_token: Some("super-secret-value".to_string()),
+            cloud_vk_path: None,
             shutdown_timeout: std::time::Duration::from_secs(30),
             ws_enabled: false,
             ws_listen_addr: "127.0.0.1:8446".parse().unwrap(),

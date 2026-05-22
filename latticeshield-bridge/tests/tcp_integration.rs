@@ -78,6 +78,7 @@ fn make_config(backend_port: u16) -> ValidConfig {
         admin_rate_limit_per_second: 10,
         admin_handshake_timeout_secs: 5,
         control_plane_install_token: None,
+        cloud_vk_path: None,
         shutdown_timeout: Duration::from_secs(5),
         ws_enabled: false,
         ws_listen_addr: "127.0.0.1:8446".parse().unwrap(),

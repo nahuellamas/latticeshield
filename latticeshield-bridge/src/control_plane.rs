@@ -25,7 +25,6 @@ struct RegistrationPayload {
     version: String,
     capabilities: Vec<String>,
     listen_addr: String,
-    backend_addr: String,
     server_vk: String, // lowercase hex-encoded ML-DSA-65 VerifyingKey (3904 chars)
     #[serde(skip_serializing_if = "Option::is_none")]
     install_token: Option<String>,
@@ -176,7 +175,6 @@ async fn try_register(
             "ml-dsa-65".to_string(),
         ],
         listen_addr: config.listen_addr.to_string(),
-        backend_addr: config.backend_addr.to_string(),
         server_vk,
         install_token: config.control_plane_install_token.clone(),
     };
@@ -317,6 +315,7 @@ mod tests {
             admin_rate_limit_per_second: 5,
             admin_handshake_timeout_secs: 10,
             control_plane_install_token: None,
+            cloud_vk_path: None,
             shutdown_timeout: Duration::from_secs(30),
             ws_enabled: false,
             ws_listen_addr: "127.0.0.1:8446".parse().unwrap(),

@@ -72,6 +72,7 @@ fn test_config(backend_addr: std::net::SocketAddr) -> ValidConfig {
         admin_rate_limit_per_second: 5,
         admin_handshake_timeout_secs: 10,
         control_plane_install_token: None,
+        cloud_vk_path: None,
         shutdown_timeout: std::time::Duration::from_secs(30),
         ws_enabled: false,
         ws_listen_addr: "127.0.0.1:0".parse().unwrap(),

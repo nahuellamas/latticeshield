@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
 /// Load a PEM-encoded certificate chain from `path`.
@@ -35,11 +35,17 @@ fn load_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
 }
 
 /// Build a rustls ServerConfig from PEM cert+key files.
+///
+/// Enforces TLS 1.3-only — TLS 1.2 and earlier are explicitly rejected.
+/// This is intentional: LatticeShield is a post-quantum transport proxy targeting
+/// modern clients. TLS 1.3 is required for QUIC; aligning the TLS listener
+/// ensures consistent security posture across all listeners.
+///
 /// Returns Arc<ServerConfig> — consumed by both TlsAcceptor (TLS) and quinn Endpoint (QUIC).
 pub fn build_server_config(cert_path: &Path, key_path: &Path) -> anyhow::Result<Arc<ServerConfig>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .with_context(|| {
@@ -236,5 +242,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!err.is_empty());
+    }
+
+    /// Verify that the TLS listener rejects TLS 1.2 clients.
+    ///
+    /// LatticeShield enforces TLS 1.3-only. A client restricted to TLS 1.2
+    /// must get a handshake failure — no data should flow.
+    #[tokio::test]
+    async fn tls13_only_rejects_tls12_client() {
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::rustls::RootCertStore;
+        use tokio_rustls::TlsConnector;
+
+        init_crypto();
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen failed");
+        let cert_der = certified.cert.der().clone();
+
+        let mut cert_f = NamedTempFile::new().unwrap();
+        let mut key_f = NamedTempFile::new().unwrap();
+        cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
+        key_f
+            .write_all(certified.key_pair.serialize_pem().as_bytes())
+            .unwrap();
+
+        let acceptor = build_acceptor(cert_f.path(), key_f.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn server: accept one connection, attempt TLS (will fail for TLS 1.2 client)
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+
+        // Build a TLS 1.2-only client config
+        let mut root_store = RootCertStore::empty();
+        root_store
+            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(
+                cert_der.to_vec(),
+            ))
+            .unwrap();
+        let client_config =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let result = connector.connect(server_name, stream).await;
+
+        // The handshake MUST fail — server only speaks TLS 1.3
+        assert!(
+            result.is_err(),
+            "expected TLS 1.2 handshake to fail against TLS-1.3-only server, but it succeeded"
+        );
+
+        let _ = server_handle.await;
     }
 }
