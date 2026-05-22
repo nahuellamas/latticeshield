@@ -345,11 +345,25 @@ async fn send_heartbeat(
             Some(s) => s,
         };
 
-        let sig_bytes = STANDARD
-            .decode(sig_b64)
-            .map_err(|e| anyhow::anyhow!("cloud sig base64 decode failed: {e}"))?;
-        let sig = Signature::from_bytes(&sig_bytes)
-            .map_err(|e| anyhow::anyhow!("cloud sig parse failed: {e:?}"))?;
+        // All malformed-signature failures degrade to "drop commands" instead of propagating an
+        // error. This keeps the operator-visible failure mode coherent: every verification path
+        // returns Ok(default()) with a warn!, so a bad cloud response never crashes the loop.
+        let sig_bytes = match STANDARD.decode(sig_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("control plane: cloud sig base64 decode failed ({e}) — dropping all pending commands");
+                return Ok(HeartbeatResponse::default());
+            }
+        };
+        let sig = match Signature::from_bytes(&sig_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "control plane: cloud sig parse failed ({e:?}) — dropping all pending commands"
+                );
+                return Ok(HeartbeatResponse::default());
+            }
+        };
 
         // Verify over the EXACT bytes of signed_payload — no re-serialization.
         if let Err(e) = latticeshield_crypto::signing::verify(vk, signed_payload.as_bytes(), &sig) {
@@ -367,11 +381,17 @@ async fn send_heartbeat(
         };
 
         // Freshness check — drops captured replays older than the window.
+        // checked_sub guards against `i64::MIN` ts → otherwise (now - i64::MIN) overflows.
+        // In debug builds the overflow panics; in release it wraps to a safe-but-wrong value.
+        // Saturating to i64::MAX makes the drift test reject the response in BOTH profiles.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let drift = (now - inner.ts).abs();
+        let drift = now
+            .checked_sub(inner.ts)
+            .map(|d| d.saturating_abs())
+            .unwrap_or(i64::MAX);
         if drift > SIGNED_RESPONSE_FRESHNESS_SECS {
             warn!(
                 drift_secs = drift,
@@ -1138,6 +1158,243 @@ mod tests {
             resp.pending_commands.is_none(),
             "future ts must drop all commands"
         );
+    }
+
+    /// Helper: builds a signed body with an arbitrary `ts` value (not a relative offset).
+    /// Lets tests reach extreme boundary values (i64::MIN, i64::MAX).
+    fn make_signed_body_with_absolute_ts(
+        cloud_sk: &latticeshield_crypto::signing::SigningKey,
+        rng: &mut impl rand_core::CryptoRngCore,
+        commands_json: &str,
+        ts: i64,
+    ) -> String {
+        let signed_payload = format!(r#"{{"pending_commands":{commands_json},"ts":{ts}}}"#);
+        let sig =
+            latticeshield_crypto::signing::sign(cloud_sk, signed_payload.as_bytes(), rng).unwrap();
+        let sig_b64 = STANDARD.encode(sig.to_bytes());
+        let escaped = signed_payload.replace('\\', r"\\").replace('"', r#"\""#);
+        format!(r#"{{"signed_payload":"{escaped}","response_signature":"{sig_b64}"}}"#)
+    }
+
+    /// Regression: `ts = i64::MIN` used to panic in debug builds because
+    /// `now - i64::MIN` overflows i64. `checked_sub` guards now.
+    #[tokio::test]
+    async fn cloud_vk_ts_i64_min_drops_without_panic() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        let body = make_signed_body_with_absolute_ts(
+            &cloud_sk,
+            &mut rng,
+            r#"[{"type":"Rotate"}]"#,
+            i64::MIN,
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.pending_commands.is_none(),
+            "ts = i64::MIN must drop without panic"
+        );
+    }
+
+    /// Mirror: `ts = i64::MAX` must also drop cleanly via saturating_abs.
+    #[tokio::test]
+    async fn cloud_vk_ts_i64_max_drops_without_panic() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        let body = make_signed_body_with_absolute_ts(
+            &cloud_sk,
+            &mut rng,
+            r#"[{"type":"Rotate"}]"#,
+            i64::MAX,
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.pending_commands.is_none(),
+            "ts = i64::MAX must drop without panic"
+        );
+    }
+
+    /// `signed_payload` missing the `ts` field → JSON parse fails → commands dropped.
+    /// SignedResponsePayload.ts has no #[serde(default)]; this is intentional and tested here.
+    #[tokio::test]
+    async fn cloud_vk_signed_payload_missing_ts_drops() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        // No "ts" field in the inner payload.
+        let signed_payload = r#"{"pending_commands":[{"type":"Rotate"}]}"#;
+        let sig =
+            latticeshield_crypto::signing::sign(&cloud_sk, signed_payload.as_bytes(), &mut rng)
+                .unwrap();
+        let sig_b64 = STANDARD.encode(sig.to_bytes());
+        let escaped = signed_payload.replace('"', r#"\""#);
+        let body = format!(r#"{{"signed_payload":"{escaped}","response_signature":"{sig_b64}"}}"#);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.pending_commands.is_none(),
+            "missing ts in signed_payload must drop without error"
+        );
+    }
+
+    /// Malformed base64 signature → drop (Ok, not Err). Coherent fail-closed.
+    #[tokio::test]
+    async fn cloud_vk_signature_malformed_base64_drops_ok() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (_, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let signed_payload = format!(r#"{{"pending_commands":[{{"type":"Rotate"}}],"ts":{now}}}"#);
+        let escaped = signed_payload.replace('"', r#"\""#);
+        // "not-valid-base64!" contains chars outside base64 alphabet
+        let body =
+            format!(r#"{{"signed_payload":"{escaped}","response_signature":"not-valid-base64!"}}"#);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        // Must return Ok with dropped commands — not propagate the decode error.
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .expect("malformed sig must drop commands without propagating Err");
+        assert!(resp.pending_commands.is_none());
+    }
+
+    /// Wrong-length signature bytes → drop (Ok). Coherent fail-closed.
+    #[tokio::test]
+    async fn cloud_vk_signature_wrong_length_drops_ok() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (_, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let signed_payload = format!(r#"{{"pending_commands":[{{"type":"Rotate"}}],"ts":{now}}}"#);
+        let escaped = signed_payload.replace('"', r#"\""#);
+        // Valid base64 but only 32 bytes → wrong sig length (ML-DSA-65 = 3309)
+        let short_sig = STANDARD.encode([0u8; 32]);
+        let body =
+            format!(r#"{{"signed_payload":"{escaped}","response_signature":"{short_sig}"}}"#);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .expect("wrong-length sig must drop commands without propagating Err");
+        assert!(resp.pending_commands.is_none());
     }
 
     /// C1: No cloud VK configured → commands dispatched (backward compat).
