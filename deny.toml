@@ -6,10 +6,6 @@ ignore = [
     # RUSTSEC-2025-0134: rustls-pemfile is unmaintained — no safe upgrade available.
     # Used only for TLS cert/key loading at startup; not in the hot crypto path.
     { id = "RUSTSEC-2025-0134" },
-    # RUSTSEC-2026-0097: rand 0.8.x unsound with a custom global logger using rand::rng().
-    # We do not install a custom global logger (we use tracing, not the log crate's set_logger).
-    # rand 0.8.x is a transitive dep via testcontainers; no upgrade path without breaking changes.
-    { id = "RUSTSEC-2026-0097" },
 ]
 
 [licenses]
