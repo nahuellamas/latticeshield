@@ -198,7 +198,7 @@ mod tests {
         let key_der = certified.key_pair.serialize_der();
 
         // Server config
-        let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
+        let cert_chain = vec![cert_der.clone()];
         let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
         let server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -208,9 +208,7 @@ mod tests {
 
         // Client config (trusts our self-signed cert)
         let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(rustls::pki_types::CertificateDer::from(cert_der))
-            .unwrap();
+        root_store.add(cert_der).unwrap();
         let client_cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -468,7 +466,7 @@ pub mod tests_pub {
         let cert_der = certified.cert.der().clone();
         let key_der = certified.key_pair.serialize_der();
 
-        let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
+        let cert_chain = vec![cert_der.clone()];
         let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
         let server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -477,9 +475,7 @@ pub mod tests_pub {
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
 
         let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(rustls::pki_types::CertificateDer::from(cert_der))
-            .unwrap();
+        root_store.add(cert_der).unwrap();
         let client_cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();

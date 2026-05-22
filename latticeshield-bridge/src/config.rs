@@ -901,6 +901,9 @@ impl ValidConfig {
     /// - All optional listeners (TLS, QUIC, WebSocket, admin, control-plane) disabled
     /// - `client_auth_enabled = false` (no client VK required)
     /// - `shutdown_timeout = 1s` for fast test teardown
+    ///
+    /// Used by `latticeshield-integration-tests`; bin target sees it as unused.
+    #[allow(dead_code)]
     pub fn for_test(backend_port: u16) -> Self {
         let dummy = std::path::PathBuf::from("/dev/null");
         ValidConfig {

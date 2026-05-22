@@ -137,8 +137,7 @@ mod tests {
         let key_f = NamedTempFile::new().unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let err = build_endpoint(Path::new("/nonexistent/tls.crt"), key_f.path(), addr)
-            .err()
-            .expect("should be Err")
+            .expect_err("should be Err")
             .to_string();
         assert!(!err.is_empty(), "expected non-empty error");
     }
@@ -150,8 +149,7 @@ mod tests {
         cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let err = build_endpoint(cert_f.path(), Path::new("/nonexistent/tls.key"), addr)
-            .err()
-            .expect("should be Err")
+            .expect_err("should be Err")
             .to_string();
         assert!(!err.is_empty(), "expected non-empty error");
     }
@@ -310,7 +308,7 @@ mod tests {
         let key_der = certified.key_pair.serialize_der();
 
         // ── Server endpoint ──────────────────────────────────────────────────
-        let cert_chain = vec![CertificateDer::from(cert_der.clone())];
+        let cert_chain = vec![cert_der.clone()];
         let key = PrivateKeyDer::try_from(key_der).unwrap();
         let server_rustls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()

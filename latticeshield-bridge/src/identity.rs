@@ -365,6 +365,7 @@ mod tests {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(&sk_path)
             .unwrap()
@@ -399,7 +400,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vk_path = dir.path().join("client.vk");
         // Escribir un archivo con tamano incorrecto
-        std::fs::write(&vk_path, &[0u8; 16]).unwrap();
+        std::fs::write(&vk_path, [0u8; 16]).unwrap();
         let err = ClientVerifyingIdentity::load(&vk_path).unwrap_err();
         assert!(
             matches!(
@@ -440,7 +441,7 @@ mod tests {
     fn cp_vk_load_wrong_size_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let vk_path = dir.path().join("cp.vk");
-        std::fs::write(&vk_path, &[0u8; 16]).unwrap();
+        std::fs::write(&vk_path, [0u8; 16]).unwrap();
         let err = ControlPlaneVerifyingIdentity::load(&vk_path).unwrap_err();
         assert!(
             matches!(

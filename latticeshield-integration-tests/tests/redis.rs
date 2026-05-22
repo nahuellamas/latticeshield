@@ -13,10 +13,7 @@ use testcontainers_modules::redis::Redis;
 #[ignore]
 #[tokio::test]
 async fn redis_baseline() {
-    let redis_container = Redis::default()
-        .start()
-        .await
-        .expect("Redis container should start");
+    let redis_container = Redis.start().await.expect("Redis container should start");
 
     let redis_port = redis_container.get_host_port_ipv4(6379).await.unwrap();
     let redis_addr: std::net::SocketAddr = format!("127.0.0.1:{redis_port}").parse().unwrap();
@@ -55,10 +52,7 @@ async fn redis_baseline() {
 #[ignore]
 #[tokio::test]
 async fn redis_pubsub_drop() {
-    let redis_container = Redis::default()
-        .start()
-        .await
-        .expect("Redis container should start");
+    let redis_container = Redis.start().await.expect("Redis container should start");
 
     let redis_port = redis_container.get_host_port_ipv4(6379).await.unwrap();
     let redis_addr: std::net::SocketAddr = format!("127.0.0.1:{redis_port}").parse().unwrap();

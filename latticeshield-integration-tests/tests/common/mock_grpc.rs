@@ -32,6 +32,7 @@ impl Echo for EchoService {
         req: Request<StreamReq>,
     ) -> Result<Response<Self::StreamStream>, Status> {
         let count = req.into_inner().count.min(10); // cap at 10 for safety
+        #[allow(clippy::result_large_err)] // Status size dictated by tonic trait
         let chunks: Vec<Result<Chunk, Status>> = (0..count)
             .map(|i| {
                 Ok(Chunk {
@@ -54,7 +55,7 @@ pub async fn spawn_grpc_backend() -> SocketAddr {
 
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(EchoServer::new(EchoService::default()))
+            .add_service(EchoServer::new(EchoService))
             .serve_with_incoming(incoming)
             .await
             .ok();

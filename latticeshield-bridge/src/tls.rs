@@ -187,8 +187,7 @@ mod tests {
     fn build_server_config_missing_cert_err() {
         let key_f = NamedTempFile::new().unwrap();
         let err = build_server_config(Path::new("/nonexistent/tls.crt"), key_f.path())
-            .err()
-            .expect("should be Err")
+            .expect_err("should be Err")
             .to_string();
         assert!(err.contains("cert"), "expected 'cert' in error, got: {err}");
     }
@@ -199,8 +198,7 @@ mod tests {
         let mut cert_f = NamedTempFile::new().unwrap();
         cert_f.write_all(certified.cert.pem().as_bytes()).unwrap();
         let err = build_server_config(cert_f.path(), Path::new("/nonexistent/tls.key"))
-            .err()
-            .expect("should be Err")
+            .expect_err("should be Err")
             .to_string();
         assert!(err.contains("key"), "expected 'key' in error, got: {err}");
     }
