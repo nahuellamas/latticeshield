@@ -1,9 +1,43 @@
+# Build artifacts
 target/
+**/*.rs.bk
+
+# Secrets — MUST NOT enter the build context
 keys/
 keys-test/
+*.pem
+*.key
+*.crt
+*.sk
+.env
+.env.*
+
+# Internal AI tooling and local config (gitignored too)
 .git/
-*.log
+.engram/
+.atl/
+.mcp.json
+.playwright-mcp/
+.claude/
+
+# Internal docs (gitignored)
+docs.md
+/docs
+
+# JS / WASM build outputs (rebuilt inside the image if needed)
+node_modules/
+e2e/
 e2e/node_modules/
 latticeshield-js/node_modules/
+latticeshield-js/.vite/
 latticeshield-js/dist/
 latticeshield-wasm/pkg/
+
+# OS / editor cruft
+.DS_Store
+.gga
+.idea/
+.vscode/
+
+# Logs
+*.log
