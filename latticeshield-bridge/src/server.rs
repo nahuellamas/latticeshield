@@ -369,6 +369,7 @@ pub async fn run(config: ValidConfig) -> anyhow::Result<()> {
 pub(crate) fn metrics_app(state: MetricsAppState) -> axum::Router {
     axum::Router::new()
         .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(healthz_handler))
         .with_state(state)
 }
 
@@ -757,6 +758,16 @@ async fn metrics_handler(State(state): State<MetricsAppState>) -> impl IntoRespo
     )
 }
 
+async fn healthz_handler() -> impl IntoResponse {
+    (
+        [
+            (CONTENT_TYPE, "application/json"),
+            (CACHE_CONTROL, "no-store"),
+        ],
+        r#"{"status":"ok"}"#,
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -816,6 +827,60 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_200_with_json_body() {
+        use axum::body::to_bytes;
+
+        let state = make_test_state();
+        let app = metrics_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+        assert!(
+            headers
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or(""))
+                .unwrap_or("")
+                .starts_with("application/json"),
+            "Content-Type must be application/json"
+        );
+        assert_eq!(
+            headers.get("cache-control").map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "Cache-Control must be no-store"
+        );
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body_str.contains("\"status\"") && body_str.contains("\"ok\""),
+            "body must contain {{\"status\":\"ok\"}}, got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_unknown_method_returns_405() {
+        let state = make_test_state();
+        let app = metrics_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     // ── extract_vk_token unit tests (pure, no I/O) ────────────────────────────

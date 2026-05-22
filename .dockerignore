@@ -1,0 +1,9 @@
+target/
+keys/
+keys-test/
+.git/
+*.log
+e2e/node_modules/
+latticeshield-js/node_modules/
+latticeshield-js/dist/
+latticeshield-wasm/pkg/
