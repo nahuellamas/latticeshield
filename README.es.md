@@ -675,6 +675,14 @@ cd latticeshield-js && npm test           # 93 tests en TypeScript
 
 ## Novedades
 
+### v0.3.3 — Parches de seguridad de dependencias + Builds reproducibles (2026-05-22)
+
+`Cargo.lock` ahora se trackea en el control de versiones, habilitando que Dependabot resuelva versiones exactas y permitiendo builds bit-a-bit reproducibles entre máquinas. El lockfile estaba previamente gitignored como default de `cargo new --lib` — un residuo de cuando el workspace era solo lib y nunca se revisó después de que el bridge y el client se sumaran como binarios.
+
+Cierra 5 alertas de Dependabot vía bumps transitivos de patch: `libcrux-ml-dsa` 0.0.8 → 0.0.9 (fix del `use_hint` en AVX2 — GHSA-fhvh-vw7h-9xf3), `rustls-webpki` 0.103.10 → 0.103.13 (panic en parsing de CRL + fixes de name constraints), y `rand` 0.8.5/0.9.2 → 0.8.6/0.9.4 (fix de soundness en `rng()`). El deployment de producción no era explotable en ningún caso (backend portable de ML-DSA, sin validación de CRL, sin URI name constraints, sin logger custom de `rand`), pero el upgrade reduce la superficie de riesgo y limpia cuatro ignores del `deny.toml`.
+
+También limpia un backlog de 17 fixes de clippy 1.94 que tenía CI rojo en `main` desde el refresh del toolchain. Sin cambio de comportamiento.
+
 ### v0.3.2 — Reconexión PQC automática server-side (2026-05-15)
 
 `latticeshield-client` ahora soporta reconexión automática transparente con backoff exponencial. Cuando el bridge cierra una sesión, el cliente re-establece la conexión silenciosamente realizando un handshake PQC completo y fresco en cada intento (ML-KEM-768 + X25519 + ML-DSA-65). Sin reutilización de sesión ni de claves, nunca.

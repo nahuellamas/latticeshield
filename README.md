@@ -690,6 +690,14 @@ handshake cost, equivalent to `unsigned_handshake`).
 
 ## What's New
 
+### v0.3.3 — Dependency Security Patches + Reproducible Builds (2026-05-22)
+
+`Cargo.lock` is now tracked in version control, enabling Dependabot version resolution and bit-reproducible builds across machines. The lockfile was previously gitignored as a `cargo new --lib` default — a leftover from when the workspace was lib-only and never revisited after the bridge and client binaries joined.
+
+Closes 5 Dependabot alerts via transitive patch bumps: `libcrux-ml-dsa` 0.0.8 → 0.0.9 (AVX2 `use_hint` fix — GHSA-fhvh-vw7h-9xf3), `rustls-webpki` 0.103.10 → 0.103.13 (CRL parsing panic + name constraint fixes), and `rand` 0.8.5/0.9.2 → 0.8.6/0.9.4 (`rng()` soundness fix). Production deployment was not exploitable in any case (portable ML-DSA backend, no CRL validation, no URI name constraints, no custom `rand` logger), but upgrading reduces risk surface and clears four `deny.toml` ignore entries.
+
+Also clears a 17-fix clippy 1.94 lint backlog that had broken CI on `main` since the toolchain refresh. No behavior change.
+
 ### v0.3.2 — Server-Side PQC Auto-Reconnect (2026-05-15)
 
 `latticeshield-client` now supports transparent auto-reconnect with exponential backoff. When the bridge drops a session, the client silently re-establishes the connection — performing a fresh full PQC handshake on every attempt (ML-KEM-768 + X25519 + ML-DSA-65). No session resumption, no key reuse, ever.
