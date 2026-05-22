@@ -1,9 +1,16 @@
 # Multi-stage Dockerfile for latticeshield-bridge
 #
-# Stage 1: Build a statically linked binary using musl libc.
-# Stage 2: Copy the binary into a minimal distroless image.
+# Stage 1 builder: Alpine-based rust image (musl libc by default, ~0 high CVEs
+# in the toolchain layer at last check vs. ~23 high CVEs on rust:1.87-slim).
+# Stage 2 runtime: distroless/static — no shell, no package manager, nonroot.
 #
-# Build:
+# Multi-arch: this Dockerfile builds natively for whichever platform docker is
+# invoked on. For amd64 + arm64 in one shot use:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#       -t latticeshield-bridge .
+#
+# Build (single-arch, local):
 #   docker build -t latticeshield-bridge .
 #
 # Run (requires a config file and keypair):
@@ -14,27 +21,32 @@
 #     -p 8443:8443 \
 #     latticeshield-bridge run --config /etc/latticeshield/config.toml
 
-# ── Stage 1: builder ──────────────────────────────────────────────────────────
-FROM rust:1.87-slim AS builder
+# ── Stage 1: builder (Alpine = musl by default → static binary ready for distroless) ─
+FROM rust:1.87-alpine AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    musl-tools \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN rustup target add x86_64-unknown-linux-musl
+# musl-dev for the C runtime headers; pkgconf because some -sys crates probe for it.
+# cmake/make/perl are required by aws-lc-sys (transitive via rustls aws_lc_rs feature)
+# to build the bundled AWS-LC C sources when no prebuilt is selected.
+RUN apk add --no-cache \
+    musl-dev \
+    pkgconf \
+    cmake \
+    make \
+    perl
 
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release --target x86_64-unknown-linux-musl \
-    --package latticeshield-bridge
+# Alpine's default Rust target is `<arch>-unknown-linux-musl` — no `--target` needed.
+# Build only the bridge package so the dev-only integration-tests crate (which pulls
+# prost-build → protoc) is skipped.
+RUN cargo build --release --package latticeshield-bridge
 
 # ── Stage 2: runtime (distroless static) ─────────────────────────────────────
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 COPY --from=builder \
-    /src/target/x86_64-unknown-linux-musl/release/latticeshield-bridge \
+    /src/target/release/latticeshield-bridge \
     /usr/local/bin/latticeshield-bridge
 
 # PQC TCP listener (default)
