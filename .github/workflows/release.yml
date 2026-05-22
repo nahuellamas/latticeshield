@@ -138,6 +138,11 @@ jobs:
             checksums.txt
 
   publish-npm:
+    # Gate on the binary release succeeding first. If cross-compilation or
+    # GitHub-release upload fail, we must NOT publish @latticeshield/js to npm —
+    # users would otherwise install a package whose paired bridge binaries do
+    # not exist for this tag.
+    needs: [build, upload-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read

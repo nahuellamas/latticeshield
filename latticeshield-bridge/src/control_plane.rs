@@ -94,6 +94,13 @@ struct SignedResponsePayload {
 /// allowing meaningful replay windows.
 const SIGNED_RESPONSE_FRESHNESS_SECS: i64 = 300;
 
+/// Hard cap on the heartbeat response body buffered into memory.
+/// A compromised or misbehaving cloud endpoint advertising or streaming a huge
+/// body would otherwise OOM the bridge. 1 MiB is generous for legitimate
+/// payloads (signed_payload is dominated by a base64 ML-DSA-65 signature ≈ 4416
+/// chars + a small JSON envelope).
+const MAX_HEARTBEAT_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum BridgeCommand {
@@ -316,11 +323,26 @@ async fn send_heartbeat(
         return Err(anyhow::anyhow!("heartbeat non-2xx: {}", resp.status()));
     }
 
-    // 6. Read response body and parse top-level envelope.
+    // 6. Read response body, bounded by MAX_HEARTBEAT_RESPONSE_BYTES.
+    //    Reject any advertised Content-Length that exceeds the cap before buffering.
+    //    Defense against a hostile cloud sending an unbounded body to OOM the bridge.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_HEARTBEAT_RESPONSE_BYTES {
+            return Err(anyhow::anyhow!(
+                "heartbeat response too large: content-length={len} bytes (max={MAX_HEARTBEAT_RESPONSE_BYTES})"
+            ));
+        }
+    }
     let body_bytes = resp
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("heartbeat read body failed: {e}"))?;
+    if body_bytes.len() as u64 > MAX_HEARTBEAT_RESPONSE_BYTES {
+        return Err(anyhow::anyhow!(
+            "heartbeat response too large: {} bytes (max={MAX_HEARTBEAT_RESPONSE_BYTES})",
+            body_bytes.len()
+        ));
+    }
     let hb_resp: HeartbeatResponse = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
     // 7. If cloud VK is configured, verify ML-DSA-65 signature over signed_payload (C1/H6).
@@ -1395,6 +1417,48 @@ mod tests {
         .await
         .expect("wrong-length sig must drop commands without propagating Err");
         assert!(resp.pending_commands.is_none());
+    }
+
+    /// M-1: an oversized response body must be rejected before buffering.
+    /// Even without a cloud VK configured, a hostile cloud sending a 1 GB
+    /// body would OOM the bridge. Test sends a body just over the 1 MiB cap.
+    #[tokio::test]
+    async fn heartbeat_oversized_body_returns_err() {
+        init_crypto();
+        let oversized = "x".repeat((MAX_HEARTBEAT_RESPONSE_BYTES + 1) as usize);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(oversized))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng = rand_core::OsRng;
+
+        let result = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "oversized heartbeat response must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "error message should mention size, got: {err}"
+        );
     }
 
     /// C1: No cloud VK configured → commands dispatched (backward compat).
