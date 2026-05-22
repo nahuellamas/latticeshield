@@ -13,6 +13,17 @@ All notable changes to LatticeShield will be documented in this file.
 - Cloud heartbeat responses are now signature-verified with ML-DSA-65 before dispatching
   `BridgeCommand::Rotate`. Set `[control_plane].cloud_vk_path` to the cloud's verifying key
   file to enable. Without this config the bridge behaves as before (backward compatible).
+  Wire format (when verification is enabled):
+  ```json
+  {
+    "signed_payload": "{\"pending_commands\":[{\"type\":\"Rotate\"}],\"ts\":1735776000}",
+    "response_signature": "<base64 ML-DSA-65 signature over signed_payload.as_bytes()>"
+  }
+  ```
+  The cloud serializes the inner payload ONCE and signs the exact bytes — bridge verifies
+  over the same byte string so no JSON-canonicalization mismatch is possible. The `ts`
+  field (unix seconds) anchors freshness: bridge rejects responses with `|now - ts| > 300s`
+  to prevent replay of captured signed responses.
 - QUIC listener now enforces `[server].max_connections_per_ip` per source IP, consistent
   with TCP and WebSocket listeners.
 - `RegistrationPayload` no longer includes `backend_addr`, preventing internal topology

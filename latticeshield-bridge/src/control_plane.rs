@@ -58,14 +58,41 @@ struct SignedHeartbeatPayload {
 
 #[derive(Debug, Deserialize, Default)]
 struct HeartbeatResponse {
+    /// Legacy field — used only when `cloud_vk` is NOT configured (backward compat).
+    /// When `cloud_vk` IS configured, this field is ignored; commands come from
+    /// the signed inner payload.
     #[serde(default)]
     pending_commands: Option<Vec<BridgeCommand>>,
-    /// ML-DSA-65 signature over the raw response body (base64-encoded).
-    /// Signed by the cloud using its private key. The bridge verifies this
-    /// against `cloud_vk_path` (if configured) before dispatching commands.
+
+    /// New wire format (required when `cloud_vk_path` is set).
+    /// Raw JSON string containing the canonical signed payload — the cloud
+    /// serializes it ONCE and signs the exact bytes. The bridge verifies the
+    /// signature over `signed_payload.as_bytes()` directly, eliminating any
+    /// JSON-canonicalization mismatch between sides (C-R1).
+    #[serde(default)]
+    signed_payload: Option<String>,
+
+    /// ML-DSA-65 signature (base64) over `signed_payload.as_bytes()`.
     #[serde(default)]
     response_signature: Option<String>,
 }
+
+/// Inner payload that the cloud signs.
+/// Wire format: `{"pending_commands": [...], "ts": <unix_seconds>}`.
+/// `ts` is freshness anchor — bridge rejects when `|now - ts| > 300` (C-R2 replay protection).
+#[derive(Debug, Deserialize)]
+struct SignedResponsePayload {
+    #[serde(default)]
+    pending_commands: Option<Vec<BridgeCommand>>,
+    /// Unix seconds at signing time. Used for freshness window enforcement.
+    ts: i64,
+}
+
+/// Maximum allowed drift between `signed_payload.ts` and the bridge's wall clock.
+/// Replay protection: any captured signed response older (or further future) than
+/// this is dropped. 5 minutes is a generous window that tolerates clock skew without
+/// allowing meaningful replay windows.
+const SIGNED_RESPONSE_FRESHNESS_SECS: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -289,48 +316,81 @@ async fn send_heartbeat(
         return Err(anyhow::anyhow!("heartbeat non-2xx: {}", resp.status()));
     }
 
-    // 6. Read response body
+    // 6. Read response body and parse top-level envelope.
     let body_bytes = resp
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("heartbeat read body failed: {e}"))?;
+    let hb_resp: HeartbeatResponse = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
-    // Parse as generic JSON first to extract canonical pending_commands bytes for verification.
-    let body_value: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-    let hb_resp =
-        serde_json::from_value::<HeartbeatResponse>(body_value.clone()).unwrap_or_default();
-
-    // 7. If cloud VK is configured, verify ML-DSA-65 signature over pending_commands (C1/H6).
-    //    The cloud signs the canonical JSON of pending_commands only (not the full body).
-    //    This avoids circular signing — the signature field itself is NOT part of the signed data.
-    //    If the signature is absent or invalid, drop all pending commands.
+    // 7. If cloud VK is configured, verify ML-DSA-65 signature over signed_payload (C1/H6).
+    //    Wire format: {"signed_payload": "<raw JSON>", "response_signature": "<b64>"}.
+    //    signed_payload parses to {"pending_commands": [...], "ts": <unix_seconds>}.
+    //    The cloud serializes the inner payload ONCE and signs `signed_payload.as_bytes()`
+    //    exactly — bridge verifies over the same bytes (no canonicalization mismatch, C-R1).
+    //    Freshness: |now - ts| <= SIGNED_RESPONSE_FRESHNESS_SECS (replay protection, C-R2).
     if let Some(vk) = cloud_vk {
-        match &hb_resp.response_signature {
+        let signed_payload = match &hb_resp.signed_payload {
             None => {
-                warn!("control plane: cloud response has no response_signature — dropping all pending commands (cloud_vk_path is set but response is unsigned)");
+                warn!("control plane: cloud_vk_path is set but response has no signed_payload — dropping all pending commands");
                 return Ok(HeartbeatResponse::default());
             }
-            Some(sig_b64) => {
-                let sig_bytes = STANDARD
-                    .decode(sig_b64)
-                    .map_err(|e| anyhow::anyhow!("cloud sig base64 decode failed: {e}"))?;
-                let sig = Signature::from_bytes(&sig_bytes)
-                    .map_err(|e| anyhow::anyhow!("cloud sig parse failed: {e:?}"))?;
-                // Canonical signed payload: the pending_commands field as raw JSON bytes.
-                // The cloud signs `to_vec(&body["pending_commands"])`.
-                let canonical = serde_json::to_vec(&body_value["pending_commands"])
-                    .map_err(|e| anyhow::anyhow!("heartbeat canonical serialize failed: {e}"))?;
-                if let Err(e) = latticeshield_crypto::signing::verify(vk, &canonical, &sig) {
-                    warn!("control plane: cloud response signature verification FAILED ({e:?}) — dropping all pending commands");
-                    return Ok(HeartbeatResponse::default());
-                }
-                return Ok(hb_resp);
+            Some(s) => s,
+        };
+        let sig_b64 = match &hb_resp.response_signature {
+            None => {
+                warn!("control plane: cloud_vk_path is set but response has no response_signature — dropping all pending commands");
+                return Ok(HeartbeatResponse::default());
             }
+            Some(s) => s,
+        };
+
+        let sig_bytes = STANDARD
+            .decode(sig_b64)
+            .map_err(|e| anyhow::anyhow!("cloud sig base64 decode failed: {e}"))?;
+        let sig = Signature::from_bytes(&sig_bytes)
+            .map_err(|e| anyhow::anyhow!("cloud sig parse failed: {e:?}"))?;
+
+        // Verify over the EXACT bytes of signed_payload — no re-serialization.
+        if let Err(e) = latticeshield_crypto::signing::verify(vk, signed_payload.as_bytes(), &sig) {
+            warn!("control plane: cloud response signature verification FAILED ({e:?}) — dropping all pending commands");
+            return Ok(HeartbeatResponse::default());
         }
+
+        // Parse the (now-verified) inner payload.
+        let inner: SignedResponsePayload = match serde_json::from_str(signed_payload) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("control plane: signed_payload JSON parse failed ({e}) — dropping all pending commands");
+                return Ok(HeartbeatResponse::default());
+            }
+        };
+
+        // Freshness check — drops captured replays older than the window.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let drift = (now - inner.ts).abs();
+        if drift > SIGNED_RESPONSE_FRESHNESS_SECS {
+            warn!(
+                drift_secs = drift,
+                ts = inner.ts,
+                now = now,
+                "control plane: signed response outside freshness window — dropping all pending commands (replay protection)"
+            );
+            return Ok(HeartbeatResponse::default());
+        }
+
+        return Ok(HeartbeatResponse {
+            pending_commands: inner.pending_commands,
+            signed_payload: None,
+            response_signature: None,
+        });
     }
 
-    // 8. No cloud VK configured — return response without verification (backward compat)
+    // 8. No cloud VK configured — return response without verification (backward compat).
+    //    Reads `pending_commands` directly from the top-level envelope.
     Ok(hb_resp)
 }
 
@@ -882,35 +942,43 @@ mod tests {
         );
     }
 
-    /// C1: Valid cloud signature → command is dispatched.
+    /// Helper: builds the wire body for a signed cloud heartbeat response.
     ///
-    /// The cloud signs the canonical JSON of `pending_commands` only (not the full body).
-    /// This avoids circular signing — `response_signature` is NOT part of the signed data.
+    /// `ts_offset_secs` lets tests construct stale/future responses for replay tests.
+    fn make_signed_body(
+        cloud_sk: &latticeshield_crypto::signing::SigningKey,
+        rng: &mut impl rand_core::CryptoRngCore,
+        commands_json: &str,
+        ts_offset_secs: i64,
+    ) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ts = now + ts_offset_secs;
+        // Cloud serializes the inner payload ONCE and signs the exact bytes.
+        let signed_payload = format!(r#"{{"pending_commands":{commands_json},"ts":{ts}}}"#);
+        let sig =
+            latticeshield_crypto::signing::sign(cloud_sk, signed_payload.as_bytes(), rng).unwrap();
+        let sig_b64 = STANDARD.encode(sig.to_bytes());
+        // Embed signed_payload as a JSON string (escape quotes).
+        let escaped = signed_payload.replace('\\', r"\\").replace('"', r#"\""#);
+        format!(r#"{{"signed_payload":"{escaped}","response_signature":"{sig_b64}"}}"#)
+    }
+
+    /// C1: Valid cloud signature with fresh `ts` → command is dispatched.
     #[tokio::test]
     async fn cloud_vk_valid_sig_dispatches_command() {
         init_crypto();
 
-        // Generate a cloud keypair
         let mut rng = rand_core::OsRng;
         let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
-
-        // Canonical payload the cloud signs: pending_commands as a JSON Value.
-        // Bridge does: serde_json::to_vec(&body_value["pending_commands"]).
-        // So the cloud must sign the same: to_vec(&json!([{"type":"Rotate"}])).
-        let commands_value = serde_json::json!([{"type": "Rotate"}]);
-        let canonical = serde_json::to_vec(&commands_value).unwrap();
-        let sig = latticeshield_crypto::signing::sign(&cloud_sk, &canonical, &mut rng).unwrap();
-        let sig_b64 = STANDARD.encode(sig.to_bytes());
-
-        // The signed body contains pending_commands + response_signature
-        let signed_body = format!(
-            r#"{{"pending_commands":[{{"type":"Rotate"}}],"response_signature":"{sig_b64}"}}"#
-        );
+        let body = make_signed_body(&cloud_sk, &mut rng, r#"[{"type":"Rotate"}]"#, 0);
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(signed_body))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
 
@@ -946,14 +1014,19 @@ mod tests {
         let mut rng = rand_core::OsRng;
         let (_, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
 
-        let server = MockServer::start().await;
-        // Response has an invalid (all-zeros) signature
+        // Build a signed_payload but pair it with an all-zeros (invalid) signature.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let signed_payload = format!(r#"{{"pending_commands":[{{"type":"Rotate"}}],"ts":{now}}}"#);
+        let escaped = signed_payload.replace('"', r#"\""#);
         let bad_sig = vec![0u8; latticeshield_crypto::signing::SIGNATURE_LEN];
         let bad_sig_b64 = STANDARD.encode(&bad_sig);
-        let body = format!(
-            r#"{{"pending_commands":[{{"type":"Rotate"}}],"response_signature":"{bad_sig_b64}"}}"#
-        );
+        let body =
+            format!(r#"{{"signed_payload":"{escaped}","response_signature":"{bad_sig_b64}"}}"#);
 
+        let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/agents/test-agent-id/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
@@ -976,13 +1049,94 @@ mod tests {
             Some(&cloud_vk),
         )
         .await
-        .unwrap(); // must not error — invalid sig → drop commands, return default
+        .unwrap();
 
-        // Commands must be dropped
         assert!(
             resp.pending_commands.is_none(),
             "invalid sig must drop all commands, got: {:?}",
             resp.pending_commands
+        );
+    }
+
+    /// C-R2: A correctly-signed response whose `ts` is too far in the past → commands dropped.
+    /// Captures the replay-attack defense: even with a valid signature, stale responses
+    /// (e.g. captured weeks ago and re-injected via TLS MITM) are rejected.
+    #[tokio::test]
+    async fn cloud_vk_stale_ts_drops_command() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        // Sign with ts 1 hour in the past — well outside the 300s window.
+        let body = make_signed_body(&cloud_sk, &mut rng, r#"[{"type":"Rotate"}]"#, -3600);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resp.pending_commands.is_none(),
+            "stale ts must drop all commands (replay protection)"
+        );
+    }
+
+    /// C-R2: A correctly-signed response whose `ts` is too far in the future → commands dropped.
+    /// Catches forward-skew or clock-tampering attacks.
+    #[tokio::test]
+    async fn cloud_vk_future_ts_drops_command() {
+        init_crypto();
+        let mut rng = rand_core::OsRng;
+        let (cloud_sk, cloud_vk) = latticeshield_crypto::signing::generate_keypair(&mut rng);
+        let body = make_signed_body(&cloud_sk, &mut rng, r#"[{"type":"Rotate"}]"#, 3600);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agents/test-agent-id/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let config = make_config(server.uri());
+        let (identity, _dir) = make_test_identity();
+        let signable = make_signable();
+        let mut rng2 = rand_core::OsRng;
+
+        let resp = send_heartbeat(
+            &client,
+            &config,
+            "test-agent-id",
+            &signable,
+            &identity,
+            &mut rng2,
+            Some(&cloud_vk),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resp.pending_commands.is_none(),
+            "future ts must drop all commands"
         );
     }
 
