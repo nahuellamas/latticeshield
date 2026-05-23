@@ -4,6 +4,17 @@ All notable changes to LatticeShield will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-05-23
+
+### Fixed
+
+- **npm publish provenance**: v0.3.6 `publish-npm` job failed with
+  `npm error 422: Error verifying sigstore provenance bundle: package.json
+  "repository.url" is "", expected to match "https://github.com/nahuellamas/latticeshield"`.
+  `--provenance` requires a `repository` field in `package.json` that matches
+  the GitHub repo for attestation verification. Added `repository`, `homepage`,
+  `bugs`, `keywords`, and `author` metadata to `@latticeshield/js` package.json.
+
 ## [0.3.6] - 2026-05-22
 
 ### Security

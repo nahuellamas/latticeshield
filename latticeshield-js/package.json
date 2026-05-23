@@ -1,7 +1,29 @@
 {
   "name": "@latticeshield/js",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Browser SDK for LatticeShield PQC bridge — PQCSession + usePQCSession React hook",
+  "keywords": [
+    "post-quantum",
+    "pqc",
+    "ml-kem",
+    "ml-dsa",
+    "quantum-safe",
+    "tls",
+    "encryption",
+    "cryptography",
+    "websocket",
+    "sdk"
+  ],
+  "homepage": "https://github.com/nahuellamas/latticeshield#readme",
+  "bugs": {
+    "url": "https://github.com/nahuellamas/latticeshield/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nahuellamas/latticeshield.git",
+    "directory": "latticeshield-js"
+  },
+  "author": "LatticeShield",
   "type": "module",
   "license": "Apache-2.0",
   "private": false,
