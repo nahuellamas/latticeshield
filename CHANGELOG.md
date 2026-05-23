@@ -4,6 +4,22 @@ All notable changes to LatticeShield will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-05-22
+
+### Fixed
+
+- **CI / npm publish**: `@latticeshield/js` build switched from `vite build`
+  to `tsc`. The v0.3.4 release workflow failed at the publish-npm step because
+  vite 8.x rolldown requires an explicit `build.lib` configuration for library
+  builds (which was never created — the SDD that added publish-npm never ran
+  `npm run build` locally). The tsconfig already had `declaration: true` and
+  `outDir: ./dist`, so plain `tsc` emits both `.js` and `.d.ts` files with no
+  extra dev dependencies needed.
+- `scripts/sri.mjs` postbuild now skips gracefully when the wasm file is not
+  present (e.g. CI publish jobs that don't run `wasm-pack build`). The SRI
+  hash is for self-hosting users who serve the wasm themselves; missing wasm
+  in CI is expected and no longer breaks the publish flow.
+
 ## [0.3.4] - 2026-05-22
 
 ### Security
