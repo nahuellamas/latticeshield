@@ -1,17 +1,30 @@
 /target
 **/*.rs.bk
+
+# Secrets — never commit these
 .env
+.env.*
 /etc/latticeshield/keys/
+keys/
 keys-test/
 *.pem
 *.key
 *.crt
+*.sk
+
+# Build outputs (regenerated locally)
 /docs
 node_modules/
 latticeshield-js/node_modules/
 latticeshield-js/.vite/
+latticeshield-js/dist/
+
+# OS / editor cruft
 .DS_Store
 .gga
+.idea/
+.vscode/
+*.log
 
 # AI tooling — internal, not for contributors
 .engram/
