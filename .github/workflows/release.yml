@@ -146,25 +146,45 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # id-token: write enables Trusted Publishing — the workflow's OIDC token
-      # is exchanged with npm for short-lived publish credentials. No
-      # long-lived NODE_AUTH_TOKEN secret is needed.
-      # Setup once at: https://www.npmjs.com/settings/<org>/packages/@latticeshield/js
-      # (or as a pre-claim under the org's "Trusted publishers" section).
+      # id-token: write enables Trusted Publishing. npm's docs require this
+      # to be set on the workflow so the OIDC token can be exchanged for
+      # short-lived publish credentials once a Trusted Publisher is configured
+      # for @latticeshield/js in the npm UI.
       id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Trusted Publishing requires Node 22.14+ and npm CLI 11.5.1+
+          # (per https://docs.npmjs.com/trusted-publishers). Node 22 ships
+          # npm 10.x by default; we explicitly install npm 11 below to meet
+          # the trusted-publishing minimum.
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+      - name: Upgrade npm to 11.5.1+ for trusted publishing
+        run: npm install -g npm@latest
       - name: Build and publish @latticeshield/js
         working-directory: latticeshield-js
         run: |
           npm ci
           npm run build
           # --provenance: emits signed provenance attestation tied to this workflow run.
-          # Authentication uses the workflow's OIDC token via trusted publishing —
-          # the npm side must have a trusted publisher configured for this package
-          # pointing to this repo + this workflow file. No NODE_AUTH_TOKEN env var.
+          # Once a Trusted Publisher is configured for @latticeshield/js on npm,
+          # this command publishes via OIDC and NODE_AUTH_TOKEN is ignored.
+          # Until then, the granular token below is used for bootstrap.
           npm publish --provenance --access public
+        env:
+          # BOOTSTRAP-ONLY: npm requires the package to exist before a Trusted
+          # Publisher can be configured. For the first publish we use a Granular
+          # Access Token scoped to @latticeshield/js with a short expiration
+          # (≤ 1 day) and Bypass-2FA enabled. Once published, do the migration:
+          #
+          #   1. Configure Trusted Publisher on https://www.npmjs.com/package/@latticeshield/js/settings
+          #      → Repository: nahuellamas/latticeshield
+          #      → Workflow: release.yml
+          #   2. Delete the NODE_AUTH_TOKEN secret from this repo's GitHub Settings.
+          #   3. Revoke the granular token on npm.
+          #
+          # After step 3 this env var resolves to empty, npm ignores it, and
+          # OIDC takes over automatically — zero standing credentials.
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
