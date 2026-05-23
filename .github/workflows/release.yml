@@ -146,6 +146,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # id-token: write enables Trusted Publishing — the workflow's OIDC token
+      # is exchanged with npm for short-lived publish credentials. No
+      # long-lived NODE_AUTH_TOKEN secret is needed.
+      # Setup once at: https://www.npmjs.com/settings/<org>/packages/@latticeshield/js
+      # (or as a pre-claim under the org's "Trusted publishers" section).
       id-token: write
     steps:
       - uses: actions/checkout@v6
@@ -158,6 +163,8 @@ jobs:
         run: |
           npm ci
           npm run build
+          # --provenance: emits signed provenance attestation tied to this workflow run.
+          # Authentication uses the workflow's OIDC token via trusted publishing —
+          # the npm side must have a trusted publisher configured for this package
+          # pointing to this repo + this workflow file. No NODE_AUTH_TOKEN env var.
           npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
