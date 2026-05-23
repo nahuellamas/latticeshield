@@ -702,6 +702,28 @@ handshake cost, equivalent to `unsigned_handshake`).
 
 ## What's New
 
+### v0.3.7 — npm Provenance Metadata (2026-05-23)
+
+The v0.3.6 publish to npm failed with a sigstore attestation error because `--provenance` requires the `package.json` `repository.url` field to match the GitHub repository URL. Added `repository`, `homepage`, `bugs`, `keywords`, and `author` metadata to `@latticeshield/js`'s `package.json`. This is the first version of `@latticeshield/js` successfully published to npm with full provenance attestation.
+
+### v0.3.6 — Gitignore Hardening + npm Trusted Publishing Toolchain (2026-05-22)
+
+The `.gitignore` was hardened to prevent accidental secret commits. Previously only `/etc/latticeshield/keys/` was ignored, so a developer running `latticeshield-bridge keygen ./keys` from the repo root could commit their private ML-DSA-65 signing key with a careless `git add .`. The updated `.gitignore` now covers `keys/`, `*.sk`, `.env.*`, `latticeshield-js/dist/`, `*.log`, `.idea/`, and `.vscode/`.
+
+The CI `publish-npm` job was upgraded from Node 20 to Node 22 and installs npm 11.5.1+ — the minimum required by npm's Trusted Publishing (OIDC) path. The workflow also adds a `NODE_AUTH_TOKEN` bootstrap path that gracefully migrates to Trusted Publishing after the first successful publish, after which all standing credentials can be removed.
+
+### v0.3.5 — Build Toolchain Hotfix for @latticeshield/js (2026-05-22)
+
+The v0.3.4 CI release workflow failed at the `publish-npm` step because vite 8.x rolldown requires an explicit `build.lib` configuration entry for library builds — which was never created. The fix switches `@latticeshield/js` from `vite build` to plain `tsc`, which already had `declaration: true` and `outDir: ./dist` in `tsconfig.json` and emits both `.js` and `.d.ts` with no extra dev dependencies. The `scripts/sri.mjs` postbuild was also updated to skip gracefully when the wasm file is absent in CI publish jobs.
+
+### v0.3.4 — Product + Security + Adversarial Audit Hardening (2026-05-22)
+
+**Breaking change:** the TLS listener (`[tls].enabled = true`) now enforces TLS 1.3 only. TLS 1.2 clients will be rejected at handshake. The PQC listener on port 8443 and the WebSocket listener on 8446 were already TLS 1.3-only via rustls defaults; this release brings the standard HTTPS listener on port 8440 into alignment.
+
+Cloud heartbeat responses are now signature-verified with ML-DSA-65 before dispatching `BridgeCommand::Rotate`. Set `[control_plane].cloud_vk_path` to the cloud's verifying key to enable — backward compatible; without the config the bridge behaves as before. A 300-second timestamp window rejects replayed signed responses. The QUIC listener gains per-IP connection enforcement consistent with TCP and WebSocket. `RegistrationPayload` no longer includes `backend_addr`, preventing internal topology disclosure to the cloud control plane. A startup `warn!` fires if `install_token` is set in TOML rather than `$INSTALL_TOKEN`.
+
+Several defensive fixes round out the release: heartbeat response body is capped at 1 MiB to prevent OOM via a hostile cloud endpoint, `ts` overflow is guarded with `checked_sub` + `saturating_abs`, and all malformed-cloud-response branches now fail closed with `warn!` rather than propagating errors. The Docker builder image switches from `rust:1.87-slim` to `rust:1.87-alpine` (~0–14 high CVEs vs ~23 in the Debian-based variant). The `publish-npm` CI job now depends on binary cross-compilation completing successfully, preventing an npm release without matching bridge binaries.
+
 ### v0.3.3 — Dependency Security Patches + Reproducible Builds (2026-05-22)
 
 `Cargo.lock` is now tracked in version control, enabling Dependabot version resolution and bit-reproducible builds across machines. The lockfile was previously gitignored as a `cargo new --lib` default — a leftover from when the workspace was lib-only and never revisited after the bridge and client binaries joined.

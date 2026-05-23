@@ -687,6 +687,28 @@ cd latticeshield-js && npm test           # 93 tests en TypeScript
 
 ## Novedades
 
+### v0.3.7 — Metadatos de provenance para npm (2026-05-23)
+
+La publicación v0.3.6 a npm falló con un error de atestación de sigstore porque `--provenance` requiere que el campo `repository.url` del `package.json` coincida con la URL del repositorio en GitHub. Se agregaron los campos `repository`, `homepage`, `bugs`, `keywords` y `author` al `package.json` de `@latticeshield/js`. Esta es la primera versión de `@latticeshield/js` publicada exitosamente en npm con provenance attestation completo.
+
+### v0.3.6 — Hardening de .gitignore + toolchain para Trusted Publishing de npm (2026-05-22)
+
+Se endureció el `.gitignore` para prevenir commits accidentales de secretos. Anteriormente solo se ignoraba `/etc/latticeshield/keys/`, por lo que un developer que ejecutara `latticeshield-bridge keygen ./keys` desde la raíz del repo podía commitear su clave privada ML-DSA-65 con un `git add .` descuidado. El `.gitignore` actualizado ahora cubre `keys/`, `*.sk`, `.env.*`, `latticeshield-js/dist/`, `*.log`, `.idea/` y `.vscode/`.
+
+El job `publish-npm` de CI fue actualizado de Node 20 a Node 22 e instala npm 11.5.1+ — el mínimo requerido por el camino Trusted Publishing (OIDC) de npm. El workflow también agrega un path de bootstrap con `NODE_AUTH_TOKEN` que migra graciosamente a Trusted Publishing después del primer publish exitoso, luego del cual se pueden remover todas las credenciales permanentes.
+
+### v0.3.5 — Hotfix del toolchain de build para @latticeshield/js (2026-05-22)
+
+El workflow de release de v0.3.4 falló en el step `publish-npm` porque vite 8.x rolldown requiere una entrada `build.lib` explícita para builds de librería — que nunca se creó. El fix cambia `@latticeshield/js` de `vite build` a `tsc` directamente, que ya tenía `declaration: true` y `outDir: ./dist` en `tsconfig.json` y emite tanto `.js` como `.d.ts` sin dependencias de desarrollo adicionales. El postbuild `scripts/sri.mjs` también fue actualizado para omitirse graciosamente cuando el archivo wasm no está presente en los jobs de publish de CI.
+
+### v0.3.4 — Hardening de producto, seguridad y auditoría adversarial (2026-05-22)
+
+**Cambio breaking:** el listener TLS (`[tls].enabled = true`) ahora exige TLS 1.3 únicamente. Los clientes TLS 1.2 serán rechazados en el handshake. El listener PQC en el puerto 8443 y el listener WebSocket en el 8446 ya eran TLS 1.3-only por defecto en rustls; este release alinea el listener HTTPS estándar en el puerto 8440.
+
+Las respuestas de heartbeat del cloud ahora se verifican con ML-DSA-65 antes de despachar `BridgeCommand::Rotate`. Configurá `[control_plane].cloud_vk_path` con la clave verificadora del cloud para habilitarlo — es backward compatible; sin el config el bridge se comporta igual que antes. Una ventana de timestamp de 300 segundos rechaza respuestas firmadas que se intenten reproducir (replay). El listener QUIC incorpora el límite de conexiones por IP consistente con TCP y WebSocket. `RegistrationPayload` ya no incluye `backend_addr`, evitando que la topología interna se filtre al control plane del cloud. Al iniciar, se emite un `warn!` si `install_token` está en el TOML en lugar de la variable de entorno `$INSTALL_TOKEN`.
+
+Varios fixes defensivos completan el release: el body de respuesta del heartbeat está limitado a 1 MiB para prevenir OOM desde un endpoint cloud hostil, el overflow del campo `ts` está protegido con `checked_sub` + `saturating_abs`, y todas las ramas de respuesta cloud malformada ahora fallan cerradas con `warn!`. La imagen builder de Docker pasa de `rust:1.87-slim` a `rust:1.87-alpine` (~0–14 CVEs high vs ~23 en la variante Debian). El job `publish-npm` ahora depende de que la compilación cruzada de binarios termine exitosamente, evitando un release de npm sin los binarios del bridge correspondientes.
+
 ### v0.3.3 — Parches de seguridad de dependencias + Builds reproducibles (2026-05-22)
 
 `Cargo.lock` ahora se trackea en el control de versiones, habilitando que Dependabot resuelva versiones exactas y permitiendo builds bit-a-bit reproducibles entre máquinas. El lockfile estaba previamente gitignored como default de `cargo new --lib` — un residuo de cuando el workspace era solo lib y nunca se revisó después de que el bridge y el client se sumaran como binarios.
