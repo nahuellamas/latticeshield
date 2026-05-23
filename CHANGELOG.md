@@ -4,6 +4,30 @@ All notable changes to LatticeShield will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-05-22
+
+### Security
+
+- **`.gitignore`** hardened to prevent secret-leak via `git add .` after the
+  README quickstart. Previously only `/etc/latticeshield/keys/` was ignored,
+  so a user running `latticeshield-bridge keygen ./keys` from the repo root
+  could accidentally commit their private ML-DSA-65 signing key. Added:
+  `keys/`, `*.sk`, `.env.*`, `latticeshield-js/dist/`, `*.log`, `.idea/`,
+  `.vscode/`.
+
+### CI / Release
+
+- `release.yml` `publish-npm`: Node 20 → 22 + `npm install -g npm@latest`.
+  npm Trusted Publishing requires Node 22.14+ and npm CLI 11.5.1+ per the
+  official docs. v0.3.5 publish failed previously because of authentication;
+  v0.3.6 ships the upgraded toolchain plus a `NODE_AUTH_TOKEN` bootstrap
+  path that gracefully migrates to Trusted Publishing after the first
+  successful publish (full migration steps in the workflow comments).
+- `publish-npm` job uses a short-lived (≤1 day) Granular Access Token
+  scoped only to `@latticeshield/*` for first publish. After this release
+  lands on npm, the migration to OIDC trusted publishing removes all
+  standing credentials.
+
 ## [0.3.5] - 2026-05-22
 
 ### Fixed
